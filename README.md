@@ -74,14 +74,14 @@ source doc  →  ingest_thought / ingest_entity
 ### Terminal
 
 ```bash
-claude marketplace add yesitsfebreeze
+claude marketplace add yesitsfebreeze/wiki
 claude plugin install wiki@yesitsfebreeze
 ```
 
 ### Inside Claude
 
 ```
-/plugin marketplace add yesitsfebreeze
+/plugin marketplace add yesitsfebreeze/wiki
 /plugin install wiki@yesitsfebreeze
 ```
 
