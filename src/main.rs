@@ -179,8 +179,10 @@ fn run_code_read_hook() -> anyhow::Result<()> {
     match code::open_source(&abs_path, &ext) {
         Ok(result) if !result.trim().is_empty() => {
             let out = serde_json::json!({
-                "decision": "block",
-                "reason": format!("Wiki code index result for `{}`:\n\n{}", file_path, result),
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": format!("Wiki code index result for `{}`:\n\n{}", file_path, result),
+                },
             });
             println!("{}", out);
             Ok(())
