@@ -1,10 +1,7 @@
 {
 	"mcpServers": {
 		"wiki": {
-			"command": "wiki",
-			"env": {
-				"WIKI_PATH": "${CLAUDE_PROJECT_DIR}/.wiki"
-			}
+			"command": "wiki"
 		}
 	}
 }
