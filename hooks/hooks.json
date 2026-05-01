@@ -39,13 +39,13 @@
 						"type": "command",
 						"shell": "powershell",
 						"timeout": 10,
-						"command": "& \"${CLAUDE_PLUGIN_ROOT}/bin/wiki.exe\" code-read-hook"
+						"command": "& \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-read-hook.ps1\""
 					},
 					{
 						"type": "command",
 						"shell": "bash",
 						"timeout": 10,
-						"command": "\"${CLAUDE_PLUGIN_ROOT}/bin/wiki\" code-read-hook"
+						"command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-read-hook.sh\""
 					}
 				]
 			}
