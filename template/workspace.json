@@ -1,0 +1,219 @@
+{
+  "main": {
+    "id": "eb4a2aeb4c8f24aa",
+    "type": "split",
+    "children": [
+      {
+        "id": "de09b0a7d1720b53",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "615724900926fae7",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "923019cc741ebaa7",
+    "type": "split",
+    "children": [
+      {
+        "id": "43ee5799e7cf833e",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "8e48b4de3b842ff6",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "131d9ae0b3ab7f6d",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "tag:thought",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "ceb9652a4f54d5a4",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "5b09d11607193d45",
+    "type": "split",
+    "children": [
+      {
+        "id": "3fcfacdd03d179dc",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0ae4b25b694735ca",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "bad9eaa0191b9482",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "02f93bf43f0a0c34",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "cac729745f122daf",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "b16d9898e79048d9",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "615724900926fae7",
+  "lastOpenFiles": [
+    "reasons/DependsOn-122.md",
+    "reasons/Answers-121.md",
+    "reasons/contains-120.md",
+    "reasons/contains-119.md",
+    "reasons/contains-118.md",
+    "reasons/evolved-from-117.md",
+    "reasons/evidence-116.md",
+    "reasons/evidence-115.md",
+    "reasons/depends-on-114.md",
+    "reasons/evidence-113.md",
+    "reasons/evidence-112.md",
+    "reasons/evidence-111.md",
+    "reasons/evidence-110.md",
+    "reasons/evidence-109.md",
+    "reasons/contains-108.md",
+    "reasons/evidence-107.md",
+    "reasons/contains-106.md",
+    "reasons/evolved-from-105.md",
+    "reasons/evidence-104.md",
+    "reasons/evolved-from-103.md",
+    "reasons/contains-102.md",
+    "reasons/evidence-101.md",
+    "reasons/contains-100.md",
+    "reasons/contains-99.md",
+    "reasons/evidence-98.md",
+    "reasons/evidence-97.md",
+    "link.json",
+    "ingest_log/a3672063-59f6-479d-a936-466cda366dbe.json",
+    "ingest_log/30d3082c-9eda-4891-ab9e-ec087f1d9c52.json",
+    "ingest_log/91796838-bc7c-4763-ae4e-d2a02a15015c.json",
+    "ingest_log/15204d79-706d-421f-859f-7ac9b9770e6a.json",
+    "conclusions",
+    "ingest_log/c098df45-6e35-47ed-beba-6de63ce62aaa.json",
+    "ingest_log/9140a3db-f1fc-4b1e-af6e-b39986b1e8aa.json",
+    "ingest_log/cc8ceda3-0243-49d6-b0e4-8cd1c98c46ed.json",
+    "ingest_log/2afbb4ce-d6ed-4ec7-a623-56d201fb5ef5.json",
+    "thoughts/Untitled.canvas"
+  ]
+}

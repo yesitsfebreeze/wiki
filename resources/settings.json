@@ -1,0 +1,116 @@
+{
+	"hooks": {
+		"SessionStart": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 5,
+						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Wiki MCP is active. Before answering substantive questions or making code changes: (1) call wiki.search_fulltext({query}) or wiki.search_by_tag({tag}) for relevant context, (2) walk [[wikilinks]] depth-1 via wiki.get({doc_type, id}). After ingesting new docs, always call wiki.link_doc({doc_type, id}) to connect entities. Skills: /wiki, /learn, /ingest, /reindex.\"}}'",
+						"timeout": 5
+					}
+				]
+			}
+		],
+		"UserPromptSubmit": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "powershell",
+						"timeout": 15,
+						"command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\tools\\wiki\\bin\\wiki.exe\" hook"
+					},
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 15,
+						"command": "\"$CLAUDE_PROJECT_DIR/.claude/tools/wiki/bin/wiki\" hook"
+					}
+				]
+			}
+		],
+		"PreToolUse": [
+			{
+				"matcher": "Read",
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "powershell",
+						"timeout": 10,
+						"command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\tools\\wiki\\bin\\wiki.exe\" code-read-hook"
+					},
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 10,
+						"command": "\"$CLAUDE_PROJECT_DIR/.claude/tools/wiki/bin/wiki\" code-read-hook"
+					}
+				]
+			}
+		],
+		"PostToolUse": [
+			{
+				"matcher": "mcp__wiki__ingest_thought|mcp__wiki__ingest_entity|mcp__wiki__ingest_conclusion",
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 5,
+						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Wiki doc ingested. Call wiki.link_doc({doc_type, id}) on the new doc to wikilink entity mentions and fold near-duplicate paragraphs into the canonical entity. Skip if already inside a learn pass.\"}}'",
+						"timeout": 5
+					}
+				]
+			},
+			{
+				"matcher": "mcp__wiki__ingest_reason",
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 5,
+						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Reason ingested. If this completes a cluster of ≥2 resolved questions around an entity, call wiki.suggest_conclusion({entity_id}) to synthesize a conclusion.\"}}'",
+						"timeout": 5
+					}
+				]
+			},
+			{
+				"matcher": "mcp__wiki__extract_pdfs|mcp__wiki__extract_youtube",
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 5,
+						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Extraction complete. Move the resulting file(s) to .wiki/ingest/ and run /ingest to atomize into thoughts and entities.\"}}'",
+						"timeout": 5
+					}
+				]
+			},
+			{
+				"matcher": "mcp__wiki__learn_pass",
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 5,
+						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Learn pass complete. Review docs_modified count. If paragraphs_merged > 0, the canonical entities now own that content — do not re-add it to source docs.\"}}'",
+						"timeout": 5
+					}
+				]
+			},
+			{
+				"matcher": "mcp__wiki__mark_question",
+				"hooks": [
+					{
+						"type": "command",
+						"shell": "bash",
+						"timeout": 5,
+						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Question status updated. Run wiki.list_open_questions() periodically to keep the question loop active.\"}}'",
+						"timeout": 5
+					}
+				]
+			}
+		]
+	}
+}

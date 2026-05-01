@@ -1,0 +1,14 @@
+{
+	"mcpServers": {
+		"wiki": {
+			"command": "${CLAUDE_PLUGIN_ROOT}/bin/wiki",
+			"args": [],
+			"env": {
+				"WIKI_PATH": "${CLAUDE_PROJECT_DIR}/.wiki",
+				"OPENAI_API_KEY": "${OPENAI_API_KEY}",
+				"WIKI_SIMILARITY_THRESHOLD": "0.35",
+				"WIKI_DEDUPE_THRESHOLD": "0.85"
+			}
+		}
+	}
+}

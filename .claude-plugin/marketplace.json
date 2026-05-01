@@ -1,0 +1,40 @@
+{
+	"name": "yesitsfebreeze",
+	"owner": {
+		"name": "yesitsfebreeze",
+		"email": ""
+	},
+	"plugins": [
+		{
+			"name": "wiki",
+			"source": {
+				"source": "github",
+				"repo": "yesitsfebreeze/wiki"
+			},
+			"description": "Persistent Obsidian-vault knowledge base — ingest, search, and link knowledge with OpenAI embeddings and Tantivy full-text search.",
+			"version": "0.1.0",
+			"author": {
+				"name": "yesitsfebreeze"
+			},
+			"homepage": "https://github.com/yesitsfebreeze/wiki",
+			"repository": "https://github.com/yesitsfebreeze/wiki",
+			"license": "MIT",
+			"keywords": [
+				"wiki",
+				"knowledge-base",
+				"obsidian",
+				"mcp",
+				"embeddings",
+				"knowledge-graph"
+			],
+			"category": "knowledge-management",
+			"tags": [
+				"wiki",
+				"knowledge",
+				"obsidian",
+				"mcp",
+				"rag"
+			]
+		}
+	]
+}
