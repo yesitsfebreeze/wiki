@@ -158,10 +158,14 @@ fn run_code_read_hook() -> anyhow::Result<()> {
         if p.is_absolute() { p } else { cwd_path.join(p) }
     };
 
-    let ext = abs_path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("rs")
-        .to_string();
+    let ext = match abs_path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_string(),
+        None => return emit_empty_hook(),
+    };
+
+    if code::language::load(&ext).is_none() {
+        return emit_empty_hook();
+    }
 
     // Ensure code index dir env is set so open_source finds the index
     if std::env::var("CODE_INDEX_DIR").is_err() && std::env::var("SPLIT_INDEX_DIR").is_err() {
@@ -264,3 +268,4 @@ async fn main() -> anyhow::Result<()> {
     server.waiting().await?;
     Ok(())
 }
+

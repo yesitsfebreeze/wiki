@@ -39,13 +39,13 @@
 						"type": "command",
 						"shell": "powershell",
 						"timeout": 10,
-						"command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\tools\\wiki\\scripts\\pre-read-hook.ps1\""
+						"command": "& \"$env:CLAUDE_PROJECT_DIR\\.claude\\tools\\wiki\\bin\\wiki.exe\" code-read-hook"
 					},
 					{
 						"type": "command",
 						"shell": "bash",
 						"timeout": 10,
-						"command": "bash \"$CLAUDE_PROJECT_DIR/.claude/tools/wiki/scripts/pre-read-hook.sh\""
+						"command": "\"$CLAUDE_PROJECT_DIR/.claude/tools/wiki/bin/wiki\" code-read-hook"
 					}
 				]
 			}
