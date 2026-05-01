@@ -3,8 +3,6 @@
 	"name": "wiki",
 	"version": "0.1.0",
 	"description": "Persistent Obsidian-vault knowledge base — ingest, search, and link knowledge with OpenAI embeddings and Tantivy full-text search.",
-	"skills": "./resources/skills",
-	"commands": "./resources/commands",
 	"hooks": "./hooks/hooks.json",
 	"mcpServers": "./.mcp.json"
 }
