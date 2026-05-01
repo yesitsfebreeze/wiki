@@ -181,6 +181,7 @@ fn run_code_read_hook() -> anyhow::Result<()> {
             let out = serde_json::json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
                     "additionalContext": format!("Wiki code index result for `{}`:\n\n{}", file_path, result),
                 },
             });
