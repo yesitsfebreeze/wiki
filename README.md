@@ -92,24 +92,15 @@ Done. MCP server + skills + hooks installed automatically.
 Requires Rust and the WASM target:
 ```bash
 rustup target add wasm32-wasip1
-cargo build --release
+cargo install --git https://github.com/yesitsfebreeze/wiki
 ```
 
-Copy the binary to `bin/`:
-```bash
-# Linux / macOS
-cp target/release/wiki bin/wiki
-
-# Windows
-copy target\release\wiki.exe bin\wiki.exe
-```
-
-Then add to `.mcp.json` manually if not using the plugin:
+Installs `wiki` (or `wiki.exe`) into `~/.cargo/bin/`. Then add to `.mcp.json` manually if not using the plugin:
 ```json
 {
   "mcpServers": {
     "wiki": {
-      "command": "/path/to/wiki",
+      "command": "wiki",
       "env": {
         "WIKI_PATH": ".wiki",
         "OPENAI_API_KEY": "sk-..."
