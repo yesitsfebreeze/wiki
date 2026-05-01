@@ -1,7 +1,7 @@
 {
 	"mcpServers": {
 		"wiki": {
-			"command": "${CLAUDE_PLUGIN_ROOT}/bin/wiki",
+			"command": "wiki",
 			"args": [],
 			"env": {
 				"WIKI_PATH": "${CLAUDE_PROJECT_DIR}/.wiki",
