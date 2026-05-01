@@ -3,9 +3,7 @@
 		"wiki": {
 			"command": "wiki",
 			"env": {
-				"WIKI_PATH": "${CLAUDE_PROJECT_DIR}/.wiki",
-				"WIKI_SIMILARITY_THRESHOLD": "0.35",
-				"WIKI_DEDUPE_THRESHOLD": "0.85"
+				"WIKI_PATH": "${CLAUDE_PROJECT_DIR}/.wiki"
 			}
 		}
 	}

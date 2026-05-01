@@ -40,7 +40,7 @@ source doc  →  ingest_thought / ingest_entity
   .search/    — Tantivy full-text index
 ```
 
-- **Purpose classification** — every doc is embedded and matched (cosine) against purpose embeddings. Top-1 above `WIKI_SIMILARITY_THRESHOLD` wins; below threshold → `general`.
+- **Purpose classification** — every doc is embedded and matched (cosine) against purpose embeddings. Top-1 above `wiki_similarity_threshold` wins; below threshold → `general`.
 - **Chunking** — multi-topic content splits into a parent container + child chunk docs linked via `PartOf` reasons.
 - **Entity linking** — `learn_pass` / `link_doc` rewrites bare entity mentions as `[[wikilinks]]` and folds near-duplicate paragraphs into the canonical entity.
 
@@ -95,31 +95,27 @@ rustup target add wasm32-wasip1
 cargo install --git https://github.com/yesitsfebreeze/wiki
 ```
 
-Installs `wiki` (or `wiki.exe`) into `~/.cargo/bin/`. Then add to `.mcp.json` manually if not using the plugin:
-```json
-{
-  "mcpServers": {
-    "wiki": {
-      "command": "wiki",
-      "env": {
-        "WIKI_PATH": ".wiki",
-        "OPENAI_API_KEY": "sk-..."
-      }
-    }
-  }
-}
+Installs `wiki` (or `wiki.exe`) into `~/.cargo/bin/`.
+
+## ⚙️ Config
+
+Create `~/.config/wiki/config.toml`:
+
+```toml
+openai_api_key = "sk-..."
+
+# wiki_rerank_model = "gpt-4o-mini"        # model for smart_search reranking
+# wiki_similarity_threshold = 0.35
+# wiki_dedupe_threshold = 0.85
+
+# Code indexing (optional)
+# split_src_dir = "src"
+# split_ext = "rs"
+# split_index_dir = ".wiki/code"
+# split_max_loc = "256"
 ```
 
-## ⚙️ Environment
-
-| Variable | Default | Description |
-|---|---|---|
-| `WIKI_PATH` | `./.wiki` | Vault root |
-| `OPENAI_API_KEY` | — | Required for ingest classification and reembed |
-| `WIKI_SIMILARITY_THRESHOLD` | `0.35` | Cosine threshold; below → `general` purpose |
-| `WIKI_DEDUPE_THRESHOLD` | `0.85` | Cosine threshold for paragraph deduplication in `learn_pass` |
-
-Priority: env vars > hardcoded defaults.
+Environment variables override config file values.
 
 ## 🌐 Languages
 

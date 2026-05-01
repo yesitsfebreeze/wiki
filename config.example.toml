@@ -1,0 +1,18 @@
+# ~/.config/wiki/config.toml
+
+openai_api_key = "sk-..."
+
+# Model used for smart_search reranking (default gpt-4o-mini)
+# wiki_rerank_model = "gpt-4o-mini"
+
+# Cosine similarity threshold for purpose classification (default 0.35)
+# wiki_similarity_threshold = 0.35
+
+# Cosine threshold for paragraph deduplication in learn_pass (default 0.85)
+# wiki_dedupe_threshold = 0.85
+
+# Code indexing — optional, enables file watcher
+# split_src_dir = "src"
+# split_ext = "rs"
+# split_index_dir = ".wiki/code"
+# split_max_loc = "256"

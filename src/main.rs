@@ -2,6 +2,7 @@ use rmcp::{transport::stdio, ServiceExt};
 use std::path::PathBuf;
 
 mod chunker;
+mod config;
 mod classifier;
 mod code;
 mod extract;
@@ -51,6 +52,7 @@ fn find_wiki_vault(start: &std::path::Path) -> Option<PathBuf> {
 }
 
 fn run_hook() -> anyhow::Result<()> {
+    config::load();
     use std::io::Read;
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
@@ -131,6 +133,7 @@ fn run_hook() -> anyhow::Result<()> {
 }
 
 fn run_code_read_hook() -> anyhow::Result<()> {
+    config::load();
     use std::io::Read;
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
@@ -247,6 +250,7 @@ fn run_cli() -> Option<anyhow::Result<()>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    config::load();
     if let Some(r) = run_cli() {
         return r;
     }
