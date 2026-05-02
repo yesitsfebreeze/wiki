@@ -11,7 +11,9 @@ pub fn load() {
         ("wiki_similarity_threshold", "WIKI_SIMILARITY_THRESHOLD"),
         ("wiki_dedupe_threshold", "WIKI_DEDUPE_THRESHOLD"),
         ("split_src_dir", "SPLIT_SRC_DIR"),
+        ("split_src_dirs", "SPLIT_SRC_DIRS"),
         ("split_ext", "SPLIT_EXT"),
+        ("split_exts", "SPLIT_EXTS"),
         ("split_index_dir", "SPLIT_INDEX_DIR"),
         ("split_max_loc", "SPLIT_MAX_LOC"),
     ];

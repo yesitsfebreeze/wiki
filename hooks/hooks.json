@@ -22,6 +22,17 @@
 				]
 			}
 		],
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"timeout": 30,
+						"command": "wiki stop-hook"
+					}
+				]
+			}
+		],
 		"PreToolUse": [
 			{
 				"matcher": "Read",

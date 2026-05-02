@@ -90,6 +90,28 @@ pub fn chat_json(system: &str, user: &str) -> Result<String> {
 		.content)
 }
 
+pub fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
+	#[derive(Deserialize)]
+	struct Expanded {
+		queries: Vec<String>,
+	}
+	let sys = "You generate retrieval queries to surface relevant context from a personal knowledge base. \
+		Given a user prompt, return JSON {\"queries\":[\"...\",\"...\"]} with N short, diverse search queries. \
+		Cover: named entities, the underlying intent, prerequisites/related concepts, and likely-adjacent topics. \
+		Each query 3-12 words, no prose, no numbering, no quotes inside strings.";
+	let user = format!("N={}\nPrompt: {}", n, prompt);
+	let content = chat_json(sys, &user)?;
+	let parsed: Expanded = serde_json::from_str(&content)
+		.map_err(|e| anyhow!("expand parse: {} body: {}", e, content))?;
+	Ok(parsed
+		.queries
+		.into_iter()
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.take(n)
+		.collect())
+}
+
 fn rerank_via_openai(question: &str, cands: &[Candidate]) -> Result<Vec<RankedItem>> {
 	let cands_json = serde_json::to_string(cands)?;
 	let sys = "You rerank candidate wiki documents for relevance to a user's question. \

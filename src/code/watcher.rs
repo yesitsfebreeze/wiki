@@ -1,44 +1,56 @@
 use anyhow::Result;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::code::splitter;
 
-pub fn watch(src_dir: &Path, index_dir: &Path, ext: &str) -> Result<()> {
+pub fn watch(src_dirs: &[PathBuf], index_dir: &Path, exts: &[String]) -> Result<()> {
     let debounce_ms = std::env::var("SPLIT_DEBOUNCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(500);
-    watch_with_debounce(src_dir, index_dir, ext, Duration::from_millis(debounce_ms))
+    watch_with_debounce(src_dirs, index_dir, exts, Duration::from_millis(debounce_ms))
 }
 
-pub fn watch_with_debounce(src_dir: &Path, index_dir: &Path, ext: &str, _debounce: Duration) -> Result<()> {
+pub fn watch_with_debounce(src_dirs: &[PathBuf], index_dir: &Path, exts: &[String], _debounce: Duration) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(move |res| { let _ = tx.send(res); }, Config::default())?;
-    watcher.watch(src_dir, RecursiveMode::Recursive)?;
+
+    for src_dir in src_dirs {
+        watcher.watch(src_dir, RecursiveMode::Recursive)?;
+        eprintln!("split: watching {} ({})", src_dir.display(), exts.join(","));
+    }
 
     let index_dir = index_dir.to_path_buf();
-    let src_ext = ext.to_string();
-
-    eprintln!("split: indexing {} -> {} (*.{})", src_dir.display(), index_dir.display(), src_ext);
+    let ext_set: HashSet<String> = exts.iter().cloned().collect();
 
     for res in rx {
         match res {
-            Ok(event) if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
+            Ok(event) => {
+                let is_write = matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
+                let is_remove = matches!(event.kind, EventKind::Remove(_));
+                if !is_write && !is_remove {
+                    continue;
+                }
                 for path in event.paths {
-                    let path_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let path_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
                     let s = path.to_string_lossy();
-                    if path_ext == src_ext && !s.contains(".wiki/") && !s.contains(".wiki\\") {
-                        if let Err(e) = on_source_change(&path, &index_dir, &src_ext) {
-                            eprintln!("split error: {e}");
+                    if !ext_set.contains(&path_ext) || s.contains(".wiki/") || s.contains(".wiki\\") {
+                        continue;
+                    }
+                    if is_remove {
+                        if let Err(e) = on_source_delete(&path, &index_dir) {
+                            eprintln!("split delete error: {e}");
                         }
+                    } else if let Err(e) = on_source_change(&path, &index_dir, &path_ext) {
+                        eprintln!("split error: {e}");
                     }
                 }
             }
             Err(e) => eprintln!("watch error: {e}"),
-            _ => {}
         }
     }
 
@@ -55,5 +67,20 @@ fn on_source_change(src_path: &Path, index_dir: &Path, ext: &str) -> Result<()> 
         std::fs::write(&b.path, &b.content)?;
     }
     eprintln!("re-split <- {}", src_path.display());
+    Ok(())
+}
+
+fn on_source_delete(src_path: &Path, index_dir: &Path) -> Result<()> {
+    let struct_path = splitter::structure_path(src_path, index_dir);
+    if struct_path.exists() {
+        std::fs::remove_file(&struct_path)?;
+    }
+    let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let key = splitter::source_key_path(src_path).with_extension("");
+    let body_dir = index_dir.join(ext).join("functions").join(&key);
+    if body_dir.exists() {
+        std::fs::remove_dir_all(&body_dir)?;
+    }
+    eprintln!("deleted index <- {}", src_path.display());
     Ok(())
 }

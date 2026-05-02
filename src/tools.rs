@@ -399,10 +399,25 @@ impl WikiService {
 		self.ingest_chunked("thoughts", &title, &content, "thought", purpose_hint.as_deref()).to_string()
 	}
 
-	#[tool(description = "Ingest an entity (consolidated concept). Args: title, content, purpose_hint?")]
+	#[tool(description = "Ingest an entity (consolidated concept). Before calling, check if the concept already exists under a different name — if a near-duplicate is found (by title match or embedding similarity >= WIKI_ALIAS_THRESHOLD, default 0.92), the new title is added as an alias to the existing entity instead of creating a duplicate. Returns {merged_into, existing_title, alias_added} when merged, or the new Document when created. Args: title, content, purpose_hint?")]
 	fn ingest_entity(&self, params: Parameters<IngestEntityParams>) -> String {
 		let IngestEntityParams { title, content, purpose_hint } = params.0;
-		self.ingest_chunked("entities", &title, &content, "entity", purpose_hint.as_deref()).to_string()
+		match learn::find_near_duplicate_entity(self.root(), &title, &content) {
+			Ok(Some(existing)) => {
+				let added = if existing.title.to_lowercase() != title.to_lowercase() {
+					store::add_alias_to_entity(self.root(), &existing.id, &title).unwrap_or(false)
+				} else {
+					false
+				};
+				serde_json::json!({
+					"merged_into": existing.id,
+					"existing_title": existing.title,
+					"alias_added": if added { Some(title.as_str()) } else { None },
+					"note": "near-duplicate found — merged as alias, no new doc created"
+				}).to_string()
+			}
+			_ => self.ingest_chunked("entities", &title, &content, "entity", purpose_hint.as_deref()).to_string(),
+		}
 	}
 
 	#[tool(description = "Ingest a reason (directed edge). kind: supports|contradicts|extends|requires|references|derives|instances|PartOf. Args: from_id, to_id, kind, body, purpose_hint?")]
@@ -789,7 +804,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Run a learn pass over the vault: rewrite bare entity mentions as [[wikilinks]], fold paragraphs that are >=WIKI_DEDUPE_THRESHOLD (default 0.85) cosine-similar to an entity body into that entity (emits Consolidates reasons), and write a report to ingest_log/. Args: limit? (default 25), purpose? (filter doc set), dry_run? (default false)")]
+	#[tool(description = "Run a learn pass over the vault: (1) rewrite bare entity mentions as [[wikilinks]], (2) whenever a surface text variant differs from the entity canonical title and all known aliases it is automatically added as an alias to that entity's frontmatter — so recurring alternate names become first-class aliases rather than one-off links, (3) fold paragraphs >=WIKI_DEDUPE_THRESHOLD (default 0.85) cosine-similar to an entity body into that entity (emits Consolidates reasons), (4) write a report to ingest_log/. Prefer alias merging over wikilink-only when two names refer to the same concept. Args: limit? (default 25), purpose? (filter doc set), dry_run? (default false)")]
 	fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
 		let LearnPassParams { limit, purpose, dry_run } = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);
@@ -820,7 +835,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Single-doc learn variant. Rewrite entity mentions as wikilinks and fold near-duplicate paragraphs into matching entities. Use as ingest-time hook on a freshly created doc. Args: doc_type, id, dry_run?")]
+	#[tool(description = "Single-doc learn variant. Rewrite entity mentions as [[wikilinks]] and auto-add surface text variants as entity aliases (if the matched text differs from all known titles/aliases, it is persisted to the entity's frontmatter aliases list). Fold near-duplicate paragraphs into matching entities. Use as ingest-time hook on a freshly created doc to immediately wire it into the entity graph. Returns aliases_added count. Args: doc_type, id, dry_run?")]
 	fn link_doc(&self, params: Parameters<LinkDocParams>) -> String {
 		let LinkDocParams { doc_type, id, dry_run } = params.0;
 		match learn::link_doc(self.root(), &doc_type, &id, dry_run.unwrap_or(false)) {

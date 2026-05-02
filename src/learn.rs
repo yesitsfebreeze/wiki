@@ -113,10 +113,11 @@ fn in_protected(pos: usize, ranges: &[(usize, usize)]) -> bool {
 	ranges.iter().any(|(s, e)| pos >= *s && pos < *e)
 }
 
-fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, usize) {
+fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, usize, Vec<(String, String)>) {
 	let mut out = body.to_string();
 	let mut count = 0usize;
 	let mut linked_ids: HashSet<String> = HashSet::new();
+	let mut alias_candidates: Vec<(String, String)> = Vec::new();
 
 	let mut all: Vec<(&EntityRef, String)> = Vec::new();
 	for e in entities {
@@ -148,7 +149,14 @@ fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, 
 			if in_protected(m.start(), &prot) {
 				continue;
 			}
-			let surface = &out[m.start()..m.end()];
+			let surface = out[m.start()..m.end()].to_string();
+			// Collect as alias candidate if surface is a new name variant for this entity.
+			let surface_lc = surface.to_lowercase();
+			let already_known = e.title.to_lowercase() == surface_lc
+				|| e.aliases.iter().any(|a| a.to_lowercase() == surface_lc);
+			if !already_known {
+				alias_candidates.push((e.id.clone(), surface.clone()));
+			}
 			let link = format!("[[{}|{}]]", e.slug, surface);
 			let mut new = String::with_capacity(out.len() + link.len());
 			new.push_str(&out[..m.start()]);
@@ -159,7 +167,44 @@ fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, 
 			linked_ids.insert(e.id.clone());
 		}
 	}
-	(out, count)
+	(out, count, alias_candidates)
+}
+
+pub fn find_near_duplicate_entity(root: &Path, title: &str, content: &str) -> Result<Option<EntityRef>> {
+	let threshold = std::env::var("WIKI_ALIAS_THRESHOLD")
+		.ok()
+		.and_then(|s| s.parse::<f32>().ok())
+		.unwrap_or(0.92);
+
+	let entities = build_entity_index(root)?;
+	let title_lc = title.trim().to_lowercase();
+
+	// Exact title or alias match first (cheap).
+	for e in &entities {
+		if e.title.to_lowercase() == title_lc {
+			return Ok(Some(e.clone()));
+		}
+		if e.aliases.iter().any(|a| a.to_lowercase() == title_lc) {
+			return Ok(Some(e.clone()));
+		}
+	}
+
+	// Embedding similarity (requires OpenAI key).
+	if !content.is_empty() {
+		if let Ok(embs) = classifier::embed_batch(&[content.to_string()]) {
+			if let Some(content_emb) = embs.into_iter().next() {
+				for e in &entities {
+					if let Some(ev) = &e.body_embedding {
+						if classifier::cosine(&content_emb, ev) >= threshold {
+							return Ok(Some(e.clone()));
+						}
+					}
+				}
+			}
+		}
+	}
+
+	Ok(None)
 }
 
 fn dedupe_paragraphs(
@@ -218,21 +263,29 @@ pub fn link_doc_internal(
 ) -> Result<serde_json::Value> {
 	let doc = store::get_document(root, doc_type, id)?;
 	let original = doc.content.clone();
-	let (linked, link_count) = rewrite_links(&original, entities, id);
+	let (linked, link_count, alias_candidates) = rewrite_links(&original, entities, id);
 	let (deduped, merges) = dedupe_paragraphs(&linked, entities, id);
 	let modified = deduped != original;
 
-	if !dry_run && modified {
-		store::update_document(root, doc_type, id, Some(&deduped), None)?;
-		for (entity_id, hash) in &merges {
-			let _ = store::create_reason(
-				root,
-				entity_id,
-				id,
-				"Consolidates",
-				&format!("absorbed paragraph hash:{}", hash),
-				doc.purpose.as_deref(),
-			);
+	let mut aliases_added = 0usize;
+	if !dry_run {
+		if modified {
+			store::update_document(root, doc_type, id, Some(&deduped), None)?;
+			for (entity_id, hash) in &merges {
+				let _ = store::create_reason(
+					root,
+					entity_id,
+					id,
+					"Consolidates",
+					&format!("absorbed paragraph hash:{}", hash),
+					doc.purpose.as_deref(),
+				);
+			}
+		}
+		for (entity_id, surface) in &alias_candidates {
+			if let Ok(true) = store::add_alias_to_entity(root, entity_id, surface) {
+				aliases_added += 1;
+			}
 		}
 	}
 
@@ -240,6 +293,7 @@ pub fn link_doc_internal(
 		"doc_id": id,
 		"doc_type": doc_type,
 		"links_added": link_count,
+		"aliases_added": aliases_added,
 		"paragraphs_merged": merges.len(),
 		"modified": !dry_run && modified,
 		"dry_run": dry_run,

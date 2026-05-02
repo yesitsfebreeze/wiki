@@ -27,15 +27,22 @@ pub struct Document {
 
 pub fn wiki_root() -> PathBuf {
 	let raw = std::env::var("WIKI_PATH").unwrap_or_else(|_| ".wiki".to_string());
-	let p = PathBuf::from(&raw);
+	// Expand ${VAR} placeholders; discard if any remain unexpanded.
+	// Claude Code does not expand ${} in MCP env values (only in hooks).
+	let expanded = if raw.contains("${") {
+		let mut s = raw.clone();
+		for (key, val) in std::env::vars() {
+			s = s.replace(&format!("${{{}}}", key), &val);
+		}
+		if s.contains("${") { ".wiki".to_string() } else { s }
+	} else {
+		raw
+	};
+	let p = PathBuf::from(&expanded);
 	if p.is_absolute() {
 		p
 	} else {
-		std::env::var("CLAUDE_PROJECT_DIR")
-			.ok()
-			.map(|d| PathBuf::from(d).join(&p))
-			.or_else(|| std::env::current_dir().ok().map(|d| d.join(&p)))
-			.unwrap_or(p)
+		std::env::current_dir().ok().map(|d| d.join(&p)).unwrap_or(p)
 	}
 }
 
@@ -308,6 +315,35 @@ pub fn update_document(
 	std::fs::write(&file_path, full)?;
 
 	Ok(doc_from_fm(&fm, body, id))
+}
+
+pub fn add_alias_to_entity(root: &Path, entity_id: &str, alias: &str) -> anyhow::Result<bool> {
+	let dir = root.join("entities");
+	let file_path = find_document_path_by_id(&dir, entity_id)?;
+	let raw = std::fs::read_to_string(&file_path)?;
+	let (mut fm, body) = parse_frontmatter(&raw)?;
+
+	let existing: Vec<String> = fm
+		.get("aliases")
+		.and_then(|v| v.as_array())
+		.map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+		.unwrap_or_default();
+
+	let alias_lc = alias.trim().to_lowercase();
+	let title_lc = fm.get("title").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+	if alias_lc == title_lc || existing.iter().any(|a| a.to_lowercase() == alias_lc) {
+		return Ok(false);
+	}
+
+	let mut new_aliases = existing;
+	new_aliases.push(alias.trim().to_string());
+	if let Some(obj) = fm.as_object_mut() {
+		obj.insert("aliases".to_string(), serde_json::json!(new_aliases));
+		obj.insert("updated_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+	}
+	let fm_str = serde_yaml::to_string(&fm)?;
+	std::fs::write(&file_path, format!("---\n{}---\n\n{}", fm_str, body))?;
+	Ok(true)
 }
 
 pub fn parse_frontmatter(content: &str) -> anyhow::Result<(serde_json::Value, String)> {

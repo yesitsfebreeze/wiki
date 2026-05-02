@@ -14,9 +14,9 @@ pub fn default_index_dir() -> PathBuf {
 	if p.is_absolute() {
 		p
 	} else {
-		std::env::current_exe()
+		std::env::current_dir()
 			.ok()
-			.and_then(|exe| exe.parent().map(|d| d.join(&p)))
+			.map(|d| d.join(&p))
 			.unwrap_or(p)
 	}
 }
