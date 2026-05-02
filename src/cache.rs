@@ -1,8 +1,10 @@
-//! Process-global caches for retrieval hot paths.
+//! Per-root caches for retrieval hot paths.
 //!
-//! All caches are keyed by a single wiki root (the binary serves one vault
-//! per process). Mutations in `store` call `invalidate_*` to keep state
-//! coherent without TTLs or generation counters.
+//! Each wiki root (canonicalized `&Path`) gets its own `RootCache`. A
+//! process-wide registry maps roots to caches, so multiple roots in the same
+//! process (e.g. parallel tests with `TempDir`s) do not corrupt each other's
+//! state. Mutations in `store` call `invalidate_*` to keep state coherent
+//! without TTLs or generation counters.
 
 use crate::search::SearchIndex;
 use crate::store::Document;
@@ -45,7 +47,7 @@ type ReasonMap = HashMap<String, ReasonAdjacency>;
 type HashMap2 = HashMap<String, Vec<DocRef>>;
 
 #[derive(Default)]
-struct Cache {
+pub struct RootCache {
 	search: Mutex<Option<Arc<SearchIndex>>>,
 	pool: RwLock<HashMap<String, Arc<PoolEntry>>>,
 	pool_seeded: Mutex<bool>,
@@ -58,15 +60,50 @@ struct Cache {
 	hyde: RwLock<HashMap<String, (Instant, Vec<f32>)>>,
 }
 
-fn cache() -> &'static Cache {
-	static C: OnceLock<Cache> = OnceLock::new();
-	C.get_or_init(Cache::default)
+static REGISTRY: OnceLock<RwLock<HashMap<PathBuf, Arc<RootCache>>>> = OnceLock::new();
+
+fn registry() -> &'static RwLock<HashMap<PathBuf, Arc<RootCache>>> {
+	REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn canonical(root: &Path) -> PathBuf {
+	// Normalize to an absolute path. We deliberately avoid `canonicalize`
+	// because (a) it requires the path to exist, and (b) transient I/O
+	// failures (e.g. Windows lock contention on a TempDir under heavy
+	// parallel test load) would shard the registry across multiple keys
+	// for the same logical root and silently lose dirty-set entries.
+	if root.is_absolute() {
+		root.to_path_buf()
+	} else {
+		std::env::current_dir()
+			.map(|cwd| cwd.join(root))
+			.unwrap_or_else(|_| root.to_path_buf())
+	}
+}
+
+/// Resolve (or lazily create) the cache for `root`.
+pub fn root_cache(root: &Path) -> Arc<RootCache> {
+	let key = canonical(root);
+	{
+		let g = registry().read().unwrap();
+		if let Some(c) = g.get(&key) {
+			return c.clone();
+		}
+	}
+	let mut g = registry().write().unwrap();
+	if let Some(c) = g.get(&key) {
+		return c.clone();
+	}
+	let c = Arc::new(RootCache::default());
+	g.insert(key, c.clone());
+	c
 }
 
 // ── SearchIndex ──────────────────────────────────────────────────────────────
 
 pub fn search_index(root: &std::path::Path) -> anyhow::Result<Arc<SearchIndex>> {
-	let mut g = cache().search.lock().unwrap();
+	let c = root_cache(root);
+	let mut g = c.search.lock().unwrap();
 	if let Some(idx) = g.as_ref() {
 		return Ok(idx.clone());
 	}
@@ -77,44 +114,56 @@ pub fn search_index(root: &std::path::Path) -> anyhow::Result<Arc<SearchIndex>> 
 
 // ── Embedding pool ───────────────────────────────────────────────────────────
 
-pub fn pool_seeded() -> bool {
-	*cache().pool_seeded.lock().unwrap()
+pub fn pool_seeded(root: &Path) -> bool {
+	*root_cache(root).pool_seeded.lock().unwrap()
 }
 
-pub fn mark_pool_seeded() {
-	*cache().pool_seeded.lock().unwrap() = true;
+pub fn mark_pool_seeded(root: &Path) {
+	*root_cache(root).pool_seeded.lock().unwrap() = true;
 }
 
-pub fn pool_get(id: &str) -> Option<Arc<PoolEntry>> {
-	cache().pool.read().unwrap().get(id).cloned()
+pub fn pool_get(root: &Path, id: &str) -> Option<Arc<PoolEntry>> {
+	root_cache(root).pool.read().unwrap().get(id).cloned()
 }
 
-pub fn pool_snapshot() -> Vec<Arc<PoolEntry>> {
-	cache().pool.read().unwrap().values().cloned().collect()
+pub fn pool_snapshot(root: &Path) -> Vec<Arc<PoolEntry>> {
+	root_cache(root).pool.read().unwrap().values().cloned().collect()
 }
 
-pub fn pool_insert(entry: PoolEntry) {
-	cache()
+pub fn pool_insert(root: &Path, entry: PoolEntry) {
+	root_cache(root)
 		.pool
 		.write()
 		.unwrap()
 		.insert(entry.doc.id.clone(), Arc::new(entry));
 }
 
-pub fn pool_remove(id: &str) {
-	cache().pool.write().unwrap().remove(id);
-	mark_pool_dirty(id);
+pub fn pool_remove(root: &Path, id: &str) {
+	root_cache(root).pool.write().unwrap().remove(id);
+	mark_pool_dirty(root, id);
 }
 
 /// Mark a doc id as needing re-embedding on the next `refresh_pool`.
-pub fn mark_pool_dirty(id: &str) {
-	cache().dirty_pool_ids.write().unwrap().insert(id.to_string());
+pub fn mark_pool_dirty(root: &Path, id: &str) {
+	let c = root_cache(root);
+	dbg_log(&format!("mark_pool_dirty root={:?} canon={:?} ptr={:p} id={}", root, canonical(root), Arc::as_ptr(&c), id));
+	c.dirty_pool_ids.write().unwrap().insert(id.to_string());
+}
+
+fn dbg_log(msg: &str) {
+	use std::io::Write;
+	if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:/Users/sayhe/dbg_wiki.log") {
+		let _ = writeln!(f, "[{:?}] {}", std::thread::current().id(), msg);
+	}
 }
 
 /// Snapshot + clear the dirty set. Returned ids should be re-checked /
 /// re-embedded by the caller.
-pub fn drain_dirty_pool() -> Vec<String> {
-	let mut g = cache().dirty_pool_ids.write().unwrap();
+pub fn drain_dirty_pool(root: &Path) -> Vec<String> {
+	let c = root_cache(root);
+	let g_data: Vec<String> = c.dirty_pool_ids.read().unwrap().iter().cloned().collect();
+	dbg_log(&format!("drain_dirty_pool root={:?} canon={:?} ptr={:p} contains={:?}", root, canonical(root), Arc::as_ptr(&c), g_data));
+	let mut g = c.dirty_pool_ids.write().unwrap();
 	let out: Vec<String> = g.iter().cloned().collect();
 	g.clear();
 	out
@@ -122,18 +171,18 @@ pub fn drain_dirty_pool() -> Vec<String> {
 
 // ── Entity index ─────────────────────────────────────────────────────────────
 
-pub fn entity_index_get() -> Option<Arc<Vec<crate::learn::EntityRef>>> {
-	cache().entity_index.read().unwrap().clone()
+pub fn entity_index_get(root: &Path) -> Option<Arc<Vec<crate::learn::EntityRef>>> {
+	root_cache(root).entity_index.read().unwrap().clone()
 }
 
-pub fn entity_index_set(v: Vec<crate::learn::EntityRef>) -> Arc<Vec<crate::learn::EntityRef>> {
+pub fn entity_index_set(root: &Path, v: Vec<crate::learn::EntityRef>) -> Arc<Vec<crate::learn::EntityRef>> {
 	let arc = Arc::new(v);
-	*cache().entity_index.write().unwrap() = Some(arc.clone());
+	*root_cache(root).entity_index.write().unwrap() = Some(arc.clone());
 	arc
 }
 
-pub fn invalidate_entities() {
-	*cache().entity_index.write().unwrap() = None;
+pub fn invalidate_entities(root: &Path) {
+	*root_cache(root).entity_index.write().unwrap() = None;
 }
 
 // ── Tag / reason / hash indexes ──────────────────────────────────────────────
@@ -210,17 +259,14 @@ fn build_indexes(root: &Path) -> (TagMap, ReasonMap, HashMap2) {
 }
 
 fn ensure_indexes(root: &Path) {
-	let need_build = {
-		let c = cache();
-		c.tag_index.read().unwrap().is_none()
-			|| c.reason_index.read().unwrap().is_none()
-			|| c.hash_index.read().unwrap().is_none()
-	};
+	let c = root_cache(root);
+	let need_build = c.tag_index.read().unwrap().is_none()
+		|| c.reason_index.read().unwrap().is_none()
+		|| c.hash_index.read().unwrap().is_none();
 	if !need_build {
 		return;
 	}
 	let (tag_idx, reason_idx, hash_idx) = build_indexes(root);
-	let c = cache();
 	*c.tag_index.write().unwrap() = Some(Arc::new(tag_idx));
 	*c.reason_index.write().unwrap() = Some(Arc::new(reason_idx));
 	*c.hash_index.write().unwrap() = Some(Arc::new(hash_idx));
@@ -228,7 +274,7 @@ fn ensure_indexes(root: &Path) {
 
 pub fn tag_index_lookup(root: &Path, tag: &str) -> Vec<DocRef> {
 	ensure_indexes(root);
-	cache()
+	root_cache(root)
 		.tag_index
 		.read()
 		.unwrap()
@@ -239,7 +285,7 @@ pub fn tag_index_lookup(root: &Path, tag: &str) -> Vec<DocRef> {
 
 pub fn reason_index_lookup(root: &Path, node_id: &str) -> ReasonAdjacency {
 	ensure_indexes(root);
-	cache()
+	root_cache(root)
 		.reason_index
 		.read()
 		.unwrap()
@@ -252,7 +298,7 @@ pub fn reason_index_lookup(root: &Path, node_id: &str) -> ReasonAdjacency {
 /// arbitrary across calls; callers needing a specific doc_type must filter.
 pub fn hash_index_lookup(root: &Path, hash_tag: &str) -> Vec<DocRef> {
 	ensure_indexes(root);
-	cache()
+	root_cache(root)
 		.hash_index
 		.read()
 		.unwrap()
@@ -261,8 +307,8 @@ pub fn hash_index_lookup(root: &Path, hash_tag: &str) -> Vec<DocRef> {
 		.unwrap_or_default()
 }
 
-pub fn invalidate_indexes() {
-	let c = cache();
+pub fn invalidate_indexes(root: &Path) {
+	let c = root_cache(root);
 	*c.tag_index.write().unwrap() = None;
 	*c.reason_index.write().unwrap() = None;
 	*c.hash_index.write().unwrap() = None;
@@ -270,15 +316,17 @@ pub fn invalidate_indexes() {
 
 // ── expand_questions ─────────────────────────────────────────────────────────
 
-pub fn expand_get(prompt: &str) -> Option<Vec<String>> {
-	let g = cache().expand.read().unwrap();
+pub fn expand_get(root: &Path, prompt: &str) -> Option<Vec<String>> {
+	let c = root_cache(root);
+	let g = c.expand.read().unwrap();
 	g.get(prompt).and_then(|(t, v)| {
 		if t.elapsed() < EXPAND_TTL { Some(v.clone()) } else { None }
 	})
 }
 
-pub fn expand_set(prompt: &str, queries: Vec<String>) {
-	let mut g = cache().expand.write().unwrap();
+pub fn expand_set(root: &Path, prompt: &str, queries: Vec<String>) {
+	let c = root_cache(root);
+	let mut g = c.expand.write().unwrap();
 	// Lazy GC: evict expired entries when we touch the map.
 	g.retain(|_, (t, _)| t.elapsed() < EXPAND_TTL);
 	g.insert(prompt.to_string(), (Instant::now(), queries));
@@ -286,15 +334,17 @@ pub fn expand_set(prompt: &str, queries: Vec<String>) {
 
 // ── HyDE ─────────────────────────────────────────────────────────────────────
 
-pub fn hyde_get(prompt: &str) -> Option<Vec<f32>> {
-	let g = cache().hyde.read().unwrap();
+pub fn hyde_get(root: &Path, prompt: &str) -> Option<Vec<f32>> {
+	let c = root_cache(root);
+	let g = c.hyde.read().unwrap();
 	g.get(prompt).and_then(|(t, v)| {
 		if t.elapsed() < HYDE_TTL { Some(v.clone()) } else { None }
 	})
 }
 
-pub fn hyde_set(prompt: &str, emb: Vec<f32>) {
-	let mut g = cache().hyde.write().unwrap();
+pub fn hyde_set(root: &Path, prompt: &str, emb: Vec<f32>) {
+	let c = root_cache(root);
+	let mut g = c.hyde.write().unwrap();
 	g.retain(|_, (t, _)| t.elapsed() < HYDE_TTL);
 	g.insert(prompt.to_string(), (Instant::now(), emb));
 }
@@ -303,22 +353,22 @@ pub fn hyde_set(prompt: &str, emb: Vec<f32>) {
 
 /// Doc was created/updated. Invalidate dependent caches and signal that the
 /// embedding pool entry (if any) is stale.
-pub fn on_doc_changed(id: &str, doc_type: &str) {
-	pool_remove(id);
-	mark_pool_dirty(id);
+pub fn on_doc_changed(root: &Path, id: &str, doc_type: &str) {
+	pool_remove(root, id);
+	mark_pool_dirty(root, id);
 	if doc_type == "entities" {
-		invalidate_entities();
+		invalidate_entities(root);
 	}
-	invalidate_indexes();
+	invalidate_indexes(root);
 }
 
-pub fn on_doc_deleted(id: &str, doc_type: &str) {
-	pool_remove(id);
-	mark_pool_dirty(id);
+pub fn on_doc_deleted(root: &Path, id: &str, doc_type: &str) {
+	pool_remove(root, id);
+	mark_pool_dirty(root, id);
 	if doc_type == "entities" {
-		invalidate_entities();
+		invalidate_entities(root);
 	}
-	invalidate_indexes();
+	invalidate_indexes(root);
 }
 
 #[cfg(test)]
@@ -327,55 +377,60 @@ mod tests {
 	use crate::store;
 	use tempfile::TempDir;
 
-	fn drain_only(id: &str) -> bool {
+	fn drain_only(root: &Path, id: &str) -> bool {
 		// Drain everything, then check whether `id` was present.
-		let drained = drain_dirty_pool();
+		let drained = drain_dirty_pool(root);
 		drained.iter().any(|s| s == id)
 	}
 
 	#[test]
 	fn mark_pool_dirty_inserts() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
 		let id = "test-dirty-mark-x-unique-1";
-		// Clear baseline
-		let _ = drain_dirty_pool();
-		mark_pool_dirty(id);
-		assert!(drain_only(id), "marked id should appear in drain");
+		eprintln!("DEBUG mark_pool_dirty_inserts root={:?} canon={:?}", root, canonical(root));
+		mark_pool_dirty(root, id);
+		let drained = drain_dirty_pool(root);
+		eprintln!("DEBUG drained={:?}", drained);
+		assert!(drained.iter().any(|s| s == id), "marked id should appear in drain");
 	}
 
 	#[test]
 	fn drain_clears_set() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
 		let id = "test-dirty-clear-y-unique-2";
-		let _ = drain_dirty_pool();
-		mark_pool_dirty(id);
-		let first = drain_dirty_pool();
+		mark_pool_dirty(root, id);
+		let first = drain_dirty_pool(root);
 		assert!(first.iter().any(|s| s == id));
 		// Second drain must not contain this id (set was cleared).
-		let second = drain_dirty_pool();
+		let second = drain_dirty_pool(root);
 		assert!(!second.iter().any(|s| s == id), "second drain leaked id");
 	}
 
 	#[test]
 	fn on_doc_changed_marks_dirty() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
 		let id = "test-on-changed-z-unique-3";
-		let _ = drain_dirty_pool();
-		on_doc_changed(id, "thoughts");
-		assert!(drain_only(id), "on_doc_changed must mark dirty");
+		on_doc_changed(root, id, "thoughts");
+		assert!(drain_only(root, id), "on_doc_changed must mark dirty");
 	}
 
 	#[test]
 	fn on_doc_deleted_marks_dirty() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
 		let id = "test-on-deleted-w-unique-4";
-		let _ = drain_dirty_pool();
-		on_doc_deleted(id, "thoughts");
-		assert!(drain_only(id), "on_doc_deleted must mark dirty");
+		on_doc_deleted(root, id, "thoughts");
+		assert!(drain_only(root, id), "on_doc_deleted must mark dirty");
 	}
 
 	#[test]
 	fn tag_index_returns_docs_with_tag() {
-		invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		store::create_document(root, "thoughts", "A", "a", vec!["x".into()], None, None).unwrap();
 		store::create_document(root, "thoughts", "B", "b", vec!["x".into()], None, None).unwrap();
 		store::create_document(root, "thoughts", "C", "c", vec!["y".into()], None, None).unwrap();
@@ -386,10 +441,9 @@ mod tests {
 
 	#[test]
 	fn tag_index_invalidated_on_create() {
-		invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		store::create_document(root, "thoughts", "A", "a", vec!["t".into()], None, None).unwrap();
 		assert_eq!(tag_index_lookup(root, "t").len(), 1);
 		store::create_document(root, "thoughts", "B", "b", vec!["t".into()], None, None).unwrap();
@@ -398,10 +452,9 @@ mod tests {
 
 	#[test]
 	fn tag_index_invalidated_on_delete() {
-		invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let d = store::create_document(root, "thoughts", "A", "a", vec!["k".into()], None, None).unwrap();
 		assert_eq!(tag_index_lookup(root, "k").len(), 1);
 		store::delete_document(root, "thoughts", &d.id).unwrap();
@@ -410,10 +463,9 @@ mod tests {
 
 	#[test]
 	fn reason_index_from_and_to() {
-		invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
 		let r = store::create_reason(root, &a.id, &b.id, "Answers", "because", None).unwrap();
@@ -425,10 +477,9 @@ mod tests {
 
 	#[test]
 	fn hash_index_finds_question_by_q_tag() {
-		invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let qhash = "q-deadbeef".to_string();
 		let tags = vec!["question".to_string(), qhash.clone()];
 		let q = store::create_document(root, "questions", "Q?", "qb", tags, None, None).unwrap();

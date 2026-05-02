@@ -3,7 +3,7 @@
 //! Resolves a query into candidate tags (matching purpose tags + entity
 //! slugs/aliases + `q-<hash>` if present), seeds docs via the tag index,
 //! then BFS-walks reason edges with kind-weighted distance decay. Used as
-//! the second tier in `smart_search` between `conclusions_first` and the
+//! the second tier in `query` between `conclusions_first` and the
 //! BM25/HyDE/MMR fallback.
 
 use crate::cache::{self, DocRef};
@@ -300,14 +300,12 @@ pub fn tag_walk(root: &Path, query: &str, opts: WalkOpts) -> Result<Vec<WalkHit>
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::store::{create_document, create_purpose, create_reason, ensure_wiki_layout};
+	use crate::store::{bootstrap, create_document, create_purpose, create_reason};
 	use tempfile::TempDir;
 
 	fn fresh_root() -> TempDir {
-		cache::invalidate_indexes();
-		cache::invalidate_entities();
 		let dir = TempDir::new().unwrap();
-		ensure_wiki_layout(dir.path()).unwrap();
+		bootstrap(dir.path()).unwrap();
 		dir
 	}
 

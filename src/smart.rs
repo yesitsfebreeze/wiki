@@ -35,13 +35,16 @@ pub struct ContradictionRef {
 	pub direction: ContradictionDirection,
 }
 
-/// Optional knobs for `smart_search_with_opts`. Defaults preserve legacy
-/// behavior so the public `smart_search` signature is unchanged.
+/// Optional knobs for `query_with_opts`. Defaults preserve legacy
+/// behavior so the public `query` signature is unchanged.
 #[derive(Debug, Clone, Default)]
-pub struct SmartSearchOpts {
+pub struct QueryOpts {
 	/// When true, append separate result hits for each contradicting doc
 	/// reachable via a `Contradicts` reason from a returned hit.
 	pub include_contradiction_docs: bool,
+	/// When true, blend a HyDE-synthesized answer embedding into the query
+	/// embedding before retrieval. Adds one LLM + one embed call.
+	pub hyde: bool,
 }
 
 /// Resolve `id` against any doc directory. Returns `(doc_type, Document)`.
@@ -158,8 +161,8 @@ fn lowercase_terms(query: &str) -> Vec<String> {
 		.collect()
 }
 
-pub async fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
-	if let Some(cached) = cache::expand_get(prompt) {
+pub async fn expand_questions(root: &Path, prompt: &str, n: usize) -> Result<Vec<String>> {
+	if let Some(cached) = cache::expand_get(root, prompt) {
 		return Ok(cached);
 	}
 	#[derive(Deserialize)]
@@ -177,15 +180,15 @@ pub async fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
 		.filter(|s| !s.is_empty())
 		.take(n)
 		.collect();
-	cache::expand_set(prompt, queries.clone());
+	cache::expand_set(root, prompt, queries.clone());
 	Ok(queries)
 }
 
 /// HyDE: generate a hypothetical 1-2 sentence answer and embed it.
 /// Returns the answer embedding, cached for the prompt. Caller can blend
 /// with query embedding for richer recall on semantic queries.
-pub async fn hyde_embedding(prompt: &str) -> Result<Vec<f32>> {
-	if let Some(cached) = cache::hyde_get(prompt) {
+pub async fn hyde_embedding(root: &Path, prompt: &str) -> Result<Vec<f32>> {
+	if let Some(cached) = cache::hyde_get(root, prompt) {
 		return Ok(cached);
 	}
 	let sys = "Given a user question, write a 1-2 sentence hypothetical answer that would \
@@ -199,12 +202,8 @@ pub async fn hyde_embedding(prompt: &str) -> Result<Vec<f32>> {
 	let texts = vec![parsed.answer];
 	let embs = http::embed_batch(&texts).await?;
 	let emb = embs.into_iter().next().ok_or_else(|| anyhow!("hyde embed empty"))?;
-	cache::hyde_set(prompt, emb.clone());
+	cache::hyde_set(root, prompt, emb.clone());
 	Ok(emb)
-}
-
-fn hyde_enabled() -> bool {
-	std::env::var("WIKI_HYDE").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
 }
 
 fn blend(a: &[f32], b: &[f32], w_a: f32) -> Vec<f32> {
@@ -266,12 +265,12 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 	let dir = emb_dir(root);
 	std::fs::create_dir_all(&dir)?;
 
-	let pool_was_seeded = cache::pool_seeded();
+	let pool_was_seeded = cache::pool_seeded(root);
 
 	// Hot path (already seeded): only re-check ids in the dirty set, then
 	// return the full pool snapshot. Avoids walking 250+ docs per query.
 	if pool_was_seeded {
-		let dirty: HashSet<String> = cache::drain_dirty_pool().into_iter().collect();
+		let dirty: HashSet<String> = cache::drain_dirty_pool(root).into_iter().collect();
 		if !dirty.is_empty() {
 			let docs: Vec<(String, Document)> = load_all_docs(root)
 				.into_iter()
@@ -290,7 +289,7 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 						.unwrap_or(false);
 				if disk_fresh {
 					if let Ok(v) = wiki_io::read_vec_f32(&vec_p, None) {
-						cache::pool_insert(cache::PoolEntry {
+						cache::pool_insert(root, cache::PoolEntry {
 							doc_type: dt.clone(),
 							doc: doc.clone(),
 							content_hash: hash,
@@ -312,7 +311,7 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 					let hash_p = dir.join(format!("{}.hash", doc.id));
 					wiki_io::write_vec_f32(&vec_p, &emb)?;
 					wiki_io::write_atomic_str(&hash_p, hash)?;
-					cache::pool_insert(cache::PoolEntry {
+					cache::pool_insert(root, cache::PoolEntry {
 						doc_type: dt.clone(),
 						doc: doc.clone(),
 						content_hash: hash.clone(),
@@ -324,7 +323,7 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 			// Deleted docs were already evicted by `on_doc_deleted` before
 			// being marked dirty — nothing to clean up here.
 		}
-		return Ok(cache::pool_snapshot());
+		return Ok(cache::pool_snapshot(root));
 	}
 
 	// Cold path (first call): full walk to seed the pool.
@@ -336,7 +335,7 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 	for (i, (dt, doc)) in docs.iter().enumerate() {
 		let hash = format!("{:x}", wiki_io::fnv64(&doc.content));
 		// In-memory hit?
-		if let Some(existing) = cache::pool_get(&doc.id) {
+		if let Some(existing) = cache::pool_get(root, &doc.id) {
 			if existing.content_hash == hash {
 				entries.push(Some(existing));
 				continue;
@@ -357,13 +356,13 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 					content_hash: hash,
 					vec: v,
 				};
-				cache::pool_insert(cache::PoolEntry {
+				cache::pool_insert(root, cache::PoolEntry {
 					doc_type: entry.doc_type.clone(),
 					doc: entry.doc.clone(),
 					content_hash: entry.content_hash.clone(),
 					vec: entry.vec.clone(),
 				});
-				entries.push(cache::pool_get(&doc.id));
+				entries.push(cache::pool_get(root, &doc.id));
 				continue;
 			}
 		}
@@ -385,13 +384,13 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 			let hash_p = dir.join(format!("{}.hash", doc.id));
 			wiki_io::write_vec_f32(&vec_p, &emb)?;
 			wiki_io::write_atomic_str(&hash_p, &hash)?;
-			cache::pool_insert(cache::PoolEntry {
+			cache::pool_insert(root, cache::PoolEntry {
 				doc_type: dt.clone(),
 				doc: doc.clone(),
 				content_hash: hash,
 				vec: emb,
 			});
-			entries[i] = cache::pool_get(&doc.id);
+			entries[i] = cache::pool_get(root, &doc.id);
 		}
 		cursor = end;
 	}
@@ -400,15 +399,15 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 	// after deletes — rare path).
 	if !pool_was_seeded {
 		let live_ids: HashSet<&str> = docs.iter().map(|(_, d)| d.id.as_str()).collect();
-		for stale in cache::pool_snapshot()
+		for stale in cache::pool_snapshot(root)
 			.into_iter()
 			.filter(|e| !live_ids.contains(e.doc.id.as_str()))
 		{
-			cache::pool_remove(&stale.doc.id);
+			cache::pool_remove(root, &stale.doc.id);
 		}
-		cache::mark_pool_seeded();
+		cache::mark_pool_seeded(root);
 		// Cold path embedded everything; nothing left to redo.
-		let _ = cache::drain_dirty_pool();
+		let _ = cache::drain_dirty_pool(root);
 	}
 
 	Ok(entries.into_iter().flatten().collect())
@@ -492,23 +491,23 @@ fn detect_purpose_bias(root: &Path, query: &str) -> Option<String> {
 	None
 }
 
-pub async fn smart_search(
+pub async fn query(
 	root: &Path,
 	question: &str,
 	tag_filter: Option<&str>,
 	k: usize,
 	top_n: usize,
 ) -> Result<serde_json::Value> {
-	smart_search_with_opts(root, question, tag_filter, k, top_n, &SmartSearchOpts::default()).await
+	query_with_opts(root, question, tag_filter, k, top_n, &QueryOpts::default()).await
 }
 
-pub async fn smart_search_with_opts(
+pub async fn query_with_opts(
 	root: &Path,
 	question: &str,
 	tag_filter: Option<&str>,
 	k: usize,
 	top_n: usize,
-	opts: &SmartSearchOpts,
+	opts: &QueryOpts,
 ) -> Result<serde_json::Value> {
 	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts)? {
 		return Ok(tree);
@@ -519,7 +518,7 @@ pub async fn smart_search_with_opts(
 	let q_text = vec![question.to_string()];
 	let q_emb_vec = http::embed_batch(&q_text).await?;
 	let q_emb = q_emb_vec.into_iter().next().ok_or_else(|| anyhow!("query embed empty"))?;
-	let mut v = smart_search_with_qemb_opts(root, question, tag_filter, k, top_n, &q_emb, opts).await?;
+	let mut v = query_with_qemb_opts(root, question, tag_filter, k, top_n, &q_emb, opts).await?;
 	if let Some(obj) = v.as_object_mut() {
 		obj.entry("entry_kind").or_insert(serde_json::json!("fallback"));
 	}
@@ -609,7 +608,7 @@ pub(crate) fn conclusions_first(
 	tag_filter: Option<&str>,
 	k: usize,
 ) -> Result<Option<serde_json::Value>> {
-	conclusions_first_with_opts(root, query, tag_filter, k, &SmartSearchOpts::default())
+	conclusions_first_with_opts(root, query, tag_filter, k, &QueryOpts::default())
 }
 
 pub(crate) fn conclusions_first_with_opts(
@@ -617,7 +616,7 @@ pub(crate) fn conclusions_first_with_opts(
 	query: &str,
 	tag_filter: Option<&str>,
 	_k: usize,
-	opts: &SmartSearchOpts,
+	opts: &QueryOpts,
 ) -> Result<Option<serde_json::Value>> {
 	let qterms = lowercase_terms(query);
 	if qterms.is_empty() { return Ok(None); }
@@ -737,7 +736,7 @@ fn resolve_doc(root: &Path, id: &str) -> Option<serde_json::Value> {
 /// Search variant accepting a pre-computed query embedding. Lets callers
 /// (e.g. the prompt-submit hook) batch all sub-query embeds into one
 /// OpenAI call before fanning out N parallel searches.
-pub async fn smart_search_with_qemb(
+pub async fn query_with_qemb(
 	root: &Path,
 	question: &str,
 	tag_filter: Option<&str>,
@@ -745,17 +744,17 @@ pub async fn smart_search_with_qemb(
 	top_n: usize,
 	q_emb: &[f32],
 ) -> Result<serde_json::Value> {
-	smart_search_with_qemb_opts(root, question, tag_filter, k, top_n, q_emb, &SmartSearchOpts::default()).await
+	query_with_qemb_opts(root, question, tag_filter, k, top_n, q_emb, &QueryOpts::default()).await
 }
 
-pub async fn smart_search_with_qemb_opts(
+pub async fn query_with_qemb_opts(
 	root: &Path,
 	question: &str,
 	tag_filter: Option<&str>,
 	k: usize,
 	top_n: usize,
 	q_emb: &[f32],
-	opts: &SmartSearchOpts,
+	opts: &QueryOpts,
 ) -> Result<serde_json::Value> {
 	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts)? {
 		return Ok(tree);
@@ -773,8 +772,8 @@ pub async fn smart_search_with_qemb_opts(
 	let pool_fut = refresh_pool(root);
 
 	let hyde_fut = async {
-		if hyde_enabled() {
-			hyde_embedding(question).await.ok()
+		if opts.hyde {
+			hyde_embedding(root, question).await.ok()
 		} else {
 			None
 		}
@@ -848,7 +847,7 @@ pub async fn smart_search_with_qemb_opts(
 	// using cached embeddings where available.
 	let mut mmr_pool: Vec<(String, f32, Vec<f32>)> = Vec::new();
 	for (id, fused_score) in &fused {
-		if let Some(entry) = cache::pool_get(id) {
+		if let Some(entry) = cache::pool_get(root, id) {
 			mmr_pool.push((id.clone(), *fused_score, entry.vec.clone()));
 		}
 	}
@@ -951,7 +950,7 @@ pub async fn smart_search_with_qemb_opts(
 	Ok(serde_json::json!({
 		"question": question,
 		"k_retrieved": hits.len(),
-		"hyde": hyde_enabled(),
+		"hyde": opts.hyde,
 		"purpose_bias": purpose_bias,
 		"results": out,
 	}))
@@ -960,14 +959,14 @@ pub async fn smart_search_with_qemb_opts(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::store::{create_document, create_reason, ensure_wiki_layout};
+	use crate::store::{bootstrap, create_document, create_reason};
 	use tempfile::TempDir;
 
 	#[test]
 	fn conclusions_first_returns_none_on_empty() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let r = conclusions_first(root, "anything matters", None, 10).unwrap();
 		assert!(r.is_none());
 	}
@@ -976,7 +975,7 @@ mod tests {
 	fn conclusions_first_walks_reasons() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let conc = create_document(
 			root, "conclusions", "Quantum entanglement summary",
 			"Quantum entanglement is correlated state.",
@@ -1024,7 +1023,7 @@ mod tests {
 	fn score_higher_with_more_answers_edges() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let a = create_document(root, "conclusions", "alpha topic",
 			"alpha topic body", vec!["conclusion".into()], None, None).unwrap();
 		let b = create_document(root, "conclusions", "alpha topic two",
@@ -1044,7 +1043,7 @@ mod tests {
 	fn score_lower_with_contradicts() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let a = create_document(root, "conclusions", "beta topic",
 			"beta topic body", vec!["conclusion".into()], None, None).unwrap();
 		let b = create_document(root, "conclusions", "beta topic two",
@@ -1062,7 +1061,7 @@ mod tests {
 	fn weight_factor_amplifies_score() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let big = create_document(root, "conclusions", "gamma topic",
 			"gamma topic body", vec!["conclusion".into()], None, None).unwrap();
 		let small = create_document(root, "conclusions", "gamma topic alt",
@@ -1082,7 +1081,7 @@ mod tests {
 	fn missing_node_size_defaults_to_one() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let c = create_document(root, "conclusions", "delta topic",
 			"delta body", vec!["conclusion".into()], None, None).unwrap();
 		assert!((node_weight_factor(root, &c.id, "conclusions") - 1.0).abs() < 1e-9);
@@ -1092,7 +1091,7 @@ mod tests {
 	fn hit_carries_contradiction_refs() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let a = create_document(
 			root, "conclusions", "Alpha says X causes Y",
 			"alpha body discussing causal claim",
@@ -1123,7 +1122,7 @@ mod tests {
 	fn bidirectional_detection() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let a = create_document(
 			root, "conclusions", "Alpha unique-term-aaa",
 			"body aaa", vec!["conclusion".into()], None, None,
@@ -1163,7 +1162,7 @@ mod tests {
 	fn include_contradiction_docs_expands_results() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		let a = create_document(
 			root, "conclusions", "Alpha widgetzzz claim",
 			"alpha body", vec!["conclusion".into()], None, None,
@@ -1177,7 +1176,7 @@ mod tests {
 		let v = conclusions_first(root, "widgetzzz", None, 10).unwrap().expect("hit");
 		assert!(v["results"].as_array().unwrap().is_empty());
 
-		let opts = SmartSearchOpts { include_contradiction_docs: true };
+		let opts = QueryOpts { include_contradiction_docs: true, hyde: false };
 		let v2 = conclusions_first_with_opts(root, "widgetzzz", None, 10, &opts)
 			.unwrap()
 			.expect("hit");
@@ -1188,10 +1187,10 @@ mod tests {
 	}
 
 	#[test]
-	fn smart_search_falls_back_when_no_conclusions() {
+	fn query_falls_back_when_no_conclusions() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		create_document(
 			root, "thoughts", "Lone thought", "lonely body content",
 			vec!["thought".into()], None, None,

@@ -2,7 +2,7 @@
 //!
 //! Writes `node_size` (int in [6, 100]) into doc frontmatter so Obsidian's
 //! CustomNodeSize plugin scales graph nodes by importance. The same `raw`
-//! score is reused by `smart_search` ranking.
+//! score is reused by `query` ranking.
 
 use crate::cache;
 use crate::store;
@@ -159,8 +159,7 @@ mod tests {
 
 	fn fresh() -> TempDir {
 		let dir = TempDir::new().unwrap();
-		store::ensure_wiki_layout(dir.path()).unwrap();
-		cache::invalidate_indexes();
+		store::bootstrap(dir.path()).unwrap();
 		dir
 	}
 
@@ -194,7 +193,7 @@ mod tests {
 			.unwrap();
 			store::create_reason(root, &q.id, &c1.id, "Answers", "ans", None).unwrap();
 		}
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		let r1 = compute_weight(root, &c1.id, "conclusions");
 		let r2 = compute_weight(root, &c2.id, "conclusions");
 		assert!(r1 > r2, "answered conclusion ({}) should outweigh isolated ({})", r1, r2);
@@ -208,7 +207,7 @@ mod tests {
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
 		let baseline = compute_weight(root, &a.id, "entities");
 		store::create_reason(root, &b.id, &a.id, "Contradicts", "x", None).unwrap();
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		let after = compute_weight(root, &a.id, "entities");
 		assert!(after < baseline, "contradicts must reduce weight ({} >= {})", after, baseline);
 	}
@@ -220,7 +219,7 @@ mod tests {
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
 		store::create_reason(root, &a.id, &b.id, "Supports", "s", None).unwrap();
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		let n = recompute_all(root).unwrap();
 		assert_eq!(n, 2);
 		for id in [&a.id, &b.id] {
@@ -239,7 +238,7 @@ mod tests {
 		let a = store::create_document(root, "thoughts", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "conclusions", "B", "b", vec![], None, None).unwrap();
 		store::create_reason(root, &a.id, &b.id, "Derives", "d", None).unwrap();
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		recompute_all(root).unwrap();
 		let read_ns = |dt: &str, id: &str| -> u64 {
 			let p = store::find_document_path_by_id(&root.join(dt), id).unwrap();
@@ -249,7 +248,7 @@ mod tests {
 		};
 		let a1 = read_ns("thoughts", &a.id);
 		let b1 = read_ns("conclusions", &b.id);
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		recompute_all(root).unwrap();
 		let a2 = read_ns("thoughts", &a.id);
 		let b2 = read_ns("conclusions", &b.id);
@@ -264,7 +263,7 @@ mod tests {
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
 		let r = store::create_reason(root, &a.id, &b.id, "Supports", "s", None).unwrap();
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		recompute_all(root).unwrap();
 		let p = store::find_document_path_by_id(&root.join("reasons"), &r.id).unwrap();
 		let raw = std::fs::read_to_string(&p).unwrap();
@@ -276,7 +275,7 @@ mod tests {
 		let dir = fresh();
 		let root = dir.path();
 		let q = store::create_document(root, "questions", "Q", "q", vec![], None, None).unwrap();
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		recompute_all(root).unwrap();
 		let p = store::find_document_path_by_id(&root.join("questions"), &q.id).unwrap();
 		let raw = std::fs::read_to_string(&p).unwrap();

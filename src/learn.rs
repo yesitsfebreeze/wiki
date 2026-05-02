@@ -26,16 +26,29 @@ pub struct AnswerCandidate {
 	pub body: String,
 }
 
-fn answer_threshold() -> f32 {
-	std::env::var("WIKI_ANSWER_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8)
+/// Tunable knobs for `run_pass`. Defaults preserve prior env-driven behavior.
+/// Pass `&PassConfig::default()` for the legacy values.
+#[derive(Debug, Clone, Copy)]
+pub struct PassConfig {
+	/// Cosine ≥ this → `Answers` edge + mark question resolved.
+	pub answer_threshold: f32,
+	/// Cosine ≥ this and < `answer_threshold` → `Supports` edge / weak link floor.
+	pub support_threshold: f32,
+	/// Hard cap on LLM calls per `run_pass` invocation.
+	pub qa_max_per_pass: usize,
+	/// Merge into existing conclusion if cosine ≥ this.
+	pub conclusion_merge_threshold: f32,
 }
 
-fn support_threshold() -> f32 {
-	std::env::var("WIKI_SUPPORT_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.3)
-}
-
-fn qa_max_per_pass() -> usize {
-	std::env::var("WIKI_QA_MAX_PER_PASS").ok().and_then(|s| s.parse().ok()).unwrap_or(50)
+impl Default for PassConfig {
+	fn default() -> Self {
+		Self {
+			answer_threshold: 0.8,
+			support_threshold: 0.3,
+			qa_max_per_pass: 50,
+			conclusion_merge_threshold: 0.92,
+		}
+	}
 }
 
 const DEFAULT_QUESTION_DEDUPE_THRESHOLD: f32 = 0.88;
@@ -123,7 +136,7 @@ fn read_entity_meta(root: &Path, id: &str) -> Option<(Vec<String>, String, Optio
 }
 
 pub async fn build_entity_index(root: &Path) -> Result<Arc<Vec<EntityRef>>> {
-	if let Some(cached) = cache::entity_index_get() {
+	if let Some(cached) = cache::entity_index_get(root) {
 		return Ok(cached);
 	}
 	let entities = store::list_documents(root, "entities")?;
@@ -149,7 +162,7 @@ pub async fn build_entity_index(root: &Path) -> Result<Arc<Vec<EntityRef>>> {
 			}
 		}
 	}
-	Ok(cache::entity_index_set(refs))
+	Ok(cache::entity_index_set(root, refs))
 }
 
 fn protected_re() -> &'static [Regex] {
@@ -481,6 +494,7 @@ async fn qa_for_doc(
 	root: &Path,
 	doc: &store::Document,
 	llm_budget: &mut usize,
+	cfg: &PassConfig,
 ) -> Result<(u64, u64, u64)> {
 	if *llm_budget == 0 {
 		return Ok((0, 0, 0));
@@ -520,12 +534,12 @@ async fn qa_for_doc(
 
 	let mut answered = 0u64;
 	let mut promoted = 0u64;
-	let strong = answer_threshold();
+	let strong = cfg.answer_threshold;
 
 	for (qid, qtitle, qpurpose) in q_targets {
 		if *llm_budget == 0 { break; }
 		*llm_budget = llm_budget.saturating_sub(1);
-		let cands = match cross_reference_question(root, &qtitle, qpurpose.as_deref()).await {
+		let cands = match cross_reference_question(root, &qtitle, qpurpose.as_deref(), cfg.support_threshold).await {
 			Ok(v) => v,
 			Err(_) => continue,
 		};
@@ -549,14 +563,14 @@ async fn qa_for_doc(
 			}
 			if *llm_budget == 0 { continue; }
 			*llm_budget = llm_budget.saturating_sub(1);
-			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &strong_edges).await {
+			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &strong_edges, cfg).await {
 				promoted += 1;
 			}
-		} else if max_score >= support_threshold() && *llm_budget >= 2 {
+		} else if max_score >= cfg.support_threshold && *llm_budget >= 2 {
 			// In-purpose answer fell below threshold but cleared the support
 			// floor. Try ONE cross-topic fallback pass (no recursion).
 			*llm_budget = llm_budget.saturating_sub(2);
-			if let Ok(n) = cross_topic_pass(root, &qid).await {
+			if let Ok(n) = cross_topic_pass(root, &qid, cfg).await {
 				if n > 0 {
 					answered += 1;
 					promoted += 1;
@@ -575,6 +589,7 @@ pub async fn run_pass(
 	dry_run: bool,
 	qa: bool,
 	force: bool,
+	cfg: &PassConfig,
 ) -> Result<serde_json::Value> {
 	let entities = build_entity_index(root).await?;
 
@@ -622,7 +637,7 @@ pub async fn run_pass(
 	let mut questions_raised = 0u64;
 	let mut questions_answered = 0u64;
 	let mut conclusions_promoted = 0u64;
-	let mut llm_budget = qa_max_per_pass();
+	let mut llm_budget = cfg.qa_max_per_pass;
 	let mut details = Vec::new();
 	let mut last_processed: Option<(String, String)> = None;
 	let mut skipped_recent = 0u64;
@@ -660,7 +675,7 @@ pub async fn run_pass(
 			continue;
 		}
 		let Ok(doc) = store::get_document(root, dt, id) else { continue };
-		match qa_for_doc(root, &doc, &mut llm_budget).await {
+		match qa_for_doc(root, &doc, &mut llm_budget, cfg).await {
 			Ok((raised, answered, promoted)) => {
 				questions_raised += raised;
 				questions_answered += answered;
@@ -693,7 +708,7 @@ pub async fn run_pass(
 			if llm_budget < 2 { break; }
 			if !should_invoke_cross_topic(root, &qid) { continue; }
 			llm_budget = llm_budget.saturating_sub(2);
-			if let Ok(n) = cross_topic_pass(root, &qid).await {
+			if let Ok(n) = cross_topic_pass(root, &qid, cfg).await {
 				if n > 0 {
 					crosstopic_invoked += 1;
 					questions_answered += 1;
@@ -932,7 +947,7 @@ pub async fn gather_open_question_embeddings(
 		if dref.doc_type != "questions" || resolved.contains(&dref.id) {
 			continue;
 		}
-		if let Some(entry) = cache::pool_get(&dref.id) {
+		if let Some(entry) = cache::pool_get(root, &dref.id) {
 			from_pool.push(entry.vec.clone());
 		} else if let Ok(qd) = store::get_document(root, "questions", &dref.id) {
 			miss_titles.push(qd.title);
@@ -1170,8 +1185,9 @@ pub async fn cross_reference_question(
 	root: &Path,
 	question: &str,
 	purpose: Option<&str>,
+	support_threshold: f32,
 ) -> Result<Vec<AnswerCandidate>> {
-	let res = smart::smart_search(root, question, purpose, 5, 5).await?;
+	let res = smart::query(root, question, purpose, 5, 5).await?;
 	let results = res.get("results").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 	if results.is_empty() {
 		return Ok(Vec::new());
@@ -1198,9 +1214,8 @@ pub async fn cross_reference_question(
 	let parsed: ScoredResp = serde_json::from_str(&raw)
 		.map_err(|e| anyhow::anyhow!("cross-ref parse: {} body: {}", e, raw))?;
 
-	let support = support_threshold();
 	let out = parsed.scored.into_iter()
-		.filter(|c| c.score >= support)
+		.filter(|c| c.score >= support_threshold)
 		.map(|c| AnswerCandidate {
 			doc_type: id_to_dt.get(&c.picked_id).cloned().unwrap_or_else(|| "thoughts".to_string()),
 			doc_id: c.picked_id,
@@ -1333,8 +1348,9 @@ async fn cross_topic_emit_and_promote(
 	question_id: &str,
 	question_purpose: Option<&str>,
 	candidates: &[AnswerCandidate],
+	cfg: &PassConfig,
 ) -> Result<usize> {
-	let strong = answer_threshold();
+	let strong = cfg.answer_threshold;
 	let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
 	let mut got_answer = false;
 	for c in candidates {
@@ -1378,7 +1394,7 @@ async fn cross_topic_emit_and_promote(
 		}
 	}
 
-	let cid = promote_to_conclusion(root, question_id, &strong_edges).await?;
+	let cid = promote_to_conclusion(root, question_id, &strong_edges, cfg).await?;
 	if let Some(cid) = cid.as_ref() {
 		let _ = tag_conclusion_with_bridges(root, cid, &bridges);
 	}
@@ -1393,25 +1409,16 @@ async fn cross_topic_emit_and_promote(
 /// strong matches emits `Answers` edges + marks the question resolved + tags
 /// the resulting conclusion as `crosstopic` with `bridges-<purpose>` tags.
 ///
-/// Returns the number of strong (≥ `WIKI_ANSWER_THRESHOLD`) edges emitted.
+/// Returns the number of strong (≥ `cfg.answer_threshold`) edges emitted.
 /// Does NOT recurse — call once per question per pass.
-pub async fn cross_topic_pass(root: &Path, question_id: &str) -> Result<usize> {
+pub async fn cross_topic_pass(root: &Path, question_id: &str, cfg: &PassConfig) -> Result<usize> {
 	let q = store::get_document(root, "questions", question_id)?;
-	let cands = cross_reference_question(root, &q.title, None).await?;
+	let cands = cross_reference_question(root, &q.title, None, cfg.support_threshold).await?;
 	if cands.is_empty() {
 		return Ok(0);
 	}
 	let scored = apply_bridging_bonus(root, cands, q.purpose.as_deref());
-	cross_topic_emit_and_promote(root, question_id, q.purpose.as_deref(), &scored).await
-}
-
-const DEFAULT_CONCLUSION_MERGE_THRESHOLD: f32 = 0.92;
-
-fn conclusion_merge_threshold() -> f32 {
-	std::env::var("WIKI_CONCLUSION_MERGE_THRESHOLD")
-		.ok()
-		.and_then(|s| s.parse().ok())
-		.unwrap_or(DEFAULT_CONCLUSION_MERGE_THRESHOLD)
+	cross_topic_emit_and_promote(root, question_id, q.purpose.as_deref(), &scored, cfg).await
 }
 
 /// Find an existing conclusion in the same `purpose` whose embedding cosine
@@ -1431,7 +1438,7 @@ pub fn find_similar_conclusion(
 		if dref.doc_type != "conclusions" {
 			continue;
 		}
-		let Some(entry) = cache::pool_get(&dref.id) else { continue };
+		let Some(entry) = cache::pool_get(root, &dref.id) else { continue };
 		let s = classifier::cosine(body_emb, &entry.vec);
 		if s >= threshold && best.as_ref().is_none_or(|(_, bs)| s > *bs) {
 			best = Some((dref.id.clone(), s));
@@ -1444,6 +1451,7 @@ pub async fn promote_to_conclusion(
 	root: &Path,
 	question_id: &str,
 	edges: &[AnswerCandidate],
+	cfg: &PassConfig,
 ) -> Result<Option<String>> {
 	let question = store::get_document(root, "questions", question_id)?;
 	let hash = fnv_question_id(&question.title);
@@ -1482,7 +1490,7 @@ pub async fn promote_to_conclusion(
 	// Embedding-similarity merge: if the synthesized body is near-identical to
 	// an existing conclusion in this purpose, consolidate instead of forking.
 	let body_text = format!("{}\n\n{}", question.title, parsed.body);
-	let threshold = conclusion_merge_threshold();
+	let threshold = cfg.conclusion_merge_threshold;
 	let body_embs = http::embed_batch(&[body_text]).await?;
 	if let Some(body_emb) = body_embs.into_iter().next() {
 		if let Some((existing_id, _)) =
@@ -1507,7 +1515,7 @@ pub async fn promote_to_conclusion(
 	)?;
 
 	let _ = store::create_reason(root, question_id, &cdoc.id, "Derives", "promoted from resolved question", purpose.as_deref());
-	let strong = answer_threshold();
+	let strong = cfg.answer_threshold;
 	for e in edges {
 		if e.score >= strong {
 			let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", &e.body, purpose.as_deref());
@@ -1773,7 +1781,7 @@ mod tests {
 	fn raise_questions_dedup_via_hash() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let title = "Does borrowing prevent data races?";
 		let hash = fnv_question_id(title);
 		let tags = vec!["question".to_string(), "general".to_string(), hash.clone()];
@@ -1784,7 +1792,7 @@ mod tests {
 		assert!(find_question_by_hash(root, "q-deadbeef").is_none());
 	}
 
-	fn seed_pool_entry(id: &str, doc_type: &str, title: &str, content: &str, vec: Vec<f32>) {
+	fn seed_pool_entry(root: &Path, id: &str, doc_type: &str, title: &str, content: &str, vec: Vec<f32>) {
 		let doc = store::Document {
 			id: id.to_string(),
 			title: title.to_string(),
@@ -1795,7 +1803,7 @@ mod tests {
 			updated_at: String::new(),
 			content: content.to_string(),
 		};
-		cache::pool_insert(cache::PoolEntry {
+		cache::pool_insert(root, cache::PoolEntry {
 			doc_type: doc_type.to_string(),
 			doc,
 			content_hash: "x".to_string(),
@@ -1807,7 +1815,7 @@ mod tests {
 	fn promote_creates_new_when_no_similar() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		// Empty vault: no conclusions in purpose => merge check returns None.
 		let probe = vec![1.0, 0.0, 0.0];
 		let hit = find_similar_conclusion(root, &probe, "general", 0.92);
@@ -1818,7 +1826,7 @@ mod tests {
 	fn promote_merges_when_similar() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		// Existing conclusion in purpose `general` with a known embedding.
 		let existing_emb = vec![0.6, 0.8, 0.0];
@@ -1831,7 +1839,7 @@ mod tests {
 			Some("general"),
 			None,
 		).unwrap();
-		seed_pool_entry(&cdoc.id, "conclusions", &cdoc.title, &cdoc.content, existing_emb.clone());
+		seed_pool_entry(root, &cdoc.id, "conclusions", &cdoc.title, &cdoc.content, existing_emb.clone());
 
 		// Probe is near-identical (cosine ≈ 1.0) → should merge.
 		let probe = vec![0.6, 0.8, 0.0];
@@ -1843,22 +1851,17 @@ mod tests {
 		let no_hit = find_similar_conclusion(root, &ortho, "general", 0.92);
 		assert!(no_hit.is_none());
 
-		cache::pool_remove(&cdoc.id);
+		cache::pool_remove(root, &cdoc.id);
 	}
 
 	#[test]
-	fn merge_threshold_respects_env() {
-		// Default threshold path.
-		std::env::remove_var("WIKI_CONCLUSION_MERGE_THRESHOLD");
-		assert!((conclusion_merge_threshold() - 0.92).abs() < 1e-6);
-
-		// Override path: a 0.99 threshold rejects a high-but-not-perfect cosine.
-		std::env::set_var("WIKI_CONCLUSION_MERGE_THRESHOLD", "0.99");
-		assert!((conclusion_merge_threshold() - 0.99).abs() < 1e-6);
+	fn merge_threshold_param_controls_similarity_match() {
+		// Default cfg uses 0.92.
+		assert!((PassConfig::default().conclusion_merge_threshold - 0.92).abs() < 1e-6);
 
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let cdoc = store::create_document(
 			root,
 			"conclusions",
@@ -1870,19 +1873,17 @@ mod tests {
 		).unwrap();
 		// Existing has a slightly different embedding (cosine ≈ 0.94).
 		let existing = vec![1.0, 0.0, 0.0];
-		seed_pool_entry(&cdoc.id, "conclusions", &cdoc.title, &cdoc.content, existing);
-		let probe = vec![0.94, 0.34, 0.0]; // cosine with [1,0,0] ≈ 0.94
+		seed_pool_entry(root, &cdoc.id, "conclusions", &cdoc.title, &cdoc.content, existing);
+		let probe = vec![0.94, 0.34, 0.0];
 		let cos = classifier::cosine(&probe, &[1.0, 0.0, 0.0]);
 		assert!(cos > 0.92 && cos < 0.99, "cos={}", cos);
 
-		// At 0.99 threshold -> no merge.
-		let strict = conclusion_merge_threshold();
-		assert!(find_similar_conclusion(root, &probe, "general", strict).is_none());
-		// At 0.92 threshold -> merge.
+		// Strict threshold rejects.
+		assert!(find_similar_conclusion(root, &probe, "general", 0.99).is_none());
+		// Default threshold accepts.
 		assert!(find_similar_conclusion(root, &probe, "general", 0.92).is_some());
 
-		cache::pool_remove(&cdoc.id);
-		std::env::remove_var("WIKI_CONCLUSION_MERGE_THRESHOLD");
+		cache::pool_remove(root, &cdoc.id);
 	}
 
 	fn mk_thought(root: &Path, title: &str, purpose: &str) -> String {
@@ -1896,11 +1897,11 @@ mod tests {
 	async fn cursor_advances_after_pass() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let mut ids = Vec::new();
 		for i in 0..5 { ids.push(mk_thought(root, &format!("t{}", i), "p1")); }
 
-		let _ = run_pass(root, 2, Some("p1"), false, false, false).await.unwrap();
+		let _ = run_pass(root, 2, Some("p1"), false, false, false, &PassConfig::default()).await.unwrap();
 		let cur = read_pass_cursor(root, "p1").expect("cursor written");
 		assert_eq!(cur.0, "thoughts");
 		// Cursor must point at one of the thoughts processed.
@@ -1911,7 +1912,7 @@ mod tests {
 	async fn cursor_resumes_from_position() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let mut ids = Vec::new();
 		for i in 0..5 { ids.push(mk_thought(root, &format!("t{}", i), "p1")); }
 		// list_documents is filesystem-ordered; capture true order:
@@ -1921,7 +1922,7 @@ mod tests {
 
 		// Set cursor at order[2] → next pass should start at order[3].
 		write_pass_cursor(root, "p1", "thoughts", &order[2]).unwrap();
-		let report = run_pass(root, 2, Some("p1"), false, false, false).await.unwrap();
+		let report = run_pass(root, 2, Some("p1"), false, false, false, &PassConfig::default()).await.unwrap();
 		let details = report["details"].as_array().unwrap();
 		let processed_ids: Vec<String> = details
 			.iter()
@@ -1934,14 +1935,14 @@ mod tests {
 	async fn cursor_wraps_when_exhausted() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		for i in 0..3 { mk_thought(root, &format!("t{}", i), "p1"); }
 		let docs = store::list_documents(root, "thoughts").unwrap();
 		let order: Vec<String> = docs.into_iter().map(|d| d.id).collect();
 
 		// Cursor at last → next pass should wrap to start.
 		write_pass_cursor(root, "p1", "thoughts", &order[2]).unwrap();
-		let report = run_pass(root, 2, Some("p1"), false, false, false).await.unwrap();
+		let report = run_pass(root, 2, Some("p1"), false, false, false, &PassConfig::default()).await.unwrap();
 		let details = report["details"].as_array().unwrap();
 		let processed: Vec<String> = details
 			.iter()
@@ -1954,7 +1955,7 @@ mod tests {
 	fn last_qa_at_skips_recent() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let id = mk_thought(root, "t-recent", "p1");
 		stamp_last_qa_at(root, "thoughts", &id).unwrap();
 		assert!(doc_qa_is_recent(root, "thoughts", &id));
@@ -1985,7 +1986,7 @@ mod tests {
 		// so with force=true the doc is processed regardless. We assert this guard directly.
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let id = mk_thought(root, "t-recent", "p1");
 		stamp_last_qa_at(root, "thoughts", &id).unwrap();
 		let recent = doc_qa_is_recent(root, "thoughts", &id);
@@ -1998,10 +1999,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn promote_to_conclusion_idempotent() {
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let qtitle = "What is ownership?";
 		let qhash = fnv_question_id(qtitle);
 		let qtags = vec!["question".to_string(), "general".to_string(), qhash.clone()];
@@ -2011,7 +2011,7 @@ mod tests {
 		let ctags = vec!["conclusion".to_string(), "general".to_string(), qhash.clone()];
 		let cdoc = store::create_document(root, "conclusions", qtitle, "existing", ctags, Some("general"), None).unwrap();
 
-		let result = promote_to_conclusion(root, &qdoc.id, &[]).await.unwrap();
+		let result = promote_to_conclusion(root, &qdoc.id, &[], &PassConfig::default()).await.unwrap();
 		assert_eq!(result, Some(cdoc.id));
 		// No new conclusion was added.
 		let concs = store::list_documents(root, "conclusions").unwrap();
@@ -2063,10 +2063,9 @@ mod tests {
 
 	#[test]
 	fn purpose_cap_blocks_new_raises() {
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		// Force a low cap so we don't have to spam create_document.
 		std::env::set_var("WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP", "3");
 		// Three open questions in purpose "phyons".
@@ -2090,17 +2089,16 @@ mod tests {
 		let hash = fnv_question_id(title);
 		let tags = vec!["question".to_string(), purpose.to_string(), hash];
 		let q = store::create_document(root, "questions", title, "body", tags, Some(purpose), None).unwrap();
-		seed_pool_entry(&q.id, "questions", title, "body", vec);
+		seed_pool_entry(root, &q.id, "questions", title, "body", vec);
 		q.id
 	}
 
 	#[tokio::test]
 	async fn dedupe_drops_near_duplicate() {
-		cache::invalidate_indexes();
 		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		// Existing open question w/ embedding e1.
 		let e1 = vec![1.0, 0.0, 0.0];
@@ -2113,16 +2111,15 @@ mod tests {
 		let kept = dedupe_candidates_by_embedding(&[e2], &existing, 0.88);
 		assert!(kept.is_empty(), "near-duplicate must be dropped");
 
-		cache::pool_remove(&qid);
+		cache::pool_remove(root, &qid);
 	}
 
 	#[tokio::test]
 	async fn dedupe_keeps_distinct() {
-		cache::invalidate_indexes();
 		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		let qid = seed_open_question(root, "p1", "What causes X?", vec![1.0, 0.0, 0.0]);
 		let cand = vec![0.0, 1.0, 0.0]; // orthogonal -> cosine 0
@@ -2130,15 +2127,14 @@ mod tests {
 		let kept = dedupe_candidates_by_embedding(&[cand], &existing, 0.88);
 		assert_eq!(kept, vec![0]);
 
-		cache::pool_remove(&qid);
+		cache::pool_remove(root, &qid);
 	}
 
 	#[tokio::test]
 	async fn dedupe_threshold_respects_env() {
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		let qid = seed_open_question(root, "p1", "What causes X?", vec![1.0, 0.0, 0.0]);
 		// Near-but-not-perfect cosine ≈ 0.94.
@@ -2163,16 +2159,15 @@ mod tests {
 		);
 
 		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
-		cache::pool_remove(&qid);
+		cache::pool_remove(root, &qid);
 	}
 
 	#[tokio::test]
 	async fn dedupe_runs_after_template_filter() {
-		cache::invalidate_indexes();
 		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		// Existing open Q in purpose w/ known embedding.
 		let qid = seed_open_question(root, "p1", "What causes X?", vec![1.0, 0.0, 0.0]);
@@ -2210,15 +2205,14 @@ mod tests {
 		assert_eq!(semantic_dropped, 1);
 		assert_eq!(keep_idx.len(), 1);
 
-		cache::pool_remove(&qid);
+		cache::pool_remove(root, &qid);
 	}
 
 	#[test]
 	fn migration_deletes_unanswered_templates() {
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		// Anchor doc to point Answers at.
 		let anchor = store::create_document(
@@ -2266,10 +2260,9 @@ mod tests {
 
 	#[test]
 	fn migration_dry_run_deletes_nothing() {
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 		let t = "What are the implications of 'X'?";
 		let hash = fnv_question_id(t);
 		let tags = vec!["question".to_string(), "p".to_string(), hash];
@@ -2289,10 +2282,9 @@ mod tests {
 		// (`cross_topic_emit_and_promote`) with a hand-built strong candidate
 		// to verify edges + resolved + bridge tags. The pre-seeded conclusion
 		// short-circuits `promote_to_conclusion`'s LLM call.
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		// Question in purpose A.
 		let qtitle = "How does Clustered Forward+ relate to deferred shading?";
@@ -2330,7 +2322,7 @@ mod tests {
 			body: "directly explains the relation".to_string(),
 		}];
 
-		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("phyons"), &cands).await.unwrap();
+		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("phyons"), &cands, &PassConfig::default()).await.unwrap();
 		assert_eq!(n, 1, "one strong edge expected");
 
 		// Question is now resolved.
@@ -2355,10 +2347,9 @@ mod tests {
 		// Candidate w/ Supports from 2 purposes (one different from question's)
 		// should be boosted; candidate w/ Supports only from same-purpose docs
 		// should not.
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		let cand_a = store::create_document(
 			root, "thoughts", "A", "a body",
@@ -2389,7 +2380,7 @@ mod tests {
 		// cand_b gets Supports only from the question's own purpose.
 		store::create_reason(root, &same_purpose_src.id, &cand_b.id, "Supports", "z", Some("phyons")).unwrap();
 
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 
 		let cands = vec![
 			AnswerCandidate { doc_id: cand_a.id.clone(), doc_type: "thoughts".into(), score: 0.5, kind: "Supports".into(), body: "".into() },
@@ -2407,10 +2398,9 @@ mod tests {
 	fn auto_trigger_on_multi_support_question() {
 		// A question with Supports edges from ≥2 distinct purposes triggers
 		// `should_invoke_cross_topic` without needing a QA failure.
-		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		store::ensure_wiki_layout(root).unwrap();
+		store::bootstrap(root).unwrap();
 
 		let qtitle = "Open question?";
 		let qhash = fnv_question_id(qtitle);
@@ -2433,11 +2423,11 @@ mod tests {
 
 		store::create_reason(root, &src_a.id, &qdoc.id, "Supports", "z", Some("phyons")).unwrap();
 		// Single-purpose so far → must NOT trigger.
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		assert!(!should_invoke_cross_topic(root, &qdoc.id));
 
 		store::create_reason(root, &src_b.id, &qdoc.id, "Supports", "z", Some("forward-plus")).unwrap();
-		cache::invalidate_indexes();
+		cache::invalidate_indexes(root);
 		assert!(should_invoke_cross_topic(root, &qdoc.id));
 		let purposes = question_support_purposes(root, &qdoc.id);
 		assert!(purposes.contains("phyons"));

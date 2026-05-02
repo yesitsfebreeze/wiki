@@ -1,10 +1,13 @@
 use crate::cache;
 use crate::io::write_atomic_str;
 use chrono::Utc;
+use include_dir::{include_dir, Dir, DirEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+static OBSIDIAN_TEMPLATE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/obsidian");
 
 const DOC_TYPES: &[&str] = &["thoughts", "entities", "reasons", "questions", "conclusions"];
 
@@ -48,12 +51,44 @@ pub fn wiki_root() -> PathBuf {
 	}
 }
 
-pub fn ensure_wiki_layout(root: &Path) -> anyhow::Result<()> {
+/// Initialize wiki vault: create required subdirs and seed `.obsidian/` from
+/// the embedded template (only files that don't already exist, so user edits
+/// survive). Idempotent — safe to call on every entry point.
+pub fn bootstrap(root: &Path) -> anyhow::Result<()> {
 	for dir in &[
 		"purposes", "thoughts", "entities", "reasons", "questions",
-		"conclusions", "ingest_log", "auto_links", "assets", ".search",
+		"conclusions", "ingest_log", "assets", ".search",
 	] {
 		std::fs::create_dir_all(root.join(dir))?;
+	}
+	seed_obsidian(&root.join(".obsidian"))?;
+	Ok(())
+}
+
+fn seed_obsidian(target: &Path) -> anyhow::Result<()> {
+	std::fs::create_dir_all(target)?;
+	seed_dir(&OBSIDIAN_TEMPLATE, target)
+}
+
+fn seed_dir(dir: &Dir<'_>, target: &Path) -> anyhow::Result<()> {
+	for entry in dir.entries() {
+		match entry {
+			DirEntry::Dir(d) => {
+				let sub = target.join(d.path().file_name().unwrap_or_default());
+				std::fs::create_dir_all(&sub)?;
+				seed_dir(d, &sub)?;
+			}
+			DirEntry::File(f) => {
+				let dest = target.join(f.path().file_name().unwrap_or_default());
+				if dest.exists() {
+					continue;
+				}
+				if let Some(parent) = dest.parent() {
+					std::fs::create_dir_all(parent)?;
+				}
+				std::fs::write(&dest, f.contents())?;
+			}
+		}
 	}
 	Ok(())
 }
@@ -90,7 +125,8 @@ pub fn list_purposes(root: &Path) -> anyhow::Result<Vec<Purpose>> {
 pub fn create_purpose(root: &Path, tag: &str, title: &str, description: &str) -> anyhow::Result<Purpose> {
 	let dir = root.join("purposes");
 	std::fs::create_dir_all(&dir)?;
-	let path = dir.join(format!("{}.md", tag));
+	let slug = slugify(tag);
+	let path = dir.join(format!("{}.md", slug));
 	if path.exists() {
 		return Err(anyhow::anyhow!("Purpose '{}' already exists", tag));
 	}
@@ -115,16 +151,17 @@ pub fn create_purpose(root: &Path, tag: &str, title: &str, description: &str) ->
 }
 
 pub fn delete_purpose(root: &Path, tag: &str) -> anyhow::Result<()> {
-	let path = root.join("purposes").join(format!("{}.md", tag));
+	let slug = slugify(tag);
+	let path = root.join("purposes").join(format!("{}.md", slug));
 	if !path.exists() {
 		return Err(anyhow::anyhow!("Purpose '{}' not found", tag));
 	}
 	std::fs::remove_file(&path)?;
-	let _ = std::fs::remove_file(root.join("purposes").join(format!("{}.vec", tag)));
+	let _ = std::fs::remove_file(root.join("purposes").join(format!("{}.vec", slug)));
 	Ok(())
 }
 
-fn slugify(title: &str) -> String {
+pub fn slugify(title: &str) -> String {
 	title
 		.to_lowercase()
 		.chars()
@@ -226,6 +263,7 @@ pub fn create_document(
 	let id = Uuid::new_v4().to_string();
 	let now = Utc::now().to_rfc3339();
 	let slug = slugify(title);
+	debug_assert!(crate::sanitize::is_clean_stem(&slug) || slug.is_empty());
 
 	let mut fm_obj = serde_json::json!({
 		"id": id,
@@ -248,7 +286,7 @@ pub fn create_document(
 	let file_path = unique_path(&dir, &slug);
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, content))?;
 	let _ = update_link_index(root);
-	cache::on_doc_changed(&id, doc_type);
+	cache::on_doc_changed(root, &id, doc_type);
 
 	Ok(Document {
 		id,
@@ -267,11 +305,13 @@ pub fn get_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<Doc
 	// Fast path: `id` is a relative path inside the type dir (`<purpose>/<name>`).
 	let rel_path = dir.join(format!("{}.md", id));
 	if rel_path.is_file() {
+		let rel_path = crate::sanitize::ensure_sanitized(root, &rel_path)?;
 		let content = std::fs::read_to_string(&rel_path)?;
 		let (fm, body) = parse_frontmatter(&content)?;
 		return Ok(doc_from_fm(&fm, body, id));
 	}
 	let file_path = find_document_path_by_id(&dir, id)?;
+	let file_path = crate::sanitize::ensure_sanitized(root, &file_path)?;
 	let content = std::fs::read_to_string(&file_path)?;
 	let (fm, body) = parse_frontmatter(&content)?;
 	Ok(doc_from_fm(&fm, body, id))
@@ -297,6 +337,7 @@ pub fn update_document(
 ) -> anyhow::Result<Document> {
 	let dir = root.join(doc_type);
 	let file_path = find_document_path_by_id(&dir, id)?;
+	let file_path = crate::sanitize::ensure_sanitized(root, &file_path)?;
 
 	let raw = std::fs::read_to_string(&file_path)?;
 	let (mut fm, mut body) = parse_frontmatter(&raw)?;
@@ -314,7 +355,7 @@ pub fn update_document(
 
 	let fm_str = serde_yaml::to_string(&fm)?;
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
-	cache::on_doc_changed(id, doc_type);
+	cache::on_doc_changed(root, id, doc_type);
 
 	Ok(doc_from_fm(&fm, body, id))
 }
@@ -345,7 +386,7 @@ pub fn add_alias_to_entity(root: &Path, entity_id: &str, alias: &str) -> anyhow:
 	}
 	let fm_str = serde_yaml::to_string(&fm)?;
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
-	cache::on_doc_changed(entity_id, "entities");
+	cache::on_doc_changed(root, entity_id, "entities");
 	Ok(true)
 }
 
@@ -401,6 +442,7 @@ pub fn create_reason(
 	let now = Utc::now().to_rfc3339();
 	let title = format!("{} -[{}]-> {}", from_id, kind, to_id);
 	let slug = slugify(&format!("{}-{}-{}", from_id, kind, to_id));
+	debug_assert!(crate::sanitize::is_clean_stem(&slug) || slug.is_empty());
 
 	let mut fm_obj = serde_json::json!({
 		"id": id,
@@ -426,7 +468,7 @@ pub fn create_reason(
 	let file_path = unique_path(&dir, &slug);
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, body))?;
 	let _ = update_link_index(root);
-	cache::on_doc_changed(&id, "reasons");
+	cache::on_doc_changed(root, &id, "reasons");
 
 	let mut tags = vec!["reason".to_string()];
 	if let Some(p) = purpose {
@@ -450,7 +492,7 @@ pub fn delete_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<
 	let file_path = find_document_path_by_id(&dir, id)?;
 	std::fs::remove_file(&file_path)?;
 	let _ = update_link_index(root);
-	cache::on_doc_deleted(id, doc_type);
+	cache::on_doc_deleted(root, id, doc_type);
 	if let Ok(idx) = cache::search_index(root) {
 		let _ = crate::search::delete_by_id(&idx, id);
 	}
@@ -520,7 +562,7 @@ mod tests {
 	fn test_create_purpose_and_list() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		create_purpose(root, "topic-a", "Topic A", "Sample topic").unwrap();
 		let purposes = list_purposes(root).unwrap();
 		assert_eq!(purposes.len(), 1);
@@ -531,7 +573,7 @@ mod tests {
 	fn test_delete_purpose() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
-		ensure_wiki_layout(root).unwrap();
+		bootstrap(root).unwrap();
 		create_purpose(root, "x", "X", "desc").unwrap();
 		delete_purpose(root, "x").unwrap();
 		assert!(list_purposes(root).unwrap().is_empty());
