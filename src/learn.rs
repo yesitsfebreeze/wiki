@@ -11,6 +11,7 @@ pub struct EntityRef {
 	pub title: String,
 	pub aliases: Vec<String>,
 	pub slug: String,
+	pub purpose: Option<String>,
 	pub body_embedding: Option<Vec<f32>>,
 }
 
@@ -30,37 +31,30 @@ fn fnv64(s: &str) -> u64 {
 	h
 }
 
-fn read_entity_meta(root: &Path, id: &str) -> Option<(Vec<String>, String)> {
+fn read_entity_meta(root: &Path, id: &str) -> Option<(Vec<String>, String, Option<String>)> {
 	let dir = root.join("entities");
-	let entries = std::fs::read_dir(&dir).ok()?;
-	for entry in entries.flatten() {
-		let path = entry.path();
-		if path.extension().and_then(|s| s.to_str()) != Some("md") {
+	for path in store::walk_md_paths(&dir) {
+		let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+		let Ok((fm, _)) = store::parse_frontmatter(&raw) else { continue };
+		if fm.get("id").and_then(|v| v.as_str()) != Some(id) {
 			continue;
 		}
-		let Ok(raw) = std::fs::read_to_string(&path) else {
-			continue;
-		};
-		let Ok((fm, _)) = store::parse_frontmatter(&raw) else {
-			continue;
-		};
-		if fm.get("id").and_then(|v| v.as_str()) == Some(id) {
-			let aliases = fm
-				.get("aliases")
-				.and_then(|v| v.as_array())
-				.map(|a| {
-					a.iter()
-						.filter_map(|v| v.as_str().map(String::from))
-						.collect()
-				})
-				.unwrap_or_default();
-			let slug = path
-				.file_stem()
-				.and_then(|s| s.to_str())
-				.map(String::from)
-				.unwrap_or_else(|| id.to_string());
-			return Some((aliases, slug));
-		}
+		let aliases = fm
+			.get("aliases")
+			.and_then(|v| v.as_array())
+			.map(|a| {
+				a.iter()
+					.filter_map(|v| v.as_str().map(String::from))
+					.collect()
+			})
+			.unwrap_or_default();
+		let slug = path
+			.file_stem()
+			.and_then(|s| s.to_str())
+			.map(String::from)
+			.unwrap_or_else(|| id.to_string());
+		let purpose = fm.get("purpose").and_then(|v| v.as_str()).map(String::from);
+		return Some((aliases, slug, purpose));
 	}
 	None
 }
@@ -70,13 +64,15 @@ pub fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
 	let mut refs: Vec<EntityRef> = Vec::new();
 	let mut texts: Vec<String> = Vec::new();
 	for e in entities {
-		let (aliases, slug) = read_entity_meta(root, &e.id).unwrap_or((Vec::new(), e.id.clone()));
+		let (aliases, slug, purpose) = read_entity_meta(root, &e.id)
+			.unwrap_or_else(|| (Vec::new(), e.id.clone(), e.purpose.clone()));
 		texts.push(e.content.clone());
 		refs.push(EntityRef {
 			id: e.id.clone(),
 			title: e.title.clone(),
 			aliases,
 			slug,
+			purpose,
 			body_embedding: None,
 		});
 	}
@@ -157,7 +153,8 @@ fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, 
 			if !already_known {
 				alias_candidates.push((e.id.clone(), surface.clone()));
 			}
-			let link = format!("[[{}|{}]]", e.slug, surface);
+			let purpose_seg = e.purpose.clone().unwrap_or_else(|| "uncategorized".to_string());
+			let link = format!("[[entities/{}/{}|{}]]", purpose_seg, e.slug, surface);
 			let mut new = String::with_capacity(out.len() + link.len());
 			new.push_str(&out[..m.start()]);
 			new.push_str(&link);
@@ -254,6 +251,107 @@ fn dedupe_paragraphs(
 	(kept.join("\n\n"), merges)
 }
 
+/// Walk wikilinks in `body` and return the set of distinct purposes the
+/// targets belong to. Recognises both new-style `[[type/purpose/name]]`
+/// (purpose read from path) and legacy `[[type/id]]` (purpose looked up via
+/// frontmatter). Bare `[[slug]]` links are skipped — too ambiguous post-migration.
+fn collect_link_purposes(root: &Path, body: &str) -> HashSet<String> {
+	let mut out: HashSet<String> = HashSet::new();
+	let re = match Regex::new(r"\[\[([^\]|#]+?)(?:[#|][^\]]*)?\]\]") {
+		Ok(r) => r,
+		Err(_) => return out,
+	};
+	for cap in re.captures_iter(body) {
+		let target = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+		if target.is_empty() { continue; }
+		let parts: Vec<&str> = target.split('/').collect();
+		match parts.len() {
+			3 => {
+				// `<type>/<purpose>/<name>` — purpose is encoded in the path.
+				out.insert(parts[1].to_string());
+			}
+			2 => {
+				// `<type>/<id-or-relpath>` — resolve through store.
+				if let Ok(doc) = store::get_document(root, parts[0], parts[1]) {
+					if let Some(p) = doc.purpose { out.insert(p); }
+				}
+			}
+			_ => {}
+		}
+	}
+	out
+}
+
+/// Replace every `[[<old_target>(#|)|...]]` occurrence with `[[<new_target>...]]`
+/// across all known doc-type directories in the vault.
+fn rewrite_inbound_links(root: &Path, old_target: &str, new_target: &str) -> Result<()> {
+	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
+	let escaped = regex::escape(old_target);
+	// Match `[[old_target` followed by `]`, `|`, or `#` (a wikilink terminator/modifier).
+	let re = Regex::new(&format!(r"\[\[{}(?P<rest>[\]|#])", escaped))?;
+	let replacement = format!("[[{}$rest", new_target);
+	for dt in &doc_types {
+		let dir = root.join(dt);
+		for path in store::walk_md_paths(&dir) {
+			let raw = match std::fs::read_to_string(&path) {
+				Ok(s) => s,
+				Err(_) => continue,
+			};
+			if !raw.contains(old_target) { continue; }
+			let new = re.replace_all(&raw, replacement.as_str()).to_string();
+			if new != raw {
+				let _ = std::fs::write(&path, new);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Move `<doc_type>/<old_purpose>/<name>.md` to `<doc_type>/crosstopic/<name>.md`
+/// and rewrite every inbound `[[<doc_type>/<old_purpose>/<name>]]` link in the
+/// vault to the new location. No-op if already in `crosstopic` or path not found.
+fn move_to_crosstopic(root: &Path, doc_type: &str, id: &str) -> Result<bool> {
+	let dir = root.join(doc_type);
+	let old_path = store::find_document_path_by_id(&dir, id)?;
+	let parent_name = old_path
+		.parent()
+		.and_then(|p| p.file_name())
+		.and_then(|s| s.to_str())
+		.unwrap_or("");
+	if parent_name == "crosstopic" {
+		return Ok(false);
+	}
+	let stem = old_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.ok_or_else(|| anyhow::anyhow!("missing file stem"))?
+		.to_string();
+	let old_purpose = parent_name.to_string();
+
+	let new_dir = dir.join("crosstopic");
+	std::fs::create_dir_all(&new_dir)?;
+	let mut new_path = new_dir.join(format!("{}.md", stem));
+	let mut suffix = 1;
+	while new_path.exists() {
+		new_path = new_dir.join(format!("{}-{}.md", stem, suffix));
+		suffix += 1;
+	}
+	let new_stem = new_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.unwrap_or(&stem)
+		.to_string();
+
+	std::fs::rename(&old_path, &new_path)?;
+
+	if !old_purpose.is_empty() {
+		let old_target = format!("{}/{}/{}", doc_type, old_purpose, stem);
+		let new_target = format!("{}/crosstopic/{}", doc_type, new_stem);
+		let _ = rewrite_inbound_links(root, &old_target, &new_target);
+	}
+	Ok(true)
+}
+
 pub fn link_doc_internal(
 	root: &Path,
 	doc_type: &str,
@@ -289,6 +387,27 @@ pub fn link_doc_internal(
 		}
 	}
 
+	// Cross-topic detection: if the doc's outgoing wikilinks (plus its own
+	// purpose) span ≥2 distinct topical purposes, relocate it to
+	// `<doc_type>/crosstopic/<name>.md` so the folder layout reflects that
+	// the doc is connective tissue rather than internal to one purpose.
+	let mut moved_to_crosstopic = false;
+	if !dry_run {
+		let mut purposes = collect_link_purposes(root, &deduped);
+		if let Some(p) = doc.purpose.as_deref() {
+			if !p.is_empty() { purposes.insert(p.to_string()); }
+		}
+		// Discount placeholder/system buckets — they shouldn't trigger a move.
+		purposes.remove("uncategorized");
+		purposes.remove("crosstopic");
+		if purposes.len() >= 2 && doc.purpose.as_deref() != Some("crosstopic") {
+			match move_to_crosstopic(root, doc_type, id) {
+				Ok(true) => { moved_to_crosstopic = true; }
+				_ => {}
+			}
+		}
+	}
+
 	Ok(serde_json::json!({
 		"doc_id": id,
 		"doc_type": doc_type,
@@ -296,6 +415,7 @@ pub fn link_doc_internal(
 		"aliases_added": aliases_added,
 		"paragraphs_merged": merges.len(),
 		"modified": !dry_run && modified,
+		"moved_to_crosstopic": moved_to_crosstopic,
 		"dry_run": dry_run,
 	}))
 }

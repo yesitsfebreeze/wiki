@@ -146,20 +146,46 @@ fn slugify(title: &str) -> String {
 		.collect()
 }
 
-fn find_document_path_by_id(dir: &Path, id: &str) -> anyhow::Result<PathBuf> {
+/// Recursively collect every `.md` file under `dir`. Returns empty if missing.
+pub fn walk_md_paths(dir: &Path) -> Vec<PathBuf> {
+	fn rec(d: &Path, out: &mut Vec<PathBuf>) {
+		if !d.exists() { return; }
+		let rd = match std::fs::read_dir(d) { Ok(r) => r, Err(_) => return };
+		for entry in rd.flatten() {
+			let p = entry.path();
+			if p.is_dir() {
+				rec(&p, out);
+			} else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+				out.push(p);
+			}
+		}
+	}
+	let mut out = Vec::new();
+	rec(dir, &mut out);
+	out
+}
+
+/// Resolve a unique target path by appending numeric suffix on collision.
+fn unique_path(dir: &Path, slug: &str) -> PathBuf {
+	let mut p = dir.join(format!("{}.md", slug));
+	let mut n = 1;
+	while p.exists() {
+		p = dir.join(format!("{}-{}.md", slug, n));
+		n += 1;
+	}
+	p
+}
+
+pub fn find_document_path_by_id(dir: &Path, id: &str) -> anyhow::Result<PathBuf> {
 	if !dir.exists() {
 		return Err(anyhow::anyhow!("Directory not found"));
 	}
-	for entry in std::fs::read_dir(dir)? {
-		let entry = entry?;
-		let path = entry.path();
-		if path.extension().and_then(|s| s.to_str()) == Some("md") {
-			if let Ok(content) = std::fs::read_to_string(&path) {
-				if let Ok((fm, _)) = parse_frontmatter(&content) {
-					if let Some(doc_id) = fm.get("id").and_then(|v| v.as_str()) {
-						if doc_id == id {
-							return Ok(path);
-						}
+	for path in walk_md_paths(dir) {
+		if let Ok(content) = std::fs::read_to_string(&path) {
+			if let Ok((fm, _)) = parse_frontmatter(&content) {
+				if let Some(doc_id) = fm.get("id").and_then(|v| v.as_str()) {
+					if doc_id == id {
+						return Ok(path);
 					}
 				}
 			}
@@ -173,20 +199,14 @@ fn update_link_index(root: &Path) -> anyhow::Result<()> {
 	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
 	for doc_type in &doc_types {
 		let dir = root.join(doc_type);
-		if !dir.exists() {
-			continue;
-		}
-		for entry in std::fs::read_dir(&dir)? {
-			let entry = entry?;
-			let path = entry.path();
-			if path.extension().and_then(|s| s.to_str()) == Some("md") {
-				if let Ok(content) = std::fs::read_to_string(&path) {
-					if let Ok((fm, _)) = parse_frontmatter(&content) {
-						if let Some(id) = fm.get("id").and_then(|v| v.as_str()) {
-							if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-								link_map.insert(id.to_string(), filename.to_string());
-							}
-						}
+		for path in walk_md_paths(&dir) {
+			if let Ok(content) = std::fs::read_to_string(&path) {
+				if let Ok((fm, _)) = parse_frontmatter(&content) {
+					if let Some(id) = fm.get("id").and_then(|v| v.as_str()) {
+						// Store path relative to the doc_type dir so callers can locate
+						// files under their purpose subfolder.
+						let rel = path.strip_prefix(&dir).unwrap_or(&path);
+						link_map.insert(id.to_string(), rel.to_string_lossy().to_string());
 					}
 				}
 			}
@@ -223,8 +243,7 @@ pub fn create_document(
 ) -> anyhow::Result<Document> {
 	let id = Uuid::new_v4().to_string();
 	let now = Utc::now().to_rfc3339();
-	let prefix = purpose.map(|p| format!("{}-", p)).unwrap_or_default();
-	let slug = format!("{}{}", prefix, slugify(title));
+	let slug = slugify(title);
 
 	let mut fm_obj = serde_json::json!({
 		"id": id,
@@ -242,9 +261,10 @@ pub fn create_document(
 	let fm = serde_yaml::to_string(&fm_obj)?;
 	let full = format!("---\n{}---\n\n{}", fm, content);
 
-	let dir = root.join(doc_type);
+	let purpose_dir = purpose.unwrap_or("uncategorized");
+	let dir = root.join(doc_type).join(purpose_dir);
 	std::fs::create_dir_all(&dir)?;
-	let file_path = dir.join(format!("{}.md", slug));
+	let file_path = unique_path(&dir, &slug);
 	std::fs::write(&file_path, full)?;
 	let _ = update_link_index(root);
 
@@ -262,6 +282,15 @@ pub fn create_document(
 
 pub fn get_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<Document> {
 	let dir = root.join(doc_type);
+	// First try `id` as a relative path inside the type dir (new layout: `<purpose>/<name>`).
+	// This makes `[[type/purpose/name]]` wikilinks resolve cheaply without scanning.
+	let rel_path = dir.join(format!("{}.md", id));
+	if rel_path.is_file() {
+		let content = std::fs::read_to_string(&rel_path)?;
+		let (fm, body) = parse_frontmatter(&content)?;
+		return Ok(doc_from_fm(&fm, body, id));
+	}
+	// Fall back to a UUID/id frontmatter scan (graph linkage, legacy callers).
 	let file_path = find_document_path_by_id(&dir, id)?;
 	let content = std::fs::read_to_string(&file_path)?;
 	let (fm, body) = parse_frontmatter(&content)?;
@@ -270,18 +299,11 @@ pub fn get_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<Doc
 
 pub fn list_documents(root: &Path, doc_type: &str) -> anyhow::Result<Vec<Document>> {
 	let dir = root.join(doc_type);
-	if !dir.exists() {
-		return Ok(vec![]);
-	}
 	let mut out = Vec::new();
-	for entry in std::fs::read_dir(dir)? {
-		let entry = entry?;
-		let path = entry.path();
-		if path.extension().and_then(|s| s.to_str()) == Some("md") {
-			let content = std::fs::read_to_string(&path)?;
-			let (fm, body) = parse_frontmatter(&content)?;
-			out.push(doc_from_fm(&fm, body, ""));
-		}
+	for path in walk_md_paths(&dir) {
+		let content = std::fs::read_to_string(&path)?;
+		let (fm, body) = parse_frontmatter(&content)?;
+		out.push(doc_from_fm(&fm, body, ""));
 	}
 	Ok(out)
 }
@@ -371,8 +393,7 @@ pub fn create_reason(
 	let id = Uuid::new_v4().to_string();
 	let now = Utc::now().to_rfc3339();
 	let title = format!("{} -[{}]-> {}", from_id, kind, to_id);
-	let prefix = purpose.map(|p| format!("{}-", p)).unwrap_or_default();
-	let slug = format!("{}{}", prefix, slugify(&format!("{}-{}-{}", from_id, kind, to_id)));
+	let slug = slugify(&format!("{}-{}-{}", from_id, kind, to_id));
 
 	let mut fm_obj = serde_json::json!({
 		"id": id,
@@ -393,9 +414,10 @@ pub fn create_reason(
 
 	let fm = serde_yaml::to_string(&fm_obj)?;
 	let full = format!("---\n{}---\n\n{}", fm, body);
-	let dir = root.join("reasons");
+	let purpose_dir = purpose.unwrap_or("uncategorized");
+	let dir = root.join("reasons").join(purpose_dir);
 	std::fs::create_dir_all(&dir)?;
-	let file_path = dir.join(format!("{}.md", slug));
+	let file_path = unique_path(&dir, &slug);
 	std::fs::write(&file_path, full)?;
 	let _ = update_link_index(root);
 
@@ -448,15 +470,7 @@ pub fn search_by_tag(root: &Path, tag: &str) -> anyhow::Result<Vec<Document>> {
 	let mut results = Vec::new();
 	for doc_type in &doc_types {
 		let dir = root.join(doc_type);
-		if !dir.exists() {
-			continue;
-		}
-		for entry in std::fs::read_dir(&dir)? {
-			let entry = entry?;
-			let path = entry.path();
-			if path.extension().and_then(|s| s.to_str()) != Some("md") {
-				continue;
-			}
+		for path in walk_md_paths(&dir) {
 			let raw = std::fs::read_to_string(&path)?;
 			let (fm, body) = parse_frontmatter(&raw)?;
 			let tags: Vec<String> = fm["tags"]
@@ -473,16 +487,8 @@ pub fn search_by_tag(root: &Path, tag: &str) -> anyhow::Result<Vec<Document>> {
 
 pub fn search_reasons_for(root: &Path, node_id: &str, direction: &str) -> anyhow::Result<Vec<Document>> {
 	let dir = root.join("reasons");
-	if !dir.exists() {
-		return Ok(vec![]);
-	}
 	let mut results = Vec::new();
-	for entry in std::fs::read_dir(&dir)? {
-		let entry = entry?;
-		let path = entry.path();
-		if path.extension().and_then(|s| s.to_str()) != Some("md") {
-			continue;
-		}
+	for path in walk_md_paths(&dir) {
 		let raw = std::fs::read_to_string(&path)?;
 		let (fm, body) = parse_frontmatter(&raw)?;
 		let from_id = fm["from_id"].as_str().unwrap_or("");
@@ -497,6 +503,68 @@ pub fn search_reasons_for(root: &Path, node_id: &str, direction: &str) -> anyhow
 		}
 	}
 	Ok(results)
+}
+
+/// Migrate the legacy flat layout (`<type>/<purpose>-<slug>.md`) to the
+/// hierarchical layout (`<type>/<purpose>/<slug>.md`). Strips the
+/// `<purpose>-` prefix from filenames when present. Idempotent: files already
+/// inside a purpose subdir are left alone.
+///
+/// Wipes `.search/` so tantivy reindexes against the new paths.
+pub fn migrate_layout(root: &Path) -> anyhow::Result<serde_json::Value> {
+	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
+	let mut moved: usize = 0;
+	let mut skipped: usize = 0;
+	let mut by_type: HashMap<String, usize> = HashMap::new();
+
+	for doc_type in &doc_types {
+		let dir = root.join(doc_type);
+		if !dir.exists() { continue; }
+		let entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
+			.filter_map(|e| e.ok().map(|e| e.path()))
+			.collect();
+		for path in entries {
+			if path.is_dir() { continue; }
+			if path.extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+
+			let raw = match std::fs::read_to_string(&path) {
+				Ok(s) => s,
+				Err(_) => { skipped += 1; continue; }
+			};
+			let (fm, _body) = match parse_frontmatter(&raw) {
+				Ok(v) => v,
+				Err(_) => { skipped += 1; continue; }
+			};
+			let purpose = fm.get("purpose").and_then(|v| v.as_str())
+				.unwrap_or("uncategorized")
+				.to_string();
+			let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+			let bare = stem.strip_prefix(&format!("{}-", purpose)).unwrap_or(&stem).to_string();
+
+			let new_dir = dir.join(&purpose);
+			std::fs::create_dir_all(&new_dir)?;
+			let new_path = unique_path(&new_dir, &bare);
+			std::fs::rename(&path, &new_path)?;
+			moved += 1;
+			*by_type.entry((*doc_type).to_string()).or_insert(0) += 1;
+		}
+	}
+
+	// Force reindex: drop the search index dir so the next search rebuilds it.
+	let search_dir = root.join(".search");
+	if search_dir.exists() {
+		let _ = std::fs::remove_dir_all(&search_dir);
+	}
+	std::fs::create_dir_all(&search_dir)?;
+
+	let _ = update_link_index(root);
+
+	Ok(serde_json::json!({
+		"moved": moved,
+		"skipped": skipped,
+		"by_type": by_type,
+		"note": "search index wiped; will rebuild on next query",
+	}))
 }
 
 #[cfg(test)]
