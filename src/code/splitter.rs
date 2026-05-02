@@ -204,8 +204,8 @@ fn top_level_text(source: &str, fns: &[FnMeta]) -> String {
 	for f in fns {
 		let lo = f.line_start.saturating_sub(1);
 		let hi = f.line_end.min(lines.len());
-		for i in lo..hi {
-			keep[i] = false;
+		for k in &mut keep[lo..hi] {
+			*k = false;
 		}
 	}
 	lines

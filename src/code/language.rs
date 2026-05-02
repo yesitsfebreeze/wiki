@@ -17,14 +17,20 @@ pub struct Meta {
 
 impl Default for Meta {
     fn default() -> Self {
-        Meta {
-            comment: "//".into(),
-        }
+        Meta { comment: "//".into() }
     }
 }
 
 struct Ctx {
     wasi: wasmtime_wasi::p1::WasiP1Ctx,
+}
+
+/// Shared `wasmtime::Engine`. Engines are expensive to construct; sharing one
+/// per process is the documented pattern. Modules compiled against the engine
+/// can be reused but `Store`s cannot.
+fn engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(Engine::default)
 }
 
 pub fn list() -> Vec<(String, String)> {
@@ -39,32 +45,22 @@ pub fn list() -> Vec<(String, String)> {
     }
 
     if let Some(home) = dirs::home_dir() {
-        let user_dir = home.join(".config/split/languages");
-        if let Ok(rd) = std::fs::read_dir(&user_dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        map.insert(stem.to_string(), "user".into());
-                    }
-                }
-            }
-        }
+        scan_wasm_dir(&home.join(".config/split/languages"), "user", &mut map);
     }
-
-    let proj = PathBuf::from(".wiki/code/languages");
-    if let Ok(rd) = std::fs::read_dir(&proj) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    map.insert(stem.to_string(), "project".into());
-                }
-            }
-        }
-    }
+    scan_wasm_dir(&PathBuf::from(".wiki/code/languages"), "project", &mut map);
 
     map.into_iter().collect()
+}
+
+fn scan_wasm_dir(dir: &Path, source: &str, out: &mut std::collections::BTreeMap<String, String>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("wasm") { continue }
+        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            out.insert(stem.to_string(), source.into());
+        }
+    }
 }
 
 pub fn load(ext: &str) -> Option<Vec<u8>> {
@@ -98,34 +94,37 @@ fn meta_cache() -> &'static Mutex<HashMap<String, Meta>> {
 }
 
 pub fn meta_for_ext(ext: &str) -> Meta {
-    if let Some(m) = meta_cache().lock().unwrap().get(ext).cloned() {
-        return m;
+    {
+        let cache = meta_cache().lock().unwrap();
+        if let Some(m) = cache.get(ext) {
+            return m.clone();
+        }
     }
-    let resolved = if let Some(wasm) = load(ext) {
-        load_meta(&wasm).unwrap_or_default()
-    } else {
-        Meta::default()
-    };
-    meta_cache()
-        .lock()
-        .unwrap()
-        .insert(ext.to_string(), resolved.clone());
+    let resolved = load(ext)
+        .and_then(|wasm| load_meta(&wasm).ok())
+        .unwrap_or_default();
+    meta_cache().lock().unwrap().insert(ext.to_string(), resolved.clone());
     resolved
 }
 
-pub fn load_meta(wasm: &[u8]) -> Result<Meta> {
-    let engine = Engine::default();
-    let mut linker: Linker<Ctx> = Linker::new(&engine);
+fn instantiate(wasm: &[u8]) -> Result<(Store<Ctx>, wasmtime::Instance, wasmtime::Memory)> {
+    let engine = engine();
+    let mut linker: Linker<Ctx> = Linker::new(engine);
     p1::add_to_linker_sync(&mut linker, |c| &mut c.wasi)?;
 
     let wasi = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
-    let mut store = Store::new(&engine, Ctx { wasi });
+    let mut store = Store::new(engine, Ctx { wasi });
 
-    let module = Module::from_binary(&engine, wasm)?;
+    let module = Module::from_binary(engine, wasm)?;
     let instance = linker.instantiate(&mut store, &module)?;
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow!("language module has no memory export"))?;
+    Ok((store, instance, memory))
+}
+
+pub fn load_meta(wasm: &[u8]) -> Result<Meta> {
+    let (mut store, instance, memory) = instantiate(wasm)?;
 
     let ptr_fn = instance.get_typed_func::<(), i32>(&mut store, "language_meta_ptr")?;
     let len_fn = instance.get_typed_func::<(), i32>(&mut store, "language_meta_len")?;
@@ -135,9 +134,7 @@ pub fn load_meta(wasm: &[u8]) -> Result<Meta> {
     memory.read(&store, ptr as usize, &mut buf)?;
 
     #[derive(serde::Deserialize)]
-    struct Raw {
-        comment: String,
-    }
+    struct Raw { comment: String }
     let raw: Raw = serde_json::from_slice(&buf)?;
     Ok(Meta { comment: raw.comment })
 }
@@ -192,18 +189,7 @@ pub fn split(
 }
 
 fn run_wasm(wasm: &[u8], input: &str) -> Result<Vec<u8>> {
-    let engine = Engine::default();
-    let mut linker: Linker<Ctx> = Linker::new(&engine);
-    p1::add_to_linker_sync(&mut linker, |c| &mut c.wasi)?;
-
-    let wasi = wasmtime_wasi::WasiCtxBuilder::new().build_p1();
-    let mut store = Store::new(&engine, Ctx { wasi });
-
-    let module = Module::from_binary(&engine, wasm)?;
-    let instance = linker.instantiate(&mut store, &module)?;
-
-    let memory = instance.get_memory(&mut store, "memory")
-        .ok_or_else(|| anyhow!("language module has no memory export"))?;
+    let (mut store, instance, memory) = instantiate(wasm)?;
 
     let alloc = instance.get_typed_func::<i32, i32>(&mut store, "wasm_alloc")?;
     let split_fn = instance.get_typed_func::<(i32, i32), i32>(&mut store, "language_split")?;

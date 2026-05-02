@@ -1,4 +1,6 @@
 use crate::classifier;
+use crate::http;
+use crate::io as wiki_io;
 use crate::search;
 use crate::store::{self, Document};
 use anyhow::{anyhow, Result};
@@ -6,16 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_RERANK_MODEL: &str = "gpt-4o-mini";
 const MAX_SNIPPET: usize = 800;
-
-fn rerank_model() -> String {
-	std::env::var("WIKI_RERANK_MODEL").unwrap_or_else(|_| DEFAULT_RERANK_MODEL.to_string())
-}
-
-fn openai_key() -> Result<String> {
-	std::env::var("OPENAI_API_KEY").map_err(|_| anyhow!("OPENAI_API_KEY not set"))
-}
+const EMB_BATCH: usize = 64;
+const RRF_K: f32 = 60.0;
 
 #[derive(Serialize)]
 struct Candidate<'a> {
@@ -40,57 +35,20 @@ struct RankedResp {
 	ranked: Vec<RankedItem>,
 }
 
-#[derive(Deserialize)]
-struct ChatChoice {
-	message: ChatMessage,
-}
-#[derive(Deserialize)]
-struct ChatMessage {
-	content: String,
-}
-#[derive(Deserialize)]
-struct ChatResp {
-	choices: Vec<ChatChoice>,
-}
-
 fn snippet(s: &str) -> String {
 	if s.len() <= MAX_SNIPPET {
 		s.to_string()
 	} else {
-		format!("{}…", &s[..MAX_SNIPPET])
+		// Slice on a char boundary.
+		let mut end = MAX_SNIPPET;
+		while !s.is_char_boundary(end) && end > 0 {
+			end -= 1;
+		}
+		format!("{}…", &s[..end])
 	}
 }
 
-pub fn chat_json(system: &str, user: &str) -> Result<String> {
-	let key = openai_key()?;
-	let model = rerank_model();
-	let body = serde_json::json!({
-		"model": model,
-		"messages": [
-			{"role": "system", "content": system},
-			{"role": "user", "content": user},
-		],
-		"response_format": {"type": "json_object"},
-		"temperature": 0,
-	});
-	let client = reqwest::blocking::Client::new();
-	let resp: ChatResp = client
-		.post("https://api.openai.com/v1/chat/completions")
-		.header("Authorization", format!("Bearer {}", key))
-		.json(&body)
-		.send()?
-		.error_for_status()?
-		.json()?;
-	Ok(resp
-		.choices
-		.into_iter()
-		.next()
-		.ok_or_else(|| anyhow!("no choices"))?
-		.message
-		.content)
-}
-
-pub fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
+pub async fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
 	#[derive(Deserialize)]
 	struct Expanded {
 		queries: Vec<String>,
@@ -100,7 +58,7 @@ pub fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
 		Cover: named entities, the underlying intent, prerequisites/related concepts, and likely-adjacent topics. \
 		Each query 3-12 words, no prose, no numbering, no quotes inside strings.";
 	let user = format!("N={}\nPrompt: {}", n, prompt);
-	let content = chat_json(sys, &user)?;
+	let content = http::chat_json(sys, &user).await?;
 	let parsed: Expanded = serde_json::from_str(&content)
 		.map_err(|e| anyhow!("expand parse: {} body: {}", e, content))?;
 	Ok(parsed
@@ -112,7 +70,7 @@ pub fn expand_questions(prompt: &str, n: usize) -> Result<Vec<String>> {
 		.collect())
 }
 
-fn rerank_via_openai(question: &str, cands: &[Candidate]) -> Result<Vec<RankedItem>> {
+async fn rerank_via_openai(question: &str, cands: &[Candidate<'_>]) -> Result<Vec<RankedItem>> {
 	let cands_json = serde_json::to_string(cands)?;
 	let sys = "You rerank candidate wiki documents for relevance to a user's question. \
 		Return JSON: {\"ranked\":[{\"id\":\"...\",\"score\":0.0-1.0,\"reason\":\"why this matches or not\"}]}. \
@@ -122,7 +80,7 @@ fn rerank_via_openai(question: &str, cands: &[Candidate]) -> Result<Vec<RankedIt
 		"Question: {}\n\nCandidates (JSON array, includes BM25 score):\n{}",
 		question, cands_json
 	);
-	let content = chat_json(sys, &user)?;
+	let content = http::chat_json(sys, &user).await?;
 	let parsed: RankedResp = serde_json::from_str(&content)
 		.map_err(|e| anyhow!("rerank parse: {} body: {}", e, content))?;
 	Ok(parsed.ranked)
@@ -135,47 +93,14 @@ fn append_feedback(root: &Path, entry: &serde_json::Value) -> Result<()> {
 		.create(true)
 		.append(true)
 		.open(&path)?;
-	writeln!(f, "{}", entry.to_string())?;
+	writeln!(f, "{}", entry)?;
 	Ok(())
 }
 
 // ── Embedding pool (sidecar vec files keyed by doc id) ──────────────────────
 
-const EMB_BATCH: usize = 64;
-const RRF_K: f32 = 60.0;
-
 fn emb_dir(root: &Path) -> PathBuf {
 	root.join(".search").join("emb")
-}
-
-fn fnv64(s: &str) -> u64 {
-	let mut h: u64 = 0xcbf29ce484222325;
-	for b in s.bytes() {
-		h ^= b as u64;
-		h = h.wrapping_mul(0x100000001b3);
-	}
-	h
-}
-
-fn write_vec(path: &Path, v: &[f32]) -> Result<()> {
-	let mut bytes = Vec::with_capacity(v.len() * 4);
-	for f in v {
-		bytes.extend_from_slice(&f.to_le_bytes());
-	}
-	std::fs::write(path, bytes)?;
-	Ok(())
-}
-
-fn read_vec(path: &Path) -> Result<Vec<f32>> {
-	let bytes = std::fs::read(path)?;
-	if bytes.len() % 4 != 0 {
-		return Err(anyhow!("corrupt vec"));
-	}
-	let mut out = Vec::with_capacity(bytes.len() / 4);
-	for c in bytes.chunks_exact(4) {
-		out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-	}
-	Ok(out)
 }
 
 fn load_all_docs(root: &Path) -> Vec<(String, Document)> {
@@ -190,7 +115,7 @@ fn load_all_docs(root: &Path) -> Vec<(String, Document)> {
 	out
 }
 
-fn ensure_doc_embeddings(root: &Path) -> Result<Vec<(String, Document, Vec<f32>)>> {
+async fn ensure_doc_embeddings(root: &Path) -> Result<Vec<(String, Document, Vec<f32>)>> {
 	let dir = emb_dir(root);
 	std::fs::create_dir_all(&dir)?;
 	let docs = load_all_docs(root);
@@ -204,7 +129,7 @@ fn ensure_doc_embeddings(root: &Path) -> Result<Vec<(String, Document, Vec<f32>)
 	let mut stale_text: Vec<String> = Vec::new();
 
 	for (i, (_, doc, slot)) in out.iter_mut().enumerate() {
-		let hash = format!("{:x}", fnv64(&doc.content));
+		let hash = format!("{:x}", wiki_io::fnv64(&doc.content));
 		let vec_p = dir.join(format!("{}.vec", doc.id));
 		let hash_p = dir.join(format!("{}.hash", doc.id));
 		let fresh = vec_p.exists()
@@ -212,7 +137,7 @@ fn ensure_doc_embeddings(root: &Path) -> Result<Vec<(String, Document, Vec<f32>)
 				.map(|s| s.trim() == hash)
 				.unwrap_or(false);
 		if fresh {
-			if let Ok(v) = read_vec(&vec_p) {
+			if let Ok(v) = wiki_io::read_vec_f32(&vec_p, None) {
 				*slot = Some(v);
 				continue;
 			}
@@ -225,15 +150,15 @@ fn ensure_doc_embeddings(root: &Path) -> Result<Vec<(String, Document, Vec<f32>)
 	while cursor < stale_idx.len() {
 		let end = (cursor + EMB_BATCH).min(stale_idx.len());
 		let batch_texts = &stale_text[cursor..end];
-		let embs = classifier::embed_batch(batch_texts)?;
+		let embs = http::embed_batch(batch_texts).await?;
 		for (offset, emb) in embs.into_iter().enumerate() {
 			let i = stale_idx[cursor + offset];
 			let doc = &out[i].1;
-			let hash = format!("{:x}", fnv64(&doc.content));
+			let hash = format!("{:x}", wiki_io::fnv64(&doc.content));
 			let vec_p = dir.join(format!("{}.vec", doc.id));
 			let hash_p = dir.join(format!("{}.hash", doc.id));
-			write_vec(&vec_p, &emb)?;
-			std::fs::write(&hash_p, hash)?;
+			wiki_io::write_vec_f32(&vec_p, &emb)?;
+			wiki_io::write_atomic_str(&hash_p, &hash)?;
 			out[i].2 = Some(emb);
 		}
 		cursor = end;
@@ -245,7 +170,7 @@ fn ensure_doc_embeddings(root: &Path) -> Result<Vec<(String, Document, Vec<f32>)
 		.collect())
 }
 
-pub fn smart_search(
+pub async fn smart_search(
 	root: &Path,
 	question: &str,
 	tag_filter: Option<&str>,
@@ -254,19 +179,23 @@ pub fn smart_search(
 ) -> Result<serde_json::Value> {
 	let pool_size = k.max(top_n * 4).max(20);
 
-	// BM25 leg
-	let index_path = root.join(".search");
-	let index = search::create_index(&index_path)?;
-	let bm25_hits: Vec<(Document, f32)> =
-		search::search_topk(&index, question, tag_filter, pool_size)?;
-	drop(index);
+	// Run BM25 indexing/search and the embedding pool refresh in parallel.
+	let bm25_fut = async {
+		let index_path = root.join(".search");
+		let index = search::create_index(&index_path)?;
+		let hits = search::search_topk(&index, question, tag_filter, pool_size)?;
+		Ok::<_, anyhow::Error>(hits)
+	};
+	let pool_fut = ensure_doc_embeddings(root);
+	let q_text = vec![question.to_string()];
+	let q_emb_fut = http::embed_batch(&q_text);
 
-	// Vector leg
-	let pool = ensure_doc_embeddings(root)?;
-	let q_emb = classifier::embed_batch(&[question.to_string()])?
+	let (bm25_hits, pool, q_emb_vec) = futures::try_join!(bm25_fut, pool_fut, q_emb_fut)?;
+	let q_emb = q_emb_vec
 		.into_iter()
 		.next()
 		.ok_or_else(|| anyhow!("query embed empty"))?;
+
 	let mut vec_scored: Vec<(String, f32, Document, String)> = pool
 		.into_iter()
 		.filter(|(_, d, _)| {
@@ -323,29 +252,24 @@ pub fn smart_search(
 		})
 		.collect();
 
-	// keep original `hits` name for downstream feedback log
 	let hits: Vec<(Document, f32)> = fused
 		.iter()
 		.filter_map(|(id, fused_score)| docs_by_id.get(id).map(|d| (d.clone(), *fused_score)))
 		.collect();
 
-	let ranked = match rerank_via_openai(question, &cands) {
+	let ranked = match rerank_via_openai(question, &cands).await {
 		Ok(r) => r,
-		Err(e) => {
-			// fall back to raw BM25 order
-			let fallback: Vec<RankedItem> = hits
-				.iter()
-				.map(|(d, s)| RankedItem {
-					id: d.id.clone(),
-					score: *s,
-					reason: format!("BM25 fallback ({})", e),
-				})
-				.collect();
-			fallback
-		}
+		Err(e) => hits
+			.iter()
+			.map(|(d, s)| RankedItem {
+				id: d.id.clone(),
+				score: *s,
+				reason: format!("BM25 fallback ({})", e),
+			})
+			.collect(),
 	};
 
-	let mut indexed: std::collections::HashMap<&str, &Document> =
+	let mut indexed: HashMap<&str, &Document> =
 		hits.iter().map(|(d, _)| (d.id.as_str(), d)).collect();
 	let mut sorted = ranked;
 	sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));

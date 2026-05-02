@@ -372,7 +372,7 @@ pub fn outline(path: &Path) -> Result<String> {
 					.chars()
 					.take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '<' || *c == ':' || *c == ' ')
 					.collect();
-				let name = name.trim().split_whitespace().next().unwrap_or("").to_string();
+				let name = name.split_whitespace().next().unwrap_or("").to_string();
 				if !name.is_empty() {
 					out.push_str(&format!(
 						"{:width$}{} {}  (line {})\n",
@@ -555,7 +555,7 @@ fn walk_files(dir: &Path, ext: &str) -> Vec<PathBuf> {
 		let path = entry.path();
 		if path.is_dir() {
 			out.extend(walk_files(&path, ext));
-		} else if path.extension().map_or(false, |e| e == ext) {
+		} else if path.extension().is_some_and(|e| e == ext) {
 			out.push(path);
 		}
 	}

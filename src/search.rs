@@ -52,7 +52,7 @@ pub fn index_document(index: &SearchIndex, doc: &Document) -> anyhow::Result<()>
 	let mut document = tantivy::TantivyDocument::default();
 	document.add_text(title_field, &doc.title);
 	document.add_text(content_field, &doc.content);
-	document.add_text(tags_field, &doc.tags.join(" "));
+	document.add_text(tags_field, doc.tags.join(" "));
 	document.add_text(id_field, &doc.id);
 
 	writer.add_document(document)?;

@@ -1,11 +1,13 @@
 use rmcp::{transport::stdio, ServiceExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod chunker;
-mod config;
 mod classifier;
 mod code;
+mod config;
 mod extract;
+mod http;
+mod io;
 mod learn;
 mod search;
 mod smart;
@@ -17,16 +19,16 @@ fn emit_empty_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find_dotenv_key(start: &std::path::Path, key: &str) -> Option<String> {
+fn find_dotenv_key(start: &Path, key: &str) -> Option<String> {
     let mut dir = Some(start.to_path_buf());
+    let prefix = format!("{}=", key);
     while let Some(d) = dir {
         let p = d.join(".env");
         if p.exists() {
             if let Ok(text) = std::fs::read_to_string(&p) {
                 for line in text.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix(&format!("{}=", key)) {
-                        let v = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if let Some(rest) = line.trim().strip_prefix(&prefix) {
+                        let v = rest.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
                         if !v.is_empty() {
                             return Some(v);
                         }
@@ -34,62 +36,68 @@ fn find_dotenv_key(start: &std::path::Path, key: &str) -> Option<String> {
                 }
             }
         }
-        dir = d.parent().map(|p| p.to_path_buf());
+        dir = d.parent().map(Path::to_path_buf);
     }
     None
 }
 
-fn find_wiki_vault(start: &std::path::Path) -> Option<PathBuf> {
+fn find_wiki_vault(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
     while let Some(d) = dir {
         let p = d.join(".wiki");
         if p.is_dir() {
             return Some(p);
         }
-        dir = d.parent().map(|p| p.to_path_buf());
+        dir = d.parent().map(Path::to_path_buf);
     }
     None
 }
 
-fn run_hook() -> anyhow::Result<()> {
-    config::load();
+fn read_stdin_json() -> Option<serde_json::Value> {
     use std::io::Read;
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
-        return emit_empty_hook();
+        return None;
     }
-    let payload: serde_json::Value = match serde_json::from_str(&buf) {
-        Ok(v) => v,
-        Err(_) => return emit_empty_hook(),
-    };
-    let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    serde_json::from_str(&buf).ok()
+}
 
-    if prompt.len() < 8 { return emit_empty_hook(); }
-    if prompt.starts_with('/') || prompt.starts_with('!') { return emit_empty_hook(); }
-
-    let cwd_path = if cwd.is_empty() {
+fn cwd_from_payload(payload: &serde_json::Value) -> PathBuf {
+    let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    if cwd.is_empty() {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
-        PathBuf::from(&cwd)
-    };
+        PathBuf::from(cwd)
+    }
+}
 
-    // Resolve wiki path: env override > walk up cwd for .wiki
+/// Resolve wiki vault dir + ensure OPENAI_API_KEY is set. Returns `None` (and
+/// the caller should `emit_empty_hook()`) if either is missing.
+fn resolve_wiki_and_key(cwd_path: &Path) -> Option<PathBuf> {
     let wiki_path = std::env::var("WIKI_PATH").ok().map(PathBuf::from)
-        .or_else(|| find_wiki_vault(&cwd_path));
-    let Some(wiki_path) = wiki_path else { return emit_empty_hook(); };
-    if !wiki_path.is_dir() { return emit_empty_hook(); }
+        .or_else(|| find_wiki_vault(cwd_path))?;
+    if !wiki_path.is_dir() { return None; }
     std::env::set_var("WIKI_PATH", &wiki_path);
 
-    // Resolve OpenAI key: env > .env walk-up
     if std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
-        if let Some(k) = find_dotenv_key(&cwd_path, "OPENAI_API_KEY") {
+        if let Some(k) = find_dotenv_key(cwd_path, "OPENAI_API_KEY") {
             std::env::set_var("OPENAI_API_KEY", k);
         }
     }
-    if std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
+    std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty())?;
+    Some(wiki_path)
+}
+
+async fn run_hook() -> anyhow::Result<()> {
+    config::load();
+    let Some(payload) = read_stdin_json() else { return emit_empty_hook(); };
+    let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if prompt.len() < 8 || prompt.starts_with('/') || prompt.starts_with('!') {
         return emit_empty_hook();
     }
+
+    let cwd_path = cwd_from_payload(&payload);
+    let Some(wiki_path) = resolve_wiki_and_key(&cwd_path) else { return emit_empty_hook(); };
 
     let _ = store::ensure_wiki_layout(&wiki_path);
 
@@ -98,12 +106,12 @@ fn run_hook() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&state_dir);
     let _ = std::fs::write(state_dir.join("pending_prompt.txt"), &prompt);
 
-    // 1. Expand prompt into diverse sub-queries (LLM, falls back to prompt-only on error)
+    // 1. Expand prompt into diverse sub-queries (LLM, falls back to prompt-only on error).
     let n_sub: usize = std::env::var("WIKI_HOOK_SUBQUERIES")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let mut queries: Vec<String> = vec![prompt.clone()];
     if n_sub > 0 {
-        if let Ok(extra) = smart::expand_questions(&prompt, n_sub) {
+        if let Ok(extra) = smart::expand_questions(&prompt, n_sub).await {
             for q in extra {
                 if !queries.iter().any(|x| x.eq_ignore_ascii_case(&q)) {
                     queries.push(q);
@@ -112,15 +120,19 @@ fn run_hook() -> anyhow::Result<()> {
         }
     }
 
-    // 2. Search each, fuse by best score per doc id
+    // 2. Search each sub-query in parallel; fuse by best score per doc id.
+    use futures::future::join_all;
+    let search_futs = queries.iter().map(|q| {
+        let wiki_path = wiki_path.clone();
+        let q = q.clone();
+        async move { smart::smart_search(&wiki_path, &q, None, 10, 3).await }
+    });
+    let results = join_all(search_futs).await;
+
     use std::collections::{HashMap, HashSet};
     let mut best: HashMap<String, (f64, serde_json::Value)> = HashMap::new();
-    for q in &queries {
-        let res = match smart::smart_search(&wiki_path, q, None, 10, 3) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let empty: Vec<serde_json::Value> = Vec::new();
+    let empty: Vec<serde_json::Value> = Vec::new();
+    for res in results.into_iter().flatten() {
         for r in res.get("results").and_then(|v| v.as_array()).unwrap_or(&empty) {
             let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if id.is_empty() { continue; }
@@ -136,7 +148,7 @@ fn run_hook() -> anyhow::Result<()> {
     hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     hits.truncate(10);
 
-    // 3. Walk depth-1 wikilinks from top hit bodies
+    // 3. Walk depth-1 wikilinks from top hit bodies.
     let link_re = regex::Regex::new(r"\[\[([^\]|#]+?)(?:[#|][^\]]*)?\]\]").ok();
     let doc_types = ["entities", "thoughts", "conclusions", "reasons", "questions", "purposes"];
     let primary_ids: HashSet<String> = hits.iter()
@@ -171,7 +183,7 @@ fn run_hook() -> anyhow::Result<()> {
         }
     }
 
-    // 4. Build markdown
+    // 4. Build markdown.
     let mut md = String::from("## Wiki context (auto-injected)\n\n**Sub-queries:**\n");
     for q in &queries { md.push_str(&format!("- {}\n", q)); }
     md.push_str("\n### Top hits\n");
@@ -215,43 +227,27 @@ fn take_chars(s: &str, max: usize) -> String {
 
 fn run_code_read_hook() -> anyhow::Result<()> {
     config::load();
-    use std::io::Read;
-    let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
-        return emit_empty_hook();
-    }
-    let payload: serde_json::Value = match serde_json::from_str(&buf) {
-        Ok(v) => v,
-        Err(_) => return emit_empty_hook(),
-    };
+    let Some(payload) = read_stdin_json() else { return emit_empty_hook(); };
 
     let file_path = payload
         .get("tool_input").and_then(|v| v.get("file_path")).and_then(|v| v.as_str())
         .unwrap_or("");
     if file_path.is_empty() { return emit_empty_hook(); }
 
-    let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    let cwd_path = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    } else {
-        PathBuf::from(cwd)
-    };
-
+    let cwd_path = cwd_from_payload(&payload);
     let abs_path = {
         let p = PathBuf::from(file_path);
         if p.is_absolute() { p } else { cwd_path.join(p) }
     };
 
-    let ext = match abs_path.extension().and_then(|e| e.to_str()) {
-        Some(e) => e.to_string(),
-        None => return emit_empty_hook(),
+    let Some(ext) = abs_path.extension().and_then(|e| e.to_str()).map(str::to_string) else {
+        return emit_empty_hook();
     };
 
     if code::language::load(&ext).is_none() {
         return emit_empty_hook();
     }
 
-    // Ensure code index dir env is set so open_source finds the index
     if std::env::var("CODE_INDEX_DIR").is_err() && std::env::var("SPLIT_INDEX_DIR").is_err() {
         let wiki = store::wiki_root();
         std::env::set_var("CODE_INDEX_DIR", wiki.join("code").to_string_lossy().as_ref());
@@ -277,39 +273,16 @@ fn normalize_question(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-fn run_stop_hook() -> anyhow::Result<()> {
+async fn run_stop_hook() -> anyhow::Result<()> {
     config::load();
-    use std::io::Read;
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_to_string(&mut buf);
-    let payload: serde_json::Value = serde_json::from_str(&buf).unwrap_or(serde_json::Value::Null);
+    let payload = read_stdin_json().unwrap_or(serde_json::Value::Null);
 
-    // Avoid recursion: if a previous Stop hook already fired this turn, bail.
     if payload.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false) {
         return emit_empty_hook();
     }
 
-    let cwd = payload.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let cwd_path = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    } else {
-        PathBuf::from(&cwd)
-    };
-
-    let wiki_path = std::env::var("WIKI_PATH").ok().map(PathBuf::from)
-        .or_else(|| find_wiki_vault(&cwd_path));
-    let Some(wiki_path) = wiki_path else { return emit_empty_hook(); };
-    if !wiki_path.is_dir() { return emit_empty_hook(); }
-    std::env::set_var("WIKI_PATH", &wiki_path);
-
-    if std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
-        if let Some(k) = find_dotenv_key(&cwd_path, "OPENAI_API_KEY") {
-            std::env::set_var("OPENAI_API_KEY", k);
-        }
-    }
-    if std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
-        return emit_empty_hook();
-    }
+    let cwd_path = cwd_from_payload(&payload);
+    let Some(wiki_path) = resolve_wiki_and_key(&cwd_path) else { return emit_empty_hook(); };
 
     let pending_path = wiki_path.join(".hook_state").join("pending_prompt.txt");
     let prompt = match std::fs::read_to_string(&pending_path) {
@@ -319,7 +292,6 @@ fn run_stop_hook() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&pending_path);
     if prompt.len() < 16 { return emit_empty_hook(); }
 
-    // Dedupe against existing question docs by normalized content.
     let pn = normalize_question(&prompt);
     if let Ok(existing) = store::list_documents(&wiki_path, "questions") {
         if existing.iter().any(|d| normalize_question(&d.content) == pn) {
@@ -335,25 +307,29 @@ fn run_stop_hook() -> anyhow::Result<()> {
         Err(_) => return emit_empty_hook(),
     };
     let _ = store::log_ingest(&wiki_path, "questions", &doc.id, &doc.title);
-
-    // Link entity mentions in the new question (replaces bare names with [[wikilinks]]).
-    let _ = learn::link_doc(&wiki_path, "questions", &doc.id, false);
+    let _ = learn::link_doc(&wiki_path, "questions", &doc.id, false).await;
 
     emit_empty_hook()
 }
 
-fn run_cli() -> Option<anyhow::Result<()>> {
+enum CliCmd {
+    Search { query: String, tag: Option<String>, k: usize, top_n: usize },
+    Hook,
+    CodeReadHook,
+    StopHook,
+    LearnFeedback { limit: usize, dry_run: bool },
+}
+
+fn parse_cli() -> Option<CliCmd> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        return None;
-    }
+    if args.len() < 2 { return None; }
     match args[1].as_str() {
         "search" => {
             if args.len() < 3 {
                 eprintln!("usage: wiki search <query> [--tag T] [--k N] [--top-n N]");
                 std::process::exit(2);
             }
-            let query = &args[2];
+            let query = args[2].clone();
             let mut tag: Option<String> = None;
             let mut k: usize = 20;
             let mut top_n: usize = 5;
@@ -366,22 +342,11 @@ fn run_cli() -> Option<anyhow::Result<()>> {
                     _ => { i += 1; }
                 }
             }
-            let root = store::wiki_root();
-            let _ = store::ensure_wiki_layout(&root);
-            return Some(match smart::smart_search(&root, query, tag.as_deref(), k, top_n) {
-                Ok(v) => { println!("{}", v); Ok(()) }
-                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
-            });
+            Some(CliCmd::Search { query, tag, k, top_n })
         }
-        "hook" => {
-            return Some(run_hook());
-        }
-        "code-read-hook" => {
-            return Some(run_code_read_hook());
-        }
-        "stop-hook" => {
-            return Some(run_stop_hook());
-        }
+        "hook" => Some(CliCmd::Hook),
+        "code-read-hook" => Some(CliCmd::CodeReadHook),
+        "stop-hook" => Some(CliCmd::StopHook),
         "learn-feedback" => {
             let mut limit: usize = 25;
             let mut dry_run = false;
@@ -393,51 +358,70 @@ fn run_cli() -> Option<anyhow::Result<()>> {
                     _ => { i += 1; }
                 }
             }
-            let root = store::wiki_root();
-            let _ = store::ensure_wiki_layout(&root);
-            return Some(match learn::run_feedback_pass(&root, limit, dry_run) {
-                Ok(v) => { println!("{}", v); Ok(()) }
-                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
-            });
+            Some(CliCmd::LearnFeedback { limit, dry_run })
         }
         _ => None,
     }
 }
 
+async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
+    match cmd {
+        CliCmd::Search { query, tag, k, top_n } => {
+            let root = store::wiki_root();
+            store::ensure_wiki_layout(&root)?;
+            match smart::smart_search(&root, &query, tag.as_deref(), k, top_n).await {
+                Ok(v) => { println!("{}", v); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::Hook => run_hook().await,
+        CliCmd::CodeReadHook => run_code_read_hook(),
+        CliCmd::StopHook => run_stop_hook().await,
+        CliCmd::LearnFeedback { limit, dry_run } => {
+            let root = store::wiki_root();
+            store::ensure_wiki_layout(&root)?;
+            match learn::run_feedback_pass(&root, limit, dry_run).await {
+                Ok(v) => { println!("{}", v); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+    }
+}
+
+fn spawn_code_watcher() {
+    let mut src_dirs: Vec<PathBuf> = std::env::var("SPLIT_SRC_DIRS")
+        .into_iter()
+        .flat_map(|s| s.split(';').map(|p| PathBuf::from(p.trim())).collect::<Vec<_>>())
+        .chain(std::env::var("SPLIT_SRC_DIR").ok().map(PathBuf::from))
+        .filter(|p| p.exists())
+        .collect();
+    src_dirs.dedup();
+
+    let exts: Vec<String> = std::env::var("SPLIT_EXTS")
+        .ok()
+        .map(|s| s.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect())
+        .or_else(|| std::env::var("SPLIT_EXT").ok().map(|e| vec![e]))
+        .unwrap_or_else(|| code::language::list().into_iter().map(|(ext, _)| ext).collect());
+
+    let index = code::default_index_dir();
+    if src_dirs.is_empty() || exts.is_empty() { return; }
+    std::thread::spawn(move || {
+        if let Err(e) = code::watcher::watch(&src_dirs, &index, &exts) {
+            eprintln!("watcher: {e}");
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     config::load();
-    if let Some(r) = run_cli() {
-        return r;
+    if let Some(cmd) = parse_cli() {
+        return dispatch_cli(cmd).await;
     }
-    {
-        let mut src_dirs: Vec<PathBuf> = std::env::var("SPLIT_SRC_DIRS")
-            .into_iter()
-            .flat_map(|s| s.split(';').map(|p| PathBuf::from(p.trim())).collect::<Vec<_>>())
-            .chain(std::env::var("SPLIT_SRC_DIR").ok().map(PathBuf::from))
-            .filter(|p| p.exists())
-            .collect();
-        src_dirs.dedup();
-
-        let exts: Vec<String> = std::env::var("SPLIT_EXTS")
-            .ok()
-            .map(|s| s.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect())
-            .or_else(|| std::env::var("SPLIT_EXT").ok().map(|e| vec![e]))
-            .unwrap_or_else(|| code::language::list().into_iter().map(|(ext, _)| ext).collect());
-
-        let index = code::default_index_dir();
-        if !src_dirs.is_empty() && !exts.is_empty() {
-            std::thread::spawn(move || {
-                if let Err(e) = code::watcher::watch(&src_dirs, &index, &exts) {
-                    eprintln!("watcher: {e}");
-                }
-            });
-        }
-    }
+    spawn_code_watcher();
 
     let service = tools::WikiService::new()?;
     let server: rmcp::service::RunningService<_, _> = service.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())
 }
-

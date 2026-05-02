@@ -1,8 +1,11 @@
+use crate::io::write_atomic_str;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+const DOC_TYPES: &[&str] = &["thoughts", "entities", "reasons", "questions", "conclusions"];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Purpose {
@@ -27,8 +30,6 @@ pub struct Document {
 
 pub fn wiki_root() -> PathBuf {
 	let raw = std::env::var("WIKI_PATH").unwrap_or_else(|_| ".wiki".to_string());
-	// Expand ${VAR} placeholders; discard if any remain unexpanded.
-	// Claude Code does not expand ${} in MCP env values (only in hooks).
 	let expanded = if raw.contains("${") {
 		let mut s = raw.clone();
 		for (key, val) in std::env::vars() {
@@ -48,16 +49,8 @@ pub fn wiki_root() -> PathBuf {
 
 pub fn ensure_wiki_layout(root: &Path) -> anyhow::Result<()> {
 	for dir in &[
-		"purposes",
-		"thoughts",
-		"entities",
-		"reasons",
-		"questions",
-		"conclusions",
-		"ingest_log",
-		"auto_links",
-		"assets",
-		".search",
+		"purposes", "thoughts", "entities", "reasons", "questions",
+		"conclusions", "ingest_log", "auto_links", "assets", ".search",
 	] {
 		std::fs::create_dir_all(root.join(dir))?;
 	}
@@ -110,8 +103,7 @@ pub fn create_purpose(root: &Path, tag: &str, title: &str, description: &str) ->
 		"updated_at": now,
 		"tags": ["purpose"],
 	}))?;
-	let full = format!("---\n{}---\n\n{}", fm, description);
-	std::fs::write(&path, full)?;
+	write_atomic_str(&path, &format!("---\n{}---\n\n{}", fm, description))?;
 	Ok(Purpose {
 		id,
 		tag: tag.to_string(),
@@ -150,7 +142,7 @@ fn slugify(title: &str) -> String {
 pub fn walk_md_paths(dir: &Path) -> Vec<PathBuf> {
 	fn rec(d: &Path, out: &mut Vec<PathBuf>) {
 		if !d.exists() { return; }
-		let rd = match std::fs::read_dir(d) { Ok(r) => r, Err(_) => return };
+		let Ok(rd) = std::fs::read_dir(d) else { return };
 		for entry in rd.flatten() {
 			let p = entry.path();
 			if p.is_dir() {
@@ -165,7 +157,6 @@ pub fn walk_md_paths(dir: &Path) -> Vec<PathBuf> {
 	out
 }
 
-/// Resolve a unique target path by appending numeric suffix on collision.
 fn unique_path(dir: &Path, slug: &str) -> PathBuf {
 	let mut p = dir.join(format!("{}.md", slug));
 	let mut n = 1;
@@ -181,14 +172,10 @@ pub fn find_document_path_by_id(dir: &Path, id: &str) -> anyhow::Result<PathBuf>
 		return Err(anyhow::anyhow!("Directory not found"));
 	}
 	for path in walk_md_paths(dir) {
-		if let Ok(content) = std::fs::read_to_string(&path) {
-			if let Ok((fm, _)) = parse_frontmatter(&content) {
-				if let Some(doc_id) = fm.get("id").and_then(|v| v.as_str()) {
-					if doc_id == id {
-						return Ok(path);
-					}
-				}
-			}
+		let Ok(content) = std::fs::read_to_string(&path) else { continue };
+		let Ok((fm, _)) = parse_frontmatter(&content) else { continue };
+		if fm.get("id").and_then(|v| v.as_str()) == Some(id) {
+			return Ok(path);
 		}
 	}
 	Err(anyhow::anyhow!("Document not found: {}", id))
@@ -196,24 +183,18 @@ pub fn find_document_path_by_id(dir: &Path, id: &str) -> anyhow::Result<PathBuf>
 
 fn update_link_index(root: &Path) -> anyhow::Result<()> {
 	let mut link_map: HashMap<String, String> = HashMap::new();
-	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
-	for doc_type in &doc_types {
+	for doc_type in DOC_TYPES {
 		let dir = root.join(doc_type);
 		for path in walk_md_paths(&dir) {
-			if let Ok(content) = std::fs::read_to_string(&path) {
-				if let Ok((fm, _)) = parse_frontmatter(&content) {
-					if let Some(id) = fm.get("id").and_then(|v| v.as_str()) {
-						// Store path relative to the doc_type dir so callers can locate
-						// files under their purpose subfolder.
-						let rel = path.strip_prefix(&dir).unwrap_or(&path);
-						link_map.insert(id.to_string(), rel.to_string_lossy().to_string());
-					}
-				}
+			let Ok(content) = std::fs::read_to_string(&path) else { continue };
+			let Ok((fm, _)) = parse_frontmatter(&content) else { continue };
+			if let Some(id) = fm.get("id").and_then(|v| v.as_str()) {
+				let rel = path.strip_prefix(&dir).unwrap_or(&path);
+				link_map.insert(id.to_string(), rel.to_string_lossy().to_string());
 			}
 		}
 	}
-	std::fs::write(root.join("link.json"), serde_json::to_string_pretty(&link_map)?)?;
-	Ok(())
+	write_atomic_str(&root.join("link.json"), &serde_json::to_string_pretty(&link_map)?)
 }
 
 fn doc_from_fm(fm: &serde_json::Value, body: String, fallback_id: &str) -> Document {
@@ -259,13 +240,12 @@ pub fn create_document(
 		fm_obj["source_doc_id"] = serde_json::Value::String(s.to_string());
 	}
 	let fm = serde_yaml::to_string(&fm_obj)?;
-	let full = format!("---\n{}---\n\n{}", fm, content);
 
 	let purpose_dir = purpose.unwrap_or("uncategorized");
 	let dir = root.join(doc_type).join(purpose_dir);
 	std::fs::create_dir_all(&dir)?;
 	let file_path = unique_path(&dir, &slug);
-	std::fs::write(&file_path, full)?;
+	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, content))?;
 	let _ = update_link_index(root);
 
 	Ok(Document {
@@ -282,15 +262,13 @@ pub fn create_document(
 
 pub fn get_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<Document> {
 	let dir = root.join(doc_type);
-	// First try `id` as a relative path inside the type dir (new layout: `<purpose>/<name>`).
-	// This makes `[[type/purpose/name]]` wikilinks resolve cheaply without scanning.
+	// Fast path: `id` is a relative path inside the type dir (`<purpose>/<name>`).
 	let rel_path = dir.join(format!("{}.md", id));
 	if rel_path.is_file() {
 		let content = std::fs::read_to_string(&rel_path)?;
 		let (fm, body) = parse_frontmatter(&content)?;
 		return Ok(doc_from_fm(&fm, body, id));
 	}
-	// Fall back to a UUID/id frontmatter scan (graph linkage, legacy callers).
 	let file_path = find_document_path_by_id(&dir, id)?;
 	let content = std::fs::read_to_string(&file_path)?;
 	let (fm, body) = parse_frontmatter(&content)?;
@@ -333,8 +311,7 @@ pub fn update_document(
 	}
 
 	let fm_str = serde_yaml::to_string(&fm)?;
-	let full = format!("---\n{}---\n\n{}", fm_str, body);
-	std::fs::write(&file_path, full)?;
+	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
 
 	Ok(doc_from_fm(&fm, body, id))
 }
@@ -364,7 +341,7 @@ pub fn add_alias_to_entity(root: &Path, entity_id: &str, alias: &str) -> anyhow:
 		obj.insert("updated_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
 	}
 	let fm_str = serde_yaml::to_string(&fm)?;
-	std::fs::write(&file_path, format!("---\n{}---\n\n{}", fm_str, body))?;
+	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
 	Ok(true)
 }
 
@@ -413,12 +390,11 @@ pub fn create_reason(
 	}
 
 	let fm = serde_yaml::to_string(&fm_obj)?;
-	let full = format!("---\n{}---\n\n{}", fm, body);
 	let purpose_dir = purpose.unwrap_or("uncategorized");
 	let dir = root.join("reasons").join(purpose_dir);
 	std::fs::create_dir_all(&dir)?;
 	let file_path = unique_path(&dir, &slug);
-	std::fs::write(&file_path, full)?;
+	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, body))?;
 	let _ = update_link_index(root);
 
 	let mut tags = vec!["reason".to_string()];
@@ -458,17 +434,15 @@ pub fn log_ingest(root: &Path, doc_type: &str, doc_id: &str, title: &str) -> any
 	});
 	let log_dir = root.join("ingest_log");
 	std::fs::create_dir_all(&log_dir)?;
-	std::fs::write(
-		log_dir.join(format!("{}.json", log_id)),
-		serde_json::to_string_pretty(&entry)?,
-	)?;
-	Ok(())
+	write_atomic_str(
+		&log_dir.join(format!("{}.json", log_id)),
+		&serde_json::to_string_pretty(&entry)?,
+	)
 }
 
 pub fn search_by_tag(root: &Path, tag: &str) -> anyhow::Result<Vec<Document>> {
-	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
 	let mut results = Vec::new();
-	for doc_type in &doc_types {
+	for doc_type in DOC_TYPES {
 		let dir = root.join(doc_type);
 		for path in walk_md_paths(&dir) {
 			let raw = std::fs::read_to_string(&path)?;
@@ -531,4 +505,3 @@ mod tests {
 		assert!(list_purposes(root).unwrap().is_empty());
 	}
 }
-

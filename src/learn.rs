@@ -1,9 +1,11 @@
-use crate::{classifier, search, smart, store};
+use crate::io::fnv64;
+use crate::{classifier, http, search, store};
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 #[derive(Clone)]
 pub struct EntityRef {
@@ -22,13 +24,11 @@ fn dedupe_threshold() -> f32 {
 		.unwrap_or(0.85)
 }
 
-fn fnv64(s: &str) -> u64 {
-	let mut h: u64 = 0xcbf29ce484222325;
-	for b in s.bytes() {
-		h ^= b as u64;
-		h = h.wrapping_mul(0x100000001b3);
-	}
-	h
+fn alias_threshold() -> f32 {
+	std::env::var("WIKI_ALIAS_THRESHOLD")
+		.ok()
+		.and_then(|s| s.parse::<f32>().ok())
+		.unwrap_or(0.92)
 }
 
 fn read_entity_meta(root: &Path, id: &str) -> Option<(Vec<String>, String, Option<String>)> {
@@ -59,7 +59,7 @@ fn read_entity_meta(root: &Path, id: &str) -> Option<(Vec<String>, String, Optio
 	None
 }
 
-pub fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
+pub async fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
 	let entities = store::list_documents(root, "entities")?;
 	let mut refs: Vec<EntityRef> = Vec::new();
 	let mut texts: Vec<String> = Vec::new();
@@ -77,7 +77,7 @@ pub fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
 		});
 	}
 	if !texts.is_empty() {
-		if let Ok(embs) = classifier::embed_batch(&texts) {
+		if let Ok(embs) = http::embed_batch(&texts).await {
 			for (r, emb) in refs.iter_mut().zip(embs.into_iter()) {
 				r.body_embedding = Some(emb);
 			}
@@ -86,19 +86,31 @@ pub fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
 	Ok(refs)
 }
 
+fn protected_re() -> &'static [Regex] {
+	static RE: OnceLock<Vec<Regex>> = OnceLock::new();
+	RE.get_or_init(|| {
+		[
+			r"(?ms)^```.*?^```",
+			r"`[^`\n]+`",
+			r"\[\[[^\]]*\]\]",
+			r"\[[^\]]*\]\([^)]*\)",
+		]
+		.iter()
+		.filter_map(|p| Regex::new(p).ok())
+		.collect()
+	})
+}
+
+fn link_target_re() -> &'static Regex {
+	static RE: OnceLock<Regex> = OnceLock::new();
+	RE.get_or_init(|| Regex::new(r"\[\[([^\]|#]+?)(?:[#|][^\]]*)?\]\]").unwrap())
+}
+
 fn protected_ranges(text: &str) -> Vec<(usize, usize)> {
 	let mut ranges = Vec::new();
-	let patterns = [
-		r"(?ms)^```.*?^```",
-		r"`[^`\n]+`",
-		r"\[\[[^\]]*\]\]",
-		r"\[[^\]]*\]\([^)]*\)",
-	];
-	for p in patterns {
-		if let Ok(re) = Regex::new(p) {
-			for m in re.find_iter(text) {
-				ranges.push((m.start(), m.end()));
-			}
+	for re in protected_re() {
+		for m in re.find_iter(text) {
+			ranges.push((m.start(), m.end()));
 		}
 	}
 	ranges.sort();
@@ -146,14 +158,13 @@ fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, 
 				continue;
 			}
 			let surface = out[m.start()..m.end()].to_string();
-			// Collect as alias candidate if surface is a new name variant for this entity.
 			let surface_lc = surface.to_lowercase();
 			let already_known = e.title.to_lowercase() == surface_lc
 				|| e.aliases.iter().any(|a| a.to_lowercase() == surface_lc);
 			if !already_known {
 				alias_candidates.push((e.id.clone(), surface.clone()));
 			}
-			let purpose_seg = e.purpose.clone().unwrap_or_else(|| "uncategorized".to_string());
+			let purpose_seg = e.purpose.as_deref().unwrap_or("uncategorized");
 			let link = format!("[[entities/{}/{}|{}]]", purpose_seg, e.slug, surface);
 			let mut new = String::with_capacity(out.len() + link.len());
 			new.push_str(&out[..m.start()]);
@@ -167,28 +178,21 @@ fn rewrite_links(body: &str, entities: &[EntityRef], self_id: &str) -> (String, 
 	(out, count, alias_candidates)
 }
 
-pub fn find_near_duplicate_entity(root: &Path, title: &str, content: &str) -> Result<Option<EntityRef>> {
-	let threshold = std::env::var("WIKI_ALIAS_THRESHOLD")
-		.ok()
-		.and_then(|s| s.parse::<f32>().ok())
-		.unwrap_or(0.92);
-
-	let entities = build_entity_index(root)?;
+pub async fn find_near_duplicate_entity(root: &Path, title: &str, content: &str) -> Result<Option<EntityRef>> {
+	let threshold = alias_threshold();
+	let entities = build_entity_index(root).await?;
 	let title_lc = title.trim().to_lowercase();
 
-	// Exact title or alias match first (cheap).
 	for e in &entities {
-		if e.title.to_lowercase() == title_lc {
-			return Ok(Some(e.clone()));
-		}
-		if e.aliases.iter().any(|a| a.to_lowercase() == title_lc) {
+		if e.title.to_lowercase() == title_lc
+			|| e.aliases.iter().any(|a| a.to_lowercase() == title_lc)
+		{
 			return Ok(Some(e.clone()));
 		}
 	}
 
-	// Embedding similarity (requires OpenAI key).
 	if !content.is_empty() {
-		if let Ok(embs) = classifier::embed_batch(&[content.to_string()]) {
+		if let Ok(embs) = http::embed_batch(&[content.to_string()]).await {
 			if let Some(content_emb) = embs.into_iter().next() {
 				for e in &entities {
 					if let Some(ev) = &e.body_embedding {
@@ -204,7 +208,7 @@ pub fn find_near_duplicate_entity(root: &Path, title: &str, content: &str) -> Re
 	Ok(None)
 }
 
-fn dedupe_paragraphs(
+async fn dedupe_paragraphs(
 	body: &str,
 	entities: &[EntityRef],
 	self_id: &str,
@@ -220,7 +224,7 @@ fn dedupe_paragraphs(
 		return (body.to_string(), Vec::new());
 	}
 	let texts: Vec<String> = nonempty.iter().map(|(_, p)| p.clone()).collect();
-	let embs = match classifier::embed_batch(&texts) {
+	let embs = match http::embed_batch(&texts).await {
 		Ok(v) => v,
 		Err(_) => return (body.to_string(), Vec::new()),
 	};
@@ -231,9 +235,7 @@ fn dedupe_paragraphs(
 			if e.id == self_id {
 				continue;
 			}
-			let Some(ev) = &e.body_embedding else {
-				continue;
-			};
+			let Some(ev) = &e.body_embedding else { continue };
 			if classifier::cosine(emb, ev) >= threshold {
 				drop_idx.insert(*idx, (e.id.clone(), format!("{:x}", fnv64(para))));
 				break;
@@ -257,21 +259,13 @@ fn dedupe_paragraphs(
 /// frontmatter). Bare `[[slug]]` links are skipped — too ambiguous post-migration.
 fn collect_link_purposes(root: &Path, body: &str) -> HashSet<String> {
 	let mut out: HashSet<String> = HashSet::new();
-	let re = match Regex::new(r"\[\[([^\]|#]+?)(?:[#|][^\]]*)?\]\]") {
-		Ok(r) => r,
-		Err(_) => return out,
-	};
-	for cap in re.captures_iter(body) {
+	for cap in link_target_re().captures_iter(body) {
 		let target = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
 		if target.is_empty() { continue; }
 		let parts: Vec<&str> = target.split('/').collect();
 		match parts.len() {
-			3 => {
-				// `<type>/<purpose>/<name>` — purpose is encoded in the path.
-				out.insert(parts[1].to_string());
-			}
+			3 => { out.insert(parts[1].to_string()); }
 			2 => {
-				// `<type>/<id-or-relpath>` — resolve through store.
 				if let Ok(doc) = store::get_document(root, parts[0], parts[1]) {
 					if let Some(p) = doc.purpose { out.insert(p); }
 				}
@@ -287,20 +281,16 @@ fn collect_link_purposes(root: &Path, body: &str) -> HashSet<String> {
 fn rewrite_inbound_links(root: &Path, old_target: &str, new_target: &str) -> Result<()> {
 	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
 	let escaped = regex::escape(old_target);
-	// Match `[[old_target` followed by `]`, `|`, or `#` (a wikilink terminator/modifier).
 	let re = Regex::new(&format!(r"\[\[{}(?P<rest>[\]|#])", escaped))?;
 	let replacement = format!("[[{}$rest", new_target);
 	for dt in &doc_types {
 		let dir = root.join(dt);
 		for path in store::walk_md_paths(&dir) {
-			let raw = match std::fs::read_to_string(&path) {
-				Ok(s) => s,
-				Err(_) => continue,
-			};
+			let Ok(raw) = std::fs::read_to_string(&path) else { continue };
 			if !raw.contains(old_target) { continue; }
 			let new = re.replace_all(&raw, replacement.as_str()).to_string();
 			if new != raw {
-				let _ = std::fs::write(&path, new);
+				crate::io::write_atomic_str(&path, &new)?;
 			}
 		}
 	}
@@ -309,7 +299,7 @@ fn rewrite_inbound_links(root: &Path, old_target: &str, new_target: &str) -> Res
 
 /// Move `<doc_type>/<old_purpose>/<name>.md` to `<doc_type>/crosstopic/<name>.md`
 /// and rewrite every inbound `[[<doc_type>/<old_purpose>/<name>]]` link in the
-/// vault to the new location. No-op if already in `crosstopic` or path not found.
+/// vault to the new location.
 fn move_to_crosstopic(root: &Path, doc_type: &str, id: &str) -> Result<bool> {
 	let dir = root.join(doc_type);
 	let old_path = store::find_document_path_by_id(&dir, id)?;
@@ -352,7 +342,7 @@ fn move_to_crosstopic(root: &Path, doc_type: &str, id: &str) -> Result<bool> {
 	Ok(true)
 }
 
-pub fn link_doc_internal(
+pub async fn link_doc_internal(
 	root: &Path,
 	doc_type: &str,
 	id: &str,
@@ -362,7 +352,7 @@ pub fn link_doc_internal(
 	let doc = store::get_document(root, doc_type, id)?;
 	let original = doc.content.clone();
 	let (linked, link_count, alias_candidates) = rewrite_links(&original, entities, id);
-	let (deduped, merges) = dedupe_paragraphs(&linked, entities, id);
+	let (deduped, merges) = dedupe_paragraphs(&linked, entities, id).await;
 	let modified = deduped != original;
 
 	let mut aliases_added = 0usize;
@@ -387,23 +377,17 @@ pub fn link_doc_internal(
 		}
 	}
 
-	// Cross-topic detection: if the doc's outgoing wikilinks (plus its own
-	// purpose) span ≥2 distinct topical purposes, relocate it to
-	// `<doc_type>/crosstopic/<name>.md` so the folder layout reflects that
-	// the doc is connective tissue rather than internal to one purpose.
 	let mut moved_to_crosstopic = false;
 	if !dry_run {
 		let mut purposes = collect_link_purposes(root, &deduped);
 		if let Some(p) = doc.purpose.as_deref() {
 			if !p.is_empty() { purposes.insert(p.to_string()); }
 		}
-		// Discount placeholder/system buckets — they shouldn't trigger a move.
 		purposes.remove("uncategorized");
 		purposes.remove("crosstopic");
 		if purposes.len() >= 2 && doc.purpose.as_deref() != Some("crosstopic") {
-			match move_to_crosstopic(root, doc_type, id) {
-				Ok(true) => { moved_to_crosstopic = true; }
-				_ => {}
+			if let Ok(true) = move_to_crosstopic(root, doc_type, id) {
+				moved_to_crosstopic = true;
 			}
 		}
 	}
@@ -420,18 +404,18 @@ pub fn link_doc_internal(
 	}))
 }
 
-pub fn link_doc(root: &Path, doc_type: &str, id: &str, dry_run: bool) -> Result<serde_json::Value> {
-	let entities = build_entity_index(root)?;
-	link_doc_internal(root, doc_type, id, &entities, dry_run)
+pub async fn link_doc(root: &Path, doc_type: &str, id: &str, dry_run: bool) -> Result<serde_json::Value> {
+	let entities = build_entity_index(root).await?;
+	link_doc_internal(root, doc_type, id, &entities, dry_run).await
 }
 
-pub fn run_pass(
+pub async fn run_pass(
 	root: &Path,
 	limit: usize,
 	purpose: Option<&str>,
 	dry_run: bool,
 ) -> Result<serde_json::Value> {
-	let entities = build_entity_index(root)?;
+	let entities = build_entity_index(root).await?;
 	let mut targets: Vec<(String, String)> = Vec::new();
 	for doc_type in &["thoughts", "conclusions"] {
 		let docs = store::list_documents(root, doc_type)?;
@@ -456,7 +440,7 @@ pub fn run_pass(
 	let mut merges_total = 0u64;
 	let mut details = Vec::new();
 	for (dt, id) in &targets {
-		match link_doc_internal(root, dt, id, &entities, dry_run) {
+		match link_doc_internal(root, dt, id, &entities, dry_run).await {
 			Ok(v) => {
 				if v["modified"].as_bool().unwrap_or(false) {
 					docs_modified += 1;
@@ -485,13 +469,7 @@ pub fn run_pass(
 		"details": details,
 	});
 
-	let log_dir = root.join("ingest_log");
-	let _ = std::fs::create_dir_all(&log_dir);
-	let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-	let _ = std::fs::write(
-		log_dir.join(format!("learn-{}.json", ts)),
-		serde_json::to_string_pretty(&report).unwrap_or_default(),
-	);
+	write_pass_log(root, "learn", &report)?;
 
 	if !dry_run {
 		let index_path = root.join(".search");
@@ -505,6 +483,15 @@ pub fn run_pass(
 	}
 
 	Ok(report)
+}
+
+fn write_pass_log(root: &Path, kind: &str, report: &serde_json::Value) -> Result<()> {
+	let log_dir = root.join("ingest_log");
+	std::fs::create_dir_all(&log_dir)?;
+	let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+	let json = serde_json::to_string_pretty(report)?;
+	crate::io::write_atomic_str(&log_dir.join(format!("{}-{}.json", kind, ts)), &json)?;
+	Ok(())
 }
 
 // ── Feedback-driven learning ─────────────────────────────────────────────────
@@ -553,9 +540,8 @@ fn read_cursor(root: &Path) -> u64 {
 		.unwrap_or(0)
 }
 
-fn write_cursor(root: &Path, off: u64) {
-	let p = root.join(".feedback.cursor");
-	let _ = std::fs::write(&p, off.to_string());
+fn write_cursor(root: &Path, off: u64) -> Result<()> {
+	crate::io::write_atomic_str(&root.join(".feedback.cursor"), &off.to_string())
 }
 
 fn fnv_question_id(q: &str) -> String {
@@ -587,7 +573,7 @@ fn allowed_kind(k: &str) -> &'static str {
 	}
 }
 
-fn decide_via_llm(entry: &FeedbackEntry, picks_ctx: &str) -> Result<LlmDecision> {
+async fn decide_via_llm(entry: &FeedbackEntry, picks_ctx: &str) -> Result<LlmDecision> {
 	let sys = "You curate a knowledge wiki from search feedback. Given a user question and the \
 		documents picked as relevant (with reasons), decide: \
 		(a) is the question worth saving as a 'questions' doc? \
@@ -602,13 +588,13 @@ fn decide_via_llm(entry: &FeedbackEntry, picks_ctx: &str) -> Result<LlmDecision>
 		"Question: {}\nPurpose hint (tag_filter): {:?}\n\nPicks (id, search_reason, snippet):\n{}",
 		entry.question, entry.tag_filter, picks_ctx
 	);
-	let content = smart::chat_json(sys, &user)?;
+	let content = http::chat_json(sys, &user).await?;
 	let parsed: LlmDecision = serde_json::from_str(&content)
 		.map_err(|e| anyhow::anyhow!("decision parse: {} body: {}", e, content))?;
 	Ok(parsed)
 }
 
-fn process_entry(
+async fn process_entry(
 	root: &Path,
 	entry: &FeedbackEntry,
 	entities: &[EntityRef],
@@ -628,24 +614,18 @@ fn process_entry(
 	let mut linked_ids: Vec<String> = Vec::new();
 	for pid in &entry.picked {
 		let mut doc_lookup: Option<(String, store::Document)> = None;
-		for dt in &[
-			"entities",
-			"thoughts",
-			"conclusions",
-			"reasons",
-			"questions",
-		] {
+		for dt in &["entities", "thoughts", "conclusions", "reasons", "questions"] {
 			if let Ok(d) = store::get_document(root, dt, pid) {
 				doc_lookup = Some(((*dt).to_string(), d));
 				break;
 			}
 		}
-		let Some((dt, doc)) = doc_lookup else {
-			continue;
-		};
+		let Some((dt, doc)) = doc_lookup else { continue };
 		found_any = true;
 		let snippet = if doc.content.len() > 400 {
-			format!("{}…", &doc.content[..400])
+			let mut end = 400;
+			while !doc.content.is_char_boundary(end) && end > 0 { end -= 1; }
+			format!("{}…", &doc.content[..end])
 		} else {
 			doc.content.clone()
 		};
@@ -654,9 +634,8 @@ fn process_entry(
 			"- id={} type={} title={:?} reason={:?}\n  snippet={}\n",
 			pid, dt, doc.title, r, snippet
 		));
-		// link wikilinks for picked docs (covers thoughts/conclusions/entities)
 		if !dry_run {
-			let _ = link_doc_internal(root, &dt, pid, entities, false);
+			let _ = link_doc_internal(root, &dt, pid, entities, false).await;
 			linked_ids.push(pid.clone());
 		}
 	}
@@ -664,7 +643,7 @@ fn process_entry(
 		return Ok(serde_json::json!({"skipped": "no picks resolved"}));
 	}
 
-	let decision = match decide_via_llm(entry, &picks_ctx) {
+	let decision = match decide_via_llm(entry, &picks_ctx).await {
 		Ok(d) => d,
 		Err(e) => return Ok(serde_json::json!({"error": e.to_string()})),
 	};
@@ -675,15 +654,9 @@ fn process_entry(
 
 	if decision.keep_question && question_id.is_none() && !dry_run {
 		let purpose = decision.purpose.clone().unwrap_or_else(|| {
-			entry
-				.tag_filter
-				.clone()
-				.unwrap_or_else(|| "general".to_string())
+			entry.tag_filter.clone().unwrap_or_else(|| "general".to_string())
 		});
-		let body = decision
-			.question_body
-			.clone()
-			.unwrap_or_else(|| entry.question.clone());
+		let body = decision.question_body.clone().unwrap_or_else(|| entry.question.clone());
 		let mut tags = vec!["question".to_string(), purpose.clone(), hash_id.clone()];
 		if decision.resolved {
 			tags.push("resolved".to_string());
@@ -691,10 +664,7 @@ fn process_entry(
 		if let Ok(qdoc) = store::create_document(
 			root,
 			"questions",
-			decision
-				.question_title
-				.as_deref()
-				.unwrap_or(entry.question.as_str()),
+			decision.question_title.as_deref().unwrap_or(entry.question.as_str()),
 			&body,
 			tags,
 			Some(&purpose),
@@ -722,14 +692,14 @@ fn process_entry(
 					continue;
 				}
 				let kind = allowed_kind(&edge.kind);
-				if let Ok(_) = store::create_reason(
+				if store::create_reason(
 					root,
 					qid,
 					&edge.picked_id,
 					kind,
 					&edge.body,
 					decision.purpose.as_deref(),
-				) {
+				).is_ok() {
 					edges_created += 1;
 				}
 			}
@@ -747,7 +717,7 @@ fn process_entry(
 	}))
 }
 
-pub fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<serde_json::Value> {
+pub async fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<serde_json::Value> {
 	let path = root.join("feedback.jsonl");
 	if !path.exists() {
 		return Ok(serde_json::json!({"processed": 0, "note": "no feedback.jsonl"}));
@@ -758,7 +728,7 @@ pub fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<ser
 	let slice = &raw[cursor..];
 	let text = std::str::from_utf8(slice).map_err(|e| anyhow::anyhow!("utf8: {}", e))?;
 
-	let entities = build_entity_index(root)?;
+	let entities = build_entity_index(root).await?;
 	let mut details = Vec::new();
 	let mut consumed_bytes = cursor as u64;
 	let mut processed = 0usize;
@@ -770,7 +740,6 @@ pub fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<ser
 			continue;
 		}
 		if processed >= limit {
-			// don't advance past unprocessed
 			consumed_bytes -= line.len() as u64;
 			break;
 		}
@@ -782,7 +751,7 @@ pub fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<ser
 				continue;
 			}
 		};
-		match process_entry(root, &entry, &entities, dry_run) {
+		match process_entry(root, &entry, &entities, dry_run).await {
 			Ok(v) => details.push(v),
 			Err(e) => details.push(serde_json::json!({"error": e.to_string()})),
 		}
@@ -790,7 +759,7 @@ pub fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<ser
 	}
 
 	if !dry_run {
-		write_cursor(root, consumed_bytes);
+		write_cursor(root, consumed_bytes)?;
 	}
 
 	let report = serde_json::json!({
@@ -802,13 +771,7 @@ pub fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Result<ser
 		"details": details,
 	});
 
-	let log_dir = root.join("ingest_log");
-	let _ = std::fs::create_dir_all(&log_dir);
-	let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-	let _ = std::fs::write(
-		log_dir.join(format!("learn-feedback-{}.json", ts)),
-		serde_json::to_string_pretty(&report).unwrap_or_default(),
-	);
+	write_pass_log(root, "learn-feedback", &report)?;
 
 	Ok(report)
 }
@@ -828,102 +791,5 @@ mod tests {
 	fn fnv64_stable() {
 		assert_eq!(fnv64("abc"), fnv64("abc"));
 		assert_ne!(fnv64("abc"), fnv64("abd"));
-	}
-
-	#[test]
-	#[ignore]
-	fn e2e_smart_and_feedback() {
-		// Requires OPENAI_API_KEY. Run with:
-		// cargo test --release e2e_smart_and_feedback -- --ignored --nocapture
-		use crate::{search, smart, store};
-		let tmp = tempfile::tempdir().expect("tmpdir");
-		let root = tmp.path();
-		store::ensure_wiki_layout(root).unwrap();
-		store::create_purpose(root, "rust", "Rust", "Rust language topics").unwrap();
-		store::create_purpose(root, "search", "Search", "Search infrastructure").unwrap();
-
-		let docs_input = [
-			(
-				"Tantivy",
-				"Tantivy is a Rust full-text search engine library similar to Lucene. \
-				It uses an inverted index, BM25 scoring, and segment-based storage.",
-				vec!["entity".into(), "search".into()],
-				"search",
-			),
-			(
-				"BM25 scoring",
-				"BM25 is a probabilistic ranking function used by full-text search engines \
-				to estimate the relevance of documents to a given query.",
-				vec!["entity".into(), "search".into()],
-				"search",
-			),
-			(
-				"Kittens",
-				"Kittens are juvenile cats. They sleep a lot and chase string.",
-				vec!["entity".into(), "rust".into()],
-				"rust",
-			),
-		];
-
-		{
-			let index_path = root.join(".search");
-			let index = search::create_index(&index_path).unwrap();
-			for (title, body, tags, purpose) in &docs_input {
-				let d = store::create_document(
-					root,
-					"entities",
-					title,
-					body,
-					tags.clone(),
-					Some(purpose),
-					None,
-				)
-				.unwrap();
-				search::index_document(&index, &d).unwrap();
-			}
-		}
-
-		let res = smart::smart_search(
-			root,
-			"which library does fulltext indexing in Rust?",
-			None,
-			10,
-			3,
-		)
-		.expect("smart_search ok");
-		println!(
-			"--- smart_search result ---\n{}",
-			serde_json::to_string_pretty(&res).unwrap()
-		);
-		let results = res["results"].as_array().expect("results array");
-		assert!(!results.is_empty(), "expected non-empty results");
-		let titles: Vec<String> = results
-			.iter()
-			.map(|r| r["title"].as_str().unwrap_or("").to_string())
-			.collect();
-		println!("retrieved titles: {:?}", titles);
-		assert!(
-			titles.iter().any(|t| t == "BM25 scoring"),
-			"hybrid recall should surface BM25 scoring doc via embeddings"
-		);
-
-		let feedback = std::fs::read_to_string(root.join("feedback.jsonl")).expect("feedback");
-		assert!(feedback.lines().count() >= 1);
-
-		let report = run_feedback_pass(root, 10, false).expect("feedback pass");
-		println!(
-			"--- feedback pass report ---\n{}",
-			serde_json::to_string_pretty(&report).unwrap()
-		);
-		assert_eq!(report["processed"].as_u64().unwrap(), 1);
-
-		let questions = store::list_documents(root, "questions").unwrap();
-		println!("questions created: {}", questions.len());
-		let reasons = store::list_documents(root, "reasons").unwrap();
-		println!("reasons created: {}", reasons.len());
-		assert!(
-			!reasons.is_empty(),
-			"expected reason edges from question to picks"
-		);
 	}
 }

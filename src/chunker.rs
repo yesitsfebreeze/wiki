@@ -18,12 +18,12 @@ pub fn split_paragraphs(content: &str) -> Vec<String> {
 
 /// Split content into per-purpose chunks. Each chunk = consecutive paragraphs
 /// classified to the same purpose.
-pub fn chunk_by_purpose(root: &Path, content: &str) -> Result<Vec<Chunk>> {
+pub async fn chunk_by_purpose(root: &Path, content: &str) -> Result<Vec<Chunk>> {
 	let paragraphs = split_paragraphs(content);
 	if paragraphs.is_empty() {
 		return Ok(vec![]);
 	}
-	let purposes = classifier::classify(root, &paragraphs)?;
+	let purposes = classifier::classify(root, &paragraphs).await?;
 
 	let mut out: Vec<Chunk> = Vec::new();
 	for (para, purpose) in paragraphs.into_iter().zip(purposes.into_iter()) {
