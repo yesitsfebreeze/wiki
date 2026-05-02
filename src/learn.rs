@@ -1,6 +1,6 @@
 use crate::cache;
 use crate::io::fnv64;
-use crate::{classifier, http, search, store};
+use crate::{classifier, http, search, smart, store};
 use std::sync::Arc;
 use anyhow::Result;
 use regex::Regex;
@@ -8,6 +8,35 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
+
+#[derive(Debug, Clone)]
+pub struct RaisedQuestion {
+	pub question_id: String,
+	pub title: String,
+	pub purpose: Option<String>,
+	pub created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnswerCandidate {
+	pub doc_id: String,
+	pub doc_type: String,
+	pub score: f32,
+	pub kind: String,
+	pub body: String,
+}
+
+fn answer_threshold() -> f32 {
+	std::env::var("WIKI_ANSWER_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8)
+}
+
+fn support_threshold() -> f32 {
+	std::env::var("WIKI_SUPPORT_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.3)
+}
+
+fn qa_max_per_pass() -> usize {
+	std::env::var("WIKI_QA_MAX_PER_PASS").ok().and_then(|s| s.parse().ok()).unwrap_or(50)
+}
 
 #[derive(Clone)]
 pub struct EntityRef {
@@ -414,11 +443,93 @@ pub async fn link_doc(root: &Path, doc_type: &str, id: &str, dry_run: bool) -> R
 	link_doc_internal(root, doc_type, id, entities.as_slice(), dry_run).await
 }
 
+/// QA loop for a single doc. Returns (raised, answered, promoted) counts.
+/// Decrements `llm_budget` by approximate LLM call count.
+async fn qa_for_doc(
+	root: &Path,
+	doc: &store::Document,
+	llm_budget: &mut usize,
+) -> Result<(u64, u64, u64)> {
+	if *llm_budget == 0 {
+		return Ok((0, 0, 0));
+	}
+	*llm_budget = llm_budget.saturating_sub(1);
+	let raised = raise_questions_for_doc(root, doc, false).await.unwrap_or_default();
+
+	// Plus any pre-existing OPEN question with a "References" reason → this doc.
+	let mut q_targets: Vec<(String, String, Option<String>)> = raised
+		.iter()
+		.map(|r| (r.question_id.clone(), r.title.clone(), r.purpose.clone()))
+		.collect();
+	if let Ok(reasons) = store::search_reasons_for(root, &doc.id, "to") {
+		for r in reasons {
+			// Heuristic: question→doc edges. We only know `from_id` via frontmatter — skip
+			// scanning frontmatter again; instead enumerate questions and check their tags.
+			let _ = r; // unused; we walk questions directly below
+		}
+	}
+	if let Ok(questions) = store::list_documents(root, "questions") {
+		for q in questions {
+			if q.tags.iter().any(|t| t == "resolved") { continue; }
+			if q_targets.iter().any(|(id, _, _)| id == &q.id) { continue; }
+			// Linked-to-this-doc check: scan reasons from q.id with to_id == doc.id.
+			let linked = store::search_reasons_for(root, &q.id, "from")
+				.ok()
+				.map(|rs| rs.iter().any(|r| {
+					// reason title format: "<from> -[<kind>]-> <to>"
+					r.title.ends_with(&doc.id)
+				}))
+				.unwrap_or(false);
+			if linked {
+				q_targets.push((q.id, q.title, q.purpose));
+			}
+		}
+	}
+
+	let mut answered = 0u64;
+	let mut promoted = 0u64;
+	let strong = answer_threshold();
+
+	for (qid, qtitle, qpurpose) in q_targets {
+		if *llm_budget == 0 { break; }
+		*llm_budget = llm_budget.saturating_sub(1);
+		let cands = match cross_reference_question(root, &qtitle, qpurpose.as_deref()).await {
+			Ok(v) => v,
+			Err(_) => continue,
+		};
+		let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
+		let mut got_answer = false;
+		for c in &cands {
+			let kind = if c.score >= strong { "Answers" } else { "Supports" };
+			if c.score >= strong { got_answer = true; }
+			let _ = store::create_reason(root, &qid, &c.doc_id, kind, &c.body, qpurpose.as_deref());
+			if c.score >= strong { strong_edges.push(c.clone()); }
+		}
+		if got_answer {
+			answered += 1;
+			if let Ok(mut q) = store::get_document(root, "questions", &qid) {
+				if !q.tags.iter().any(|t| t == "resolved") {
+					q.tags.push("resolved".to_string());
+					let _ = store::update_document(root, "questions", &qid, None, Some(q.tags));
+				}
+			}
+			if *llm_budget == 0 { continue; }
+			*llm_budget = llm_budget.saturating_sub(1);
+			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &strong_edges).await {
+				promoted += 1;
+			}
+		}
+	}
+
+	Ok((raised.iter().filter(|r| r.created).count() as u64, answered, promoted))
+}
+
 pub async fn run_pass(
 	root: &Path,
 	limit: usize,
 	purpose: Option<&str>,
 	dry_run: bool,
+	qa: bool,
 ) -> Result<serde_json::Value> {
 	let entities = build_entity_index(root).await?;
 	let mut targets: Vec<(String, String)> = Vec::new();
@@ -443,6 +554,10 @@ pub async fn run_pass(
 	let mut docs_modified = 0u64;
 	let mut links_added = 0u64;
 	let mut merges_total = 0u64;
+	let mut questions_raised = 0u64;
+	let mut questions_answered = 0u64;
+	let mut conclusions_promoted = 0u64;
+	let mut llm_budget = qa_max_per_pass();
 	let mut details = Vec::new();
 	for (dt, id) in &targets {
 		match link_doc_internal(root, dt, id, entities.as_slice(), dry_run).await {
@@ -460,6 +575,21 @@ pub async fn run_pass(
 				"error": e.to_string()
 			})),
 		}
+
+		if !qa || dry_run || llm_budget == 0 {
+			continue;
+		}
+		let Ok(doc) = store::get_document(root, dt, id) else { continue };
+		match qa_for_doc(root, &doc, &mut llm_budget).await {
+			Ok((raised, answered, promoted)) => {
+				questions_raised += raised;
+				questions_answered += answered;
+				conclusions_promoted += promoted;
+			}
+			Err(e) => details.push(serde_json::json!({
+				"doc_id": id, "qa_error": e.to_string(),
+			})),
+		}
 	}
 
 	let report = serde_json::json!({
@@ -468,9 +598,13 @@ pub async fn run_pass(
 		"docs_modified": docs_modified,
 		"links_added": links_added,
 		"paragraphs_merged": merges_total,
+		"questions_raised": questions_raised,
+		"questions_answered": questions_answered,
+		"conclusions_promoted": conclusions_promoted,
 		"entity_count": entities.len(),
 		"purpose_filter": purpose,
 		"dry_run": dry_run,
+		"qa": qa,
 		"details": details,
 	});
 
@@ -561,6 +695,199 @@ fn find_question_by_hash(root: &Path, hash_id: &str) -> Option<String> {
 			None
 		}
 	})
+}
+
+fn find_conclusion_by_hash(root: &Path, hash_id: &str) -> Option<String> {
+	let docs = store::list_documents(root, "conclusions").ok()?;
+	docs.into_iter().find_map(|d| {
+		if d.tags.iter().any(|t| t == hash_id) { Some(d.id) } else { None }
+	})
+}
+
+#[derive(Deserialize, Debug)]
+struct RaisedQItem {
+	#[serde(default)]
+	title: String,
+	#[serde(default)]
+	body: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct RaisedQResp {
+	#[serde(default)]
+	questions: Vec<RaisedQItem>,
+}
+
+pub async fn raise_questions_for_doc(
+	root: &Path,
+	doc: &store::Document,
+	dry_run: bool,
+) -> Result<Vec<RaisedQuestion>> {
+	let sys = "You read a wiki doc and produce open questions IT raises (not answers). \
+		Return JSON {\"questions\": [{\"title\": string, \"body\": string}]}. \
+		Skip if doc already self-explanatory. Max 3.";
+	let user = format!("Title: {}\n\nBody:\n{}", doc.title, doc.content);
+	let raw = http::chat_json(sys, &user).await?;
+	let parsed: RaisedQResp = serde_json::from_str(&raw)
+		.map_err(|e| anyhow::anyhow!("raise parse: {} body: {}", e, raw))?;
+
+	let purpose = doc.purpose.clone();
+	let mut out = Vec::new();
+	for q in parsed.questions.into_iter().take(3) {
+		let title = q.title.trim().to_string();
+		if title.is_empty() {
+			continue;
+		}
+		let hash = fnv_question_id(&title);
+		if let Some(existing_id) = find_question_by_hash(root, &hash) {
+			out.push(RaisedQuestion {
+				question_id: existing_id,
+				title,
+				purpose: purpose.clone(),
+				created: false,
+			});
+			continue;
+		}
+		if dry_run {
+			out.push(RaisedQuestion {
+				question_id: hash.clone(),
+				title,
+				purpose: purpose.clone(),
+				created: false,
+			});
+			continue;
+		}
+		let body = if q.body.trim().is_empty() { title.clone() } else { q.body };
+		let purpose_tag = purpose.clone().unwrap_or_else(|| "general".to_string());
+		let tags = vec!["question".to_string(), purpose_tag.clone(), hash.clone()];
+		let qdoc = store::create_document(
+			root, "questions", &title, &body, tags, Some(&purpose_tag), None,
+		)?;
+		let _ = store::create_reason(root, &qdoc.id, &doc.id, "References", "raised by", purpose.as_deref());
+		out.push(RaisedQuestion {
+			question_id: qdoc.id,
+			title,
+			purpose: purpose.clone(),
+			created: true,
+		});
+	}
+	Ok(out)
+}
+
+#[derive(Deserialize, Debug)]
+struct ScoredCand {
+	picked_id: String,
+	#[serde(default)]
+	score: f32,
+	#[serde(default)]
+	kind: String,
+	#[serde(default)]
+	body: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct ScoredResp {
+	#[serde(default)]
+	scored: Vec<ScoredCand>,
+}
+
+pub async fn cross_reference_question(
+	root: &Path,
+	question: &str,
+	purpose: Option<&str>,
+) -> Result<Vec<AnswerCandidate>> {
+	let res = smart::smart_search(root, question, purpose, 5, 5).await?;
+	let results = res.get("results").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+	if results.is_empty() {
+		return Ok(Vec::new());
+	}
+	// Build a doc-type map by re-resolving each candidate id.
+	let mut id_to_dt: HashMap<String, String> = HashMap::new();
+	for r in &results {
+		let Some(id) = r.get("id").and_then(|v| v.as_str()) else { continue };
+		for dt in &["entities", "thoughts", "conclusions", "reasons", "questions"] {
+			if store::get_document(root, dt, id).is_ok() {
+				id_to_dt.insert(id.to_string(), (*dt).to_string());
+				break;
+			}
+		}
+	}
+
+	let cand_json = serde_json::to_string(&results)?;
+	let sys = "Given a question and these candidate docs, score each 0..1 for how well it \
+		answers, and pick a kind from Answers|Supports|Contradicts|Extends|References. \
+		Return JSON {\"scored\":[{\"picked_id\":string,\"score\":number,\"kind\":string,\"body\":string}]}. \
+		`body` is one short sentence on WHY. Include every candidate id.";
+	let user = format!("Question: {}\n\nCandidates:\n{}", question, cand_json);
+	let raw = http::chat_json(sys, &user).await?;
+	let parsed: ScoredResp = serde_json::from_str(&raw)
+		.map_err(|e| anyhow::anyhow!("cross-ref parse: {} body: {}", e, raw))?;
+
+	let support = support_threshold();
+	let out = parsed.scored.into_iter()
+		.filter(|c| c.score >= support)
+		.map(|c| AnswerCandidate {
+			doc_type: id_to_dt.get(&c.picked_id).cloned().unwrap_or_else(|| "thoughts".to_string()),
+			doc_id: c.picked_id,
+			score: c.score,
+			kind: allowed_kind(&c.kind).to_string(),
+			body: c.body,
+		})
+		.collect();
+	Ok(out)
+}
+
+pub async fn promote_to_conclusion(
+	root: &Path,
+	question_id: &str,
+	edges: &[AnswerCandidate],
+) -> Result<Option<String>> {
+	let question = store::get_document(root, "questions", question_id)?;
+	let hash = fnv_question_id(&question.title);
+	if let Some(existing) = find_conclusion_by_hash(root, &hash) {
+		return Ok(Some(existing));
+	}
+
+	#[derive(serde::Serialize)]
+	struct EdgeView<'a> {
+		doc_id: &'a str,
+		doc_type: &'a str,
+		score: f32,
+		kind: &'a str,
+		body: &'a str,
+	}
+	let edges_json: Vec<EdgeView> = edges.iter().map(|e| EdgeView {
+		doc_id: &e.doc_id, doc_type: &e.doc_type, score: e.score, kind: &e.kind, body: &e.body,
+	}).collect();
+
+	let sys = "Synthesize a 1-paragraph conclusion answering this question, citing the \
+		supplied edges. Be concise. Return JSON {\"body\": string}.";
+	let user = format!(
+		"Question: {}\n\nEdges JSON:\n{}",
+		question.title,
+		serde_json::to_string(&edges_json)?,
+	);
+	let raw = http::chat_json(sys, &user).await?;
+	#[derive(Deserialize)]
+	struct Body { body: String }
+	let parsed: Body = serde_json::from_str(&raw)
+		.map_err(|e| anyhow::anyhow!("promote parse: {} body: {}", e, raw))?;
+
+	let purpose = question.purpose.clone();
+	let purpose_tag = purpose.clone().unwrap_or_else(|| "general".to_string());
+	let tags = vec!["conclusion".to_string(), purpose_tag.clone(), hash];
+	let cdoc = store::create_document(
+		root, "conclusions", &question.title, &parsed.body, tags, Some(&purpose_tag), None,
+	)?;
+
+	let _ = store::create_reason(root, question_id, &cdoc.id, "Derives", "promoted from resolved question", purpose.as_deref());
+	let strong = answer_threshold();
+	for e in edges {
+		if e.score >= strong {
+			let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", &e.body, purpose.as_deref());
+		}
+	}
+	Ok(Some(cdoc.id))
 }
 
 fn allowed_kind(k: &str) -> &'static str {
@@ -783,6 +1110,7 @@ pub async fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Resu
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use tempfile::TempDir;
 
 	#[test]
 	fn protected_ranges_skip_code() {
@@ -795,5 +1123,59 @@ mod tests {
 	fn fnv64_stable() {
 		assert_eq!(fnv64("abc"), fnv64("abc"));
 		assert_ne!(fnv64("abc"), fnv64("abd"));
+	}
+
+	#[test]
+	fn fnv_question_id_stable() {
+		assert_eq!(fnv_question_id("Why is the sky blue?"), fnv_question_id("Why is the sky blue?"));
+		assert_eq!(fnv_question_id(" Why is the sky blue? "), fnv_question_id("Why is the sky blue?"));
+		assert_ne!(fnv_question_id("Why?"), fnv_question_id("How?"));
+		assert!(fnv_question_id("Q").starts_with("q-"));
+	}
+
+	#[test]
+	fn allowed_kind_extends_answers() {
+		assert_eq!(allowed_kind("answers"), "Answers");
+		assert_eq!(allowed_kind("Answers"), "Answers");
+		assert_eq!(allowed_kind("supports"), "Supports");
+		assert_eq!(allowed_kind("contradicts"), "Contradicts");
+		assert_eq!(allowed_kind("extends"), "Extends");
+		assert_eq!(allowed_kind("garbage"), "References");
+	}
+
+	#[test]
+	fn raise_questions_dedup_via_hash() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let title = "Does borrowing prevent data races?";
+		let hash = fnv_question_id(title);
+		let tags = vec!["question".to_string(), "general".to_string(), hash.clone()];
+		let q = store::create_document(root, "questions", title, "body", tags, Some("general"), None).unwrap();
+		let found = find_question_by_hash(root, &hash);
+		assert_eq!(found, Some(q.id));
+		// Negative: distinct hash returns None
+		assert!(find_question_by_hash(root, "q-deadbeef").is_none());
+	}
+
+	#[tokio::test]
+	async fn promote_to_conclusion_idempotent() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let qtitle = "What is ownership?";
+		let qhash = fnv_question_id(qtitle);
+		let qtags = vec!["question".to_string(), "general".to_string(), qhash.clone()];
+		let qdoc = store::create_document(root, "questions", qtitle, "q body", qtags, Some("general"), None).unwrap();
+
+		// Pre-existing conclusion w/ matching hash tag.
+		let ctags = vec!["conclusion".to_string(), "general".to_string(), qhash.clone()];
+		let cdoc = store::create_document(root, "conclusions", qtitle, "existing", ctags, Some("general"), None).unwrap();
+
+		let result = promote_to_conclusion(root, &qdoc.id, &[]).await.unwrap();
+		assert_eq!(result, Some(cdoc.id));
+		// No new conclusion was added.
+		let concs = store::list_documents(root, "conclusions").unwrap();
+		assert_eq!(concs.len(), 1);
 	}
 }

@@ -319,10 +319,125 @@ pub async fn smart_search(
 	k: usize,
 	top_n: usize,
 ) -> Result<serde_json::Value> {
+	if let Some(tree) = conclusions_first(root, question, tag_filter, k)? {
+		return Ok(tree);
+	}
 	let q_text = vec![question.to_string()];
 	let q_emb_vec = http::embed_batch(&q_text).await?;
 	let q_emb = q_emb_vec.into_iter().next().ok_or_else(|| anyhow!("query embed empty"))?;
-	smart_search_with_qemb(root, question, tag_filter, k, top_n, &q_emb).await
+	let mut v = smart_search_with_qemb(root, question, tag_filter, k, top_n, &q_emb).await?;
+	if let Some(obj) = v.as_object_mut() {
+		obj.entry("entry_kind").or_insert(serde_json::json!("fallback"));
+	}
+	Ok(v)
+}
+
+/// Score a conclusion against the query: count of lowercase term hits in
+/// title (×3) + body. Cheap deterministic scoring — no embeddings needed.
+fn score_conclusion(doc: &Document, qterms: &[String]) -> usize {
+	if qterms.is_empty() { return 0; }
+	let title_lc = doc.title.to_lowercase();
+	let body_lc = doc.content.to_lowercase();
+	qterms.iter()
+		.map(|t| title_lc.matches(t.as_str()).count() * 3 + body_lc.matches(t.as_str()).count())
+		.sum()
+}
+
+/// Conclusions-first stage: if the query hits any conclusion, return its
+/// depth-1 reason fanout (cap 5) as the primary tree. None → caller falls
+/// back to the hybrid path.
+pub(crate) fn conclusions_first(
+	root: &Path,
+	query: &str,
+	tag_filter: Option<&str>,
+	_k: usize,
+) -> Result<Option<serde_json::Value>> {
+	let qterms = lowercase_terms(query);
+	if qterms.is_empty() { return Ok(None); }
+
+	let conclusions = match store::list_documents(root, "conclusions") {
+		Ok(v) => v,
+		Err(_) => return Ok(None),
+	};
+
+	let mut scored: Vec<(usize, Document)> = conclusions
+		.into_iter()
+		.filter(|d| tag_filter.map(|t| d.tags.iter().any(|x| x == t)).unwrap_or(true))
+		.filter_map(|d| {
+			let s = score_conclusion(&d, &qterms);
+			if s > 0 { Some((s, d)) } else { None }
+		})
+		.collect();
+	if scored.is_empty() { return Ok(None); }
+	scored.sort_by(|a, b| b.0.cmp(&a.0));
+	scored.truncate(3);
+
+	let mut tree = Vec::with_capacity(scored.len());
+	for (_, conc) in &scored {
+		let reasons = store::search_reasons_for(root, &conc.id, "from")
+			.unwrap_or_default();
+		let reasons_json: Vec<serde_json::Value> = reasons.into_iter().take(5)
+			.map(|r| {
+				let from_id = &conc.id;
+				let to_id = extract_to_id(&r);
+				let kind = extract_kind(&r);
+				let target = to_id.as_deref()
+					.and_then(|tid| resolve_doc(root, tid));
+				serde_json::json!({
+					"reason_id": r.id,
+					"from_id": from_id,
+					"to_id": to_id,
+					"kind": kind,
+					"target_doc": target,
+				})
+			})
+			.collect();
+		tree.push(serde_json::json!({
+			"conclusion": {
+				"id": conc.id,
+				"title": conc.title,
+				"tags": conc.tags,
+				"purpose": conc.purpose,
+				"content": conc.content,
+			},
+			"reasons": reasons_json,
+		}));
+	}
+
+	Ok(Some(serde_json::json!({
+		"question": query,
+		"entry_kind": "conclusions",
+		"tree": tree,
+		"results": [],
+	})))
+}
+
+/// Reason docs encode `to_id`/`kind` in their title `"<from> -[<kind>]-> <to>"`.
+/// We don't re-parse the frontmatter — the title is canonical.
+fn extract_to_id(reason: &Document) -> Option<String> {
+	reason.title.split("]-> ").nth(1).map(|s| s.trim().to_string())
+}
+
+fn extract_kind(reason: &Document) -> Option<String> {
+	let t = &reason.title;
+	let start = t.find("-[")? + 2;
+	let end = t[start..].find("]->")? + start;
+	Some(t[start..end].to_string())
+}
+
+fn resolve_doc(root: &Path, id: &str) -> Option<serde_json::Value> {
+	for dt in &["conclusions", "thoughts", "entities", "questions", "reasons"] {
+		if let Ok(d) = store::get_document(root, dt, id) {
+			return Some(serde_json::json!({
+				"id": d.id,
+				"doc_type": dt,
+				"title": d.title,
+				"tags": d.tags,
+				"content": d.content,
+			}));
+		}
+	}
+	None
 }
 
 /// Search variant accepting a pre-computed query embedding. Lets callers
@@ -336,6 +451,9 @@ pub async fn smart_search_with_qemb(
 	top_n: usize,
 	q_emb: &[f32],
 ) -> Result<serde_json::Value> {
+	if let Some(tree) = conclusions_first(root, question, tag_filter, k)? {
+		return Ok(tree);
+	}
 	let pool_size = k.max(top_n * 4).max(20);
 
 	let bm25_fut = async {
@@ -506,4 +624,70 @@ pub async fn smart_search_with_qemb(
 		"purpose_bias": purpose_bias,
 		"results": out,
 	}))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::store::{create_document, create_reason, ensure_wiki_layout};
+	use tempfile::TempDir;
+
+	#[test]
+	fn conclusions_first_returns_none_on_empty() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let r = conclusions_first(root, "anything matters", None, 10).unwrap();
+		assert!(r.is_none());
+	}
+
+	#[test]
+	fn conclusions_first_walks_reasons() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let conc = create_document(
+			root, "conclusions", "Quantum entanglement summary",
+			"Quantum entanglement is correlated state.",
+			vec!["conclusion".into()], None, None,
+		).unwrap();
+		let t1 = create_document(
+			root, "thoughts", "Bell test note", "Bell inequalities body",
+			vec!["thought".into()], None, None,
+		).unwrap();
+		let t2 = create_document(
+			root, "thoughts", "EPR paradox", "EPR body",
+			vec!["thought".into()], None, None,
+		).unwrap();
+		create_reason(root, &conc.id, &t1.id, "References", "see bell", None).unwrap();
+		create_reason(root, &conc.id, &t2.id, "References", "see epr", None).unwrap();
+
+		let v = conclusions_first(root, "quantum entanglement", None, 10)
+			.unwrap()
+			.expect("must hit conclusion");
+		assert_eq!(v["entry_kind"], "conclusions");
+		let tree = v["tree"].as_array().unwrap();
+		assert_eq!(tree.len(), 1);
+		assert_eq!(tree[0]["conclusion"]["id"], conc.id);
+		let reasons = tree[0]["reasons"].as_array().unwrap();
+		let target_ids: Vec<String> = reasons.iter()
+			.filter_map(|r| r["target_doc"]["id"].as_str().map(String::from))
+			.collect();
+		assert!(target_ids.contains(&t1.id), "missing t1: {:?}", target_ids);
+		assert!(target_ids.contains(&t2.id), "missing t2: {:?}", target_ids);
+	}
+
+	#[test]
+	fn smart_search_falls_back_when_no_conclusions() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		create_document(
+			root, "thoughts", "Lone thought", "lonely body content",
+			vec!["thought".into()], None, None,
+		).unwrap();
+		// helper alone should return None — no conclusions exist
+		let r = conclusions_first(root, "lonely thought", None, 10).unwrap();
+		assert!(r.is_none(), "expected fallback (None) when no conclusions");
+	}
 }
