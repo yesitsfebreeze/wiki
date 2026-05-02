@@ -14,6 +14,8 @@ mod search;
 mod smart;
 mod store;
 mod tools;
+mod walk;
+mod weight;
 
 fn emit_empty_hook() -> anyhow::Result<()> {
     println!("{{}}");
@@ -327,6 +329,8 @@ enum CliCmd {
     CodeReadHook,
     StopHook,
     LearnFeedback { limit: usize, dry_run: bool },
+    MigrateTemplatedQuestions { dry_run: bool },
+    RecomputeWeights { dry_run: bool },
 }
 
 fn parse_cli() -> Option<CliCmd> {
@@ -369,6 +373,19 @@ fn parse_cli() -> Option<CliCmd> {
             }
             Some(CliCmd::LearnFeedback { limit, dry_run })
         }
+        "migrate-templated-questions" => {
+            let mut dry_run = false;
+            let mut i = 2;
+            while i < args.len() {
+                if args[i].as_str() == "--dry-run" { dry_run = true; }
+                i += 1;
+            }
+            Some(CliCmd::MigrateTemplatedQuestions { dry_run })
+        }
+        "recompute-weights" => {
+            let dry_run = args.iter().skip(2).any(|a| a == "--dry-run");
+            Some(CliCmd::RecomputeWeights { dry_run })
+        }
         _ => None,
     }
 }
@@ -391,6 +408,32 @@ async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
             store::ensure_wiki_layout(&root)?;
             match learn::run_feedback_pass(&root, limit, dry_run).await {
                 Ok(v) => { println!("{}", v); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::MigrateTemplatedQuestions { dry_run } => {
+            let root = store::wiki_root();
+            store::ensure_wiki_layout(&root)?;
+            match learn::migrate_templated_questions(&root, dry_run) {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    eprintln!(
+                        "migrate-templated-questions: scanned={} templated={} deleted={} dry_run={}",
+                        report.scanned, report.templated, report.deleted, dry_run,
+                    );
+                    Ok(())
+                }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::RecomputeWeights { dry_run } => {
+            let root = store::wiki_root();
+            store::ensure_wiki_layout(&root)?;
+            match weight::run_cli(&root, dry_run) {
+                Ok(n) => {
+                    eprintln!("{} doc(s) {}", n, if dry_run { "would update" } else { "updated" });
+                    Ok(())
+                }
                 Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
             }
         }

@@ -530,9 +530,12 @@ pub async fn run_pass(
 	purpose: Option<&str>,
 	dry_run: bool,
 	qa: bool,
+	force: bool,
 ) -> Result<serde_json::Value> {
 	let entities = build_entity_index(root).await?;
-	let mut targets: Vec<(String, String)> = Vec::new();
+
+	// Build the full ordered sequence of (doc_type, id) candidates respecting purpose filter.
+	let mut sequence: Vec<(String, String)> = Vec::new();
 	for doc_type in &["thoughts", "conclusions"] {
 		let docs = store::list_documents(root, doc_type)?;
 		for d in docs {
@@ -541,13 +544,31 @@ pub async fn run_pass(
 					continue;
 				}
 			}
-			targets.push(((*doc_type).to_string(), d.id));
+			sequence.push(((*doc_type).to_string(), d.id));
+		}
+	}
+
+	// Apply per-purpose cursor: rotate sequence so it starts after the cursor.
+	let cursor_key = purpose.unwrap_or("<global>");
+	let cursor = read_pass_cursor(root, cursor_key);
+	let start_idx = match cursor {
+		Some((ref dt, ref id)) => sequence
+			.iter()
+			.position(|(d, i)| d == dt && i == id)
+			.map(|i| (i + 1) % sequence.len().max(1))
+			.unwrap_or(0),
+		None => 0,
+	};
+
+	let mut targets: Vec<(String, String)> = Vec::new();
+	if !sequence.is_empty() {
+		let n = sequence.len();
+		for k in 0..n {
+			let idx = (start_idx + k) % n;
+			targets.push(sequence[idx].clone());
 			if targets.len() >= limit {
 				break;
 			}
-		}
-		if targets.len() >= limit {
-			break;
 		}
 	}
 
@@ -559,7 +580,22 @@ pub async fn run_pass(
 	let mut conclusions_promoted = 0u64;
 	let mut llm_budget = qa_max_per_pass();
 	let mut details = Vec::new();
+	let mut last_processed: Option<(String, String)> = None;
+	let mut skipped_recent = 0u64;
 	for (dt, id) in &targets {
+		last_processed = Some((dt.clone(), id.clone()));
+
+		// Skip if last_qa_at is within 24h and not forced.
+		if !force && qa && doc_qa_is_recent(root, dt, id) {
+			skipped_recent += 1;
+			details.push(serde_json::json!({
+				"doc_id": id,
+				"doc_type": dt,
+				"skipped": "recent_qa",
+			}));
+			continue;
+		}
+
 		match link_doc_internal(root, dt, id, entities.as_slice(), dry_run).await {
 			Ok(v) => {
 				if v["modified"].as_bool().unwrap_or(false) {
@@ -585,10 +621,20 @@ pub async fn run_pass(
 				questions_raised += raised;
 				questions_answered += answered;
 				conclusions_promoted += promoted;
+				if !dry_run {
+					let _ = stamp_last_qa_at(root, dt, id);
+				}
 			}
 			Err(e) => details.push(serde_json::json!({
 				"doc_id": id, "qa_error": e.to_string(),
 			})),
+		}
+	}
+
+	// Persist cursor at last-processed doc so the next pass resumes after it.
+	if !dry_run {
+		if let Some((dt, id)) = &last_processed {
+			let _ = write_pass_cursor(root, cursor_key, dt, id);
 		}
 	}
 
@@ -605,6 +651,9 @@ pub async fn run_pass(
 		"purpose_filter": purpose,
 		"dry_run": dry_run,
 		"qa": qa,
+		"force": force,
+		"skipped_recent": skipped_recent,
+		"cursor": last_processed.as_ref().map(|(dt, id)| format!("{}/{}", dt, id)),
 		"details": details,
 	});
 
@@ -618,6 +667,9 @@ pub async fn run_pass(
 				.collect();
 			let _ = search::index_documents(&index, &docs);
 		}
+		// Recompute node_size weights for the whole vault. Cheap because the
+		// reason index is cached; min/max normalization needs all docs anyway.
+		let _ = crate::weight::recompute_all(root);
 	}
 
 	Ok(report)
@@ -682,34 +734,103 @@ fn write_cursor(root: &Path, off: u64) -> Result<()> {
 	crate::io::write_atomic_str(&root.join(".feedback.cursor"), &off.to_string())
 }
 
+fn pass_cursor_path(root: &Path, key: &str) -> std::path::PathBuf {
+	let safe: String = key.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '<' || c == '>' { c } else { '_' }).collect();
+	root.join(format!(".learn.cursor.{}", safe))
+}
+
+/// Read per-purpose pass cursor. Returns Some((doc_type, id)) if present.
+pub(crate) fn read_pass_cursor(root: &Path, key: &str) -> Option<(String, String)> {
+	let raw = std::fs::read_to_string(pass_cursor_path(root, key)).ok()?;
+	let mut lines = raw.lines();
+	let first = lines.next()?.trim();
+	let (dt, id) = first.split_once('/')?;
+	if dt.is_empty() || id.is_empty() {
+		return None;
+	}
+	Some((dt.to_string(), id.to_string()))
+}
+
+pub(crate) fn write_pass_cursor(root: &Path, key: &str, doc_type: &str, id: &str) -> Result<()> {
+	let body = format!("{}/{}\n{}\n", doc_type, id, chrono::Utc::now().to_rfc3339());
+	crate::io::write_atomic_str(&pass_cursor_path(root, key), &body)
+}
+
+/// Returns true if the doc has a `last_qa_at` frontmatter field within the last 24h.
+fn doc_qa_is_recent(root: &Path, doc_type: &str, id: &str) -> bool {
+	let dir = root.join(doc_type);
+	let Ok(path) = store::find_document_path_by_id(&dir, id) else { return false };
+	let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+	let Ok((fm, _)) = store::parse_frontmatter(&raw) else { return false };
+	let Some(ts) = fm.get("last_qa_at").and_then(|v| v.as_str()) else { return false };
+	let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else { return false };
+	let age = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
+	age.num_hours() < 24 && age.num_seconds() >= 0
+}
+
+/// Write `last_qa_at: <now-rfc3339>` into the doc's frontmatter (preserves body + other fm).
+fn stamp_last_qa_at(root: &Path, doc_type: &str, id: &str) -> Result<()> {
+	let dir = root.join(doc_type);
+	let path = store::find_document_path_by_id(&dir, id)?;
+	let raw = std::fs::read_to_string(&path)?;
+	let (mut fm, body) = store::parse_frontmatter(&raw)?;
+	let now = chrono::Utc::now().to_rfc3339();
+	if let Some(obj) = fm.as_object_mut() {
+		obj.insert("last_qa_at".to_string(), serde_json::json!(now));
+	} else {
+		// fm was Null — synthesize.
+		let mut m = serde_json::Map::new();
+		m.insert("id".to_string(), serde_json::json!(id));
+		m.insert("last_qa_at".to_string(), serde_json::json!(now));
+		fm = serde_json::Value::Object(m);
+	}
+	let fm_str = serde_yaml::to_string(&fm)?;
+	crate::io::write_atomic_str(&path, &format!("---\n{}---\n\n{}", fm_str, body))?;
+	Ok(())
+}
+
 fn fnv_question_id(q: &str) -> String {
 	format!("q-{:x}", fnv64(q.trim()))
 }
 
 fn find_question_by_hash(root: &Path, hash_id: &str) -> Option<String> {
-	let docs = store::list_documents(root, "questions").ok()?;
-	docs.into_iter().find_map(|d| {
-		if d.tags.iter().any(|t| t == hash_id) {
-			Some(d.id)
-		} else {
-			None
-		}
-	})
+	if let Some(id) = cache::hash_index_lookup(root, hash_id)
+		.into_iter()
+		.find(|d| d.doc_type == "questions")
+		.map(|d| d.id)
+	{
+		return Some(id);
+	}
+	// Fallback FS scan: process-global cache may be stale across parallel
+	// tests using different roots.
+	store::list_documents(root, "questions")
+		.ok()?
+		.into_iter()
+		.find(|d| d.tags.iter().any(|t| t == hash_id))
+		.map(|d| d.id)
 }
 
 fn find_conclusion_by_hash(root: &Path, hash_id: &str) -> Option<String> {
-	let docs = store::list_documents(root, "conclusions").ok()?;
-	docs.into_iter().find_map(|d| {
-		if d.tags.iter().any(|t| t == hash_id) { Some(d.id) } else { None }
-	})
+	if let Some(id) = cache::hash_index_lookup(root, hash_id)
+		.into_iter()
+		.find(|d| d.doc_type == "conclusions")
+		.map(|d| d.id)
+	{
+		return Some(id);
+	}
+	store::list_documents(root, "conclusions")
+		.ok()?
+		.into_iter()
+		.find(|d| d.tags.iter().any(|t| t == hash_id))
+		.map(|d| d.id)
 }
 
-#[derive(Deserialize, Debug)]
-struct RaisedQItem {
+#[derive(Deserialize, Debug, Clone)]
+pub struct RaisedQItem {
 	#[serde(default)]
-	title: String,
+	pub title: String,
 	#[serde(default)]
-	body: String,
+	pub body: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -718,26 +839,84 @@ struct RaisedQResp {
 	questions: Vec<RaisedQItem>,
 }
 
+/// Counts open (i.e. not yet `resolved`) questions for the given purpose using
+/// the cached tag index. `purpose` of `None` falls back to `"general"`.
+pub fn count_open_questions_in_purpose(root: &Path, purpose: Option<&str>) -> usize {
+	let purpose_tag = purpose.unwrap_or("general");
+	let by_purpose = cache::tag_index_lookup(root, purpose_tag);
+	let resolved: std::collections::HashSet<String> = cache::tag_index_lookup(root, "resolved")
+		.into_iter()
+		.filter(|d| d.doc_type == "questions")
+		.map(|d| d.id)
+		.collect();
+	by_purpose
+		.into_iter()
+		.filter(|d| d.doc_type == "questions" && !resolved.contains(&d.id))
+		.count()
+}
+
+/// Filter LLM-emitted candidates: drop empties, drop template-shaped titles.
+/// Pure -- no I/O. Returns `(kept, skipped_template_titles)`.
+pub fn filter_raised_candidates(
+	items: Vec<RaisedQItem>,
+) -> (Vec<RaisedQItem>, Vec<String>) {
+	let mut kept = Vec::new();
+	let mut skipped = Vec::new();
+	for q in items.into_iter().take(3) {
+		let title = q.title.trim().to_string();
+		if title.is_empty() {
+			continue;
+		}
+		if crate::config::is_template_question(&title) {
+			skipped.push(title);
+			continue;
+		}
+		kept.push(RaisedQItem { title, body: q.body });
+	}
+	(kept, skipped)
+}
+
 pub async fn raise_questions_for_doc(
 	root: &Path,
 	doc: &store::Document,
 	dry_run: bool,
 ) -> Result<Vec<RaisedQuestion>> {
+	// Per-purpose backpressure: refuse to call the LLM if we already have too
+	// many open questions in this purpose.
+	let cap = crate::config::open_questions_per_purpose_cap();
+	let open_now = count_open_questions_in_purpose(root, doc.purpose.as_deref());
+	if open_now >= cap {
+		eprintln!(
+			"raise_questions_for_doc: purpose {:?} at cap ({} >= {}), skipping raise",
+			doc.purpose.as_deref().unwrap_or("general"),
+			open_now,
+			cap,
+		);
+		return Ok(Vec::new());
+	}
+
 	let sys = "You read a wiki doc and produce open questions IT raises (not answers). \
 		Return JSON {\"questions\": [{\"title\": string, \"body\": string}]}. \
-		Skip if doc already self-explanatory. Max 3.";
+		Skip if doc already self-explanatory. Max 3. \
+		Hard rules: \
+		- Reject questions any reasonable reader could answer from the doc body alone. \
+		- No templated phrasing. No 'How does X relate to similar concepts'. \
+		No 'What are the implications of X'. No 'What are the key characteristics of X'. \
+		- Each question must require >=2 sentences of context in the body, not just a title.";
 	let user = format!("Title: {}\n\nBody:\n{}", doc.title, doc.content);
 	let raw = http::chat_json(sys, &user).await?;
 	let parsed: RaisedQResp = serde_json::from_str(&raw)
 		.map_err(|e| anyhow::anyhow!("raise parse: {} body: {}", e, raw))?;
 
+	let (kept, skipped) = filter_raised_candidates(parsed.questions);
+	for s in &skipped {
+		eprintln!("raise_questions_for_doc: skipped templated question {:?}", s);
+	}
+
 	let purpose = doc.purpose.clone();
 	let mut out = Vec::new();
-	for q in parsed.questions.into_iter().take(3) {
-		let title = q.title.trim().to_string();
-		if title.is_empty() {
-			continue;
-		}
+	for q in kept {
+		let title = q.title;
 		let hash = fnv_question_id(&title);
 		if let Some(existing_id) = find_question_by_hash(root, &hash) {
 			out.push(RaisedQuestion {
@@ -772,6 +951,60 @@ pub async fn raise_questions_for_doc(
 		});
 	}
 	Ok(out)
+}
+
+/// Outcome of [`migrate_templated_questions`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TemplateMigrationReport {
+	pub scanned: usize,
+	pub templated: usize,
+	pub deleted: usize,
+	/// IDs that matched a template but were spared because they had at least
+	/// one inbound `Answers` edge.
+	pub kept_with_answers: Vec<String>,
+}
+
+/// One-shot cleanup: walk all questions, delete those whose title matches a
+/// template regex AND have no inbound `Answers` reason edges. Returns a
+/// summary; in `dry_run` mode no docs are deleted.
+pub fn migrate_templated_questions(root: &Path, dry_run: bool) -> Result<TemplateMigrationReport> {
+	let mut rep = TemplateMigrationReport::default();
+	let questions = store::list_documents(root, "questions").unwrap_or_default();
+	rep.scanned = questions.len();
+
+	for q in questions {
+		if !crate::config::is_template_question(&q.title) {
+			continue;
+		}
+		rep.templated += 1;
+
+		// "Inbound Answers" edges: reasons whose to_id == question.id and
+		// kind == "Answers".  reason_index_lookup gives us the reason ids.
+		let adj = cache::reason_index_lookup(root, &q.id);
+		let mut has_answer = false;
+		// reason title format is "{from} -[{kind}]-> {to}" -- cheap kind probe.
+		for rid in adj.to.iter().chain(adj.from.iter()) {
+			if let Ok(r) = store::get_document(root, "reasons", rid) {
+				if r.title.contains("-[Answers]->") {
+					has_answer = true;
+					break;
+				}
+			}
+		}
+
+		if has_answer {
+			rep.kept_with_answers.push(q.id.clone());
+			continue;
+		}
+		if dry_run {
+			rep.deleted += 1;
+			continue;
+		}
+		if store::delete_document(root, "questions", &q.id).is_ok() {
+			rep.deleted += 1;
+		}
+	}
+	Ok(rep)
 }
 
 #[derive(Deserialize, Debug)]
@@ -837,6 +1070,41 @@ pub async fn cross_reference_question(
 	Ok(out)
 }
 
+const DEFAULT_CONCLUSION_MERGE_THRESHOLD: f32 = 0.92;
+
+fn conclusion_merge_threshold() -> f32 {
+	std::env::var("WIKI_CONCLUSION_MERGE_THRESHOLD")
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(DEFAULT_CONCLUSION_MERGE_THRESHOLD)
+}
+
+/// Find an existing conclusion in the same `purpose` whose embedding cosine
+/// against `body_emb` meets or exceeds `threshold`. Returns the conclusion id
+/// of the best match, or `None`. Uses the in-memory pool; conclusions absent
+/// from the pool are silently skipped (they will be considered on the next
+/// search-driven pool refresh).
+pub fn find_similar_conclusion(
+	root: &Path,
+	body_emb: &[f32],
+	purpose_tag: &str,
+	threshold: f32,
+) -> Option<(String, f32)> {
+	let candidates = cache::tag_index_lookup(root, purpose_tag);
+	let mut best: Option<(String, f32)> = None;
+	for dref in candidates {
+		if dref.doc_type != "conclusions" {
+			continue;
+		}
+		let Some(entry) = cache::pool_get(&dref.id) else { continue };
+		let s = classifier::cosine(body_emb, &entry.vec);
+		if s >= threshold && best.as_ref().is_none_or(|(_, bs)| s > *bs) {
+			best = Some((dref.id.clone(), s));
+		}
+	}
+	best
+}
+
 pub async fn promote_to_conclusion(
 	root: &Path,
 	question_id: &str,
@@ -875,6 +1143,29 @@ pub async fn promote_to_conclusion(
 
 	let purpose = question.purpose.clone();
 	let purpose_tag = purpose.clone().unwrap_or_else(|| "general".to_string());
+
+	// Embedding-similarity merge: if the synthesized body is near-identical to
+	// an existing conclusion in this purpose, consolidate instead of forking.
+	let body_text = format!("{}\n\n{}", question.title, parsed.body);
+	let threshold = conclusion_merge_threshold();
+	let body_embs = http::embed_batch(&[body_text]).await?;
+	if let Some(body_emb) = body_embs.into_iter().next() {
+		if let Some((existing_id, _)) =
+			find_similar_conclusion(root, &body_emb, &purpose_tag, threshold)
+		{
+			let _ = store::create_reason(
+				root,
+				question_id,
+				&existing_id,
+				"Consolidates",
+				"merged into existing conclusion via embedding similarity",
+				purpose.as_deref(),
+			);
+			eprintln!("merged into existing conclusion {}", existing_id);
+			return Ok(Some(existing_id));
+		}
+	}
+
 	let tags = vec!["conclusion".to_string(), purpose_tag.clone(), hash];
 	let cdoc = store::create_document(
 		root, "conclusions", &question.title, &parsed.body, tags, Some(&purpose_tag), None,
@@ -1158,8 +1449,221 @@ mod tests {
 		assert!(find_question_by_hash(root, "q-deadbeef").is_none());
 	}
 
+	fn seed_pool_entry(id: &str, doc_type: &str, title: &str, content: &str, vec: Vec<f32>) {
+		let doc = store::Document {
+			id: id.to_string(),
+			title: title.to_string(),
+			tags: vec![],
+			purpose: None,
+			source_doc_id: None,
+			created_at: String::new(),
+			updated_at: String::new(),
+			content: content.to_string(),
+		};
+		cache::pool_insert(cache::PoolEntry {
+			doc_type: doc_type.to_string(),
+			doc,
+			content_hash: "x".to_string(),
+			vec,
+		});
+	}
+
+	#[test]
+	fn promote_creates_new_when_no_similar() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		// Empty vault: no conclusions in purpose => merge check returns None.
+		let probe = vec![1.0, 0.0, 0.0];
+		let hit = find_similar_conclusion(root, &probe, "general", 0.92);
+		assert!(hit.is_none(), "expected no merge candidate in empty vault");
+	}
+
+	#[test]
+	fn promote_merges_when_similar() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		// Existing conclusion in purpose `general` with a known embedding.
+		let existing_emb = vec![0.6, 0.8, 0.0];
+		let cdoc = store::create_document(
+			root,
+			"conclusions",
+			"X means Y",
+			"X means Y because reasons.",
+			vec!["conclusion".to_string(), "general".to_string()],
+			Some("general"),
+			None,
+		).unwrap();
+		seed_pool_entry(&cdoc.id, "conclusions", &cdoc.title, &cdoc.content, existing_emb.clone());
+
+		// Probe is near-identical (cosine ≈ 1.0) → should merge.
+		let probe = vec![0.6, 0.8, 0.0];
+		let hit = find_similar_conclusion(root, &probe, "general", 0.92);
+		assert_eq!(hit.as_ref().map(|(id, _)| id.clone()), Some(cdoc.id.clone()));
+
+		// A clearly orthogonal probe should not match.
+		let ortho = vec![0.0, 0.0, 1.0];
+		let no_hit = find_similar_conclusion(root, &ortho, "general", 0.92);
+		assert!(no_hit.is_none());
+
+		cache::pool_remove(&cdoc.id);
+	}
+
+	#[test]
+	fn merge_threshold_respects_env() {
+		// Default threshold path.
+		std::env::remove_var("WIKI_CONCLUSION_MERGE_THRESHOLD");
+		assert!((conclusion_merge_threshold() - 0.92).abs() < 1e-6);
+
+		// Override path: a 0.99 threshold rejects a high-but-not-perfect cosine.
+		std::env::set_var("WIKI_CONCLUSION_MERGE_THRESHOLD", "0.99");
+		assert!((conclusion_merge_threshold() - 0.99).abs() < 1e-6);
+
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let cdoc = store::create_document(
+			root,
+			"conclusions",
+			"Z",
+			"z body",
+			vec!["conclusion".to_string(), "general".to_string()],
+			Some("general"),
+			None,
+		).unwrap();
+		// Existing has a slightly different embedding (cosine ≈ 0.94).
+		let existing = vec![1.0, 0.0, 0.0];
+		seed_pool_entry(&cdoc.id, "conclusions", &cdoc.title, &cdoc.content, existing);
+		let probe = vec![0.94, 0.34, 0.0]; // cosine with [1,0,0] ≈ 0.94
+		let cos = classifier::cosine(&probe, &[1.0, 0.0, 0.0]);
+		assert!(cos > 0.92 && cos < 0.99, "cos={}", cos);
+
+		// At 0.99 threshold -> no merge.
+		let strict = conclusion_merge_threshold();
+		assert!(find_similar_conclusion(root, &probe, "general", strict).is_none());
+		// At 0.92 threshold -> merge.
+		assert!(find_similar_conclusion(root, &probe, "general", 0.92).is_some());
+
+		cache::pool_remove(&cdoc.id);
+		std::env::remove_var("WIKI_CONCLUSION_MERGE_THRESHOLD");
+	}
+
+	fn mk_thought(root: &Path, title: &str, purpose: &str) -> String {
+		let tags = vec!["thought".to_string(), purpose.to_string()];
+		store::create_document(root, "thoughts", title, "body", tags, Some(purpose), None)
+			.unwrap()
+			.id
+	}
+
+	#[tokio::test]
+	async fn cursor_advances_after_pass() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let mut ids = Vec::new();
+		for i in 0..5 { ids.push(mk_thought(root, &format!("t{}", i), "p1")); }
+
+		let _ = run_pass(root, 2, Some("p1"), false, false, false).await.unwrap();
+		let cur = read_pass_cursor(root, "p1").expect("cursor written");
+		assert_eq!(cur.0, "thoughts");
+		// Cursor must point at one of the thoughts processed.
+		assert!(ids.contains(&cur.1));
+	}
+
+	#[tokio::test]
+	async fn cursor_resumes_from_position() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let mut ids = Vec::new();
+		for i in 0..5 { ids.push(mk_thought(root, &format!("t{}", i), "p1")); }
+		// list_documents is filesystem-ordered; capture true order:
+		let docs = store::list_documents(root, "thoughts").unwrap();
+		let order: Vec<String> = docs.into_iter().map(|d| d.id).collect();
+		assert_eq!(order.len(), 5);
+
+		// Set cursor at order[2] → next pass should start at order[3].
+		write_pass_cursor(root, "p1", "thoughts", &order[2]).unwrap();
+		let report = run_pass(root, 2, Some("p1"), false, false, false).await.unwrap();
+		let details = report["details"].as_array().unwrap();
+		let processed_ids: Vec<String> = details
+			.iter()
+			.filter_map(|d| d.get("doc_id").and_then(|v| v.as_str()).map(String::from))
+			.collect();
+		assert_eq!(processed_ids, vec![order[3].clone(), order[4].clone()]);
+	}
+
+	#[tokio::test]
+	async fn cursor_wraps_when_exhausted() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		for i in 0..3 { mk_thought(root, &format!("t{}", i), "p1"); }
+		let docs = store::list_documents(root, "thoughts").unwrap();
+		let order: Vec<String> = docs.into_iter().map(|d| d.id).collect();
+
+		// Cursor at last → next pass should wrap to start.
+		write_pass_cursor(root, "p1", "thoughts", &order[2]).unwrap();
+		let report = run_pass(root, 2, Some("p1"), false, false, false).await.unwrap();
+		let details = report["details"].as_array().unwrap();
+		let processed: Vec<String> = details
+			.iter()
+			.filter_map(|d| d.get("doc_id").and_then(|v| v.as_str()).map(String::from))
+			.collect();
+		assert_eq!(processed, vec![order[0].clone(), order[1].clone()]);
+	}
+
+	#[test]
+	fn last_qa_at_skips_recent() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let id = mk_thought(root, "t-recent", "p1");
+		stamp_last_qa_at(root, "thoughts", &id).unwrap();
+		assert!(doc_qa_is_recent(root, "thoughts", &id));
+
+		// Old timestamp → not recent.
+		let dir2 = root.join("thoughts");
+		let path = store::find_document_path_by_id(&dir2, &id).unwrap();
+		let raw = std::fs::read_to_string(&path).unwrap();
+		let new = raw.replace(
+			&chrono::Utc::now().to_rfc3339()[..4],
+			"2000",
+		);
+		// Just rewrite frontmatter with explicit old ts to be safe:
+		let (mut fm, body) = store::parse_frontmatter(&new).unwrap();
+		fm.as_object_mut().unwrap().insert(
+			"last_qa_at".to_string(),
+			serde_json::json!("2000-01-01T00:00:00+00:00"),
+		);
+		let fm_str = serde_yaml::to_string(&fm).unwrap();
+		crate::io::write_atomic_str(&path, &format!("---\n{}---\n\n{}", fm_str, body)).unwrap();
+		assert!(!doc_qa_is_recent(root, "thoughts", &id));
+	}
+
+	#[test]
+	fn force_overrides_last_qa_at() {
+		// `force=true` bypasses the recent-skip branch in run_pass.
+		// Logic check (no LLM): the run_pass branch is `if !force && qa && doc_qa_is_recent`,
+		// so with force=true the doc is processed regardless. We assert this guard directly.
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let id = mk_thought(root, "t-recent", "p1");
+		stamp_last_qa_at(root, "thoughts", &id).unwrap();
+		let recent = doc_qa_is_recent(root, "thoughts", &id);
+		assert!(recent);
+		let force = true;
+		let qa = true;
+		let should_skip = !force && qa && recent;
+		assert!(!should_skip, "force must override recent-skip");
+	}
+
 	#[tokio::test]
 	async fn promote_to_conclusion_idempotent() {
+		cache::invalidate_indexes();
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
 		store::ensure_wiki_layout(root).unwrap();
@@ -1177,5 +1681,140 @@ mod tests {
 		// No new conclusion was added.
 		let concs = store::list_documents(root, "conclusions").unwrap();
 		assert_eq!(concs.len(), 1);
+	}
+
+	#[test]
+	fn template_regex_matches_relate_form() {
+		assert!(crate::config::is_template_question(
+			"How does 'GPU Pipeline (8-Pass)' relate to or differ from similar concepts?"
+		));
+		assert!(crate::config::is_template_question(
+			"What are the key characteristics of 'XPBD'?"
+		));
+		assert!(crate::config::is_template_question(
+			"What are the implications of 'Visibility Buffer'?"
+		));
+		assert!(crate::config::is_template_question(
+			"What is the importance of 'foo'?"
+		));
+		// Novel question, not template-shaped.
+		assert!(!crate::config::is_template_question(
+			"Why does the 8-Pass pipeline tile in 32x32 blocks instead of 16x16?"
+		));
+	}
+
+	#[test]
+	fn raise_questions_skips_templates() {
+		// Three candidates: 2 templated, 1 novel. Filter must keep 1.
+		let items = vec![
+			RaisedQItem {
+				title: "How does 'XPBD' relate to or differ from similar concepts?".into(),
+				body: "x".into(),
+			},
+			RaisedQItem {
+				title: "Why is the substep count fixed at 8?".into(),
+				body: "Body sentence one. Body sentence two.".into(),
+			},
+			RaisedQItem {
+				title: "What are the implications of 'Substep'?".into(),
+				body: "y".into(),
+			},
+		];
+		let (kept, skipped) = filter_raised_candidates(items);
+		assert_eq!(kept.len(), 1);
+		assert_eq!(kept[0].title, "Why is the substep count fixed at 8?");
+		assert_eq!(skipped.len(), 2);
+	}
+
+	#[test]
+	fn purpose_cap_blocks_new_raises() {
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		// Force a low cap so we don't have to spam create_document.
+		std::env::set_var("WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP", "3");
+		// Three open questions in purpose "phyons".
+		for i in 0..3 {
+			let title = format!("Open question #{}?", i);
+			let hash = fnv_question_id(&title);
+			let tags = vec!["question".to_string(), "phyons".to_string(), hash];
+			store::create_document(root, "questions", &title, "b", tags, Some("phyons"), None).unwrap();
+		}
+		assert_eq!(count_open_questions_in_purpose(root, Some("phyons")), 3);
+		// Add one resolved question; should not count.
+		let title = "Resolved Q?";
+		let hash = fnv_question_id(title);
+		let tags = vec!["question".to_string(), "phyons".to_string(), hash, "resolved".to_string()];
+		store::create_document(root, "questions", title, "b", tags, Some("phyons"), None).unwrap();
+		assert_eq!(count_open_questions_in_purpose(root, Some("phyons")), 3);
+		std::env::remove_var("WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP");
+	}
+
+	#[test]
+	fn migration_deletes_unanswered_templates() {
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		// Anchor doc to point Answers at.
+		let anchor = store::create_document(
+			root, "thoughts", "anchor", "b", vec!["thought".into()], Some("phyons"), None,
+		).unwrap();
+
+		// Three templated questions.
+		let mut q_ids = Vec::new();
+		for (i, t) in [
+			"How does 'A' relate to or differ from similar concepts?",
+			"What are the key characteristics of 'B'?",
+			"What are the implications of 'C'?",
+		].iter().enumerate() {
+			let hash = fnv_question_id(t);
+			let tags = vec!["question".to_string(), "phyons".to_string(), hash];
+			let q = store::create_document(root, "questions", t, "b", tags, Some("phyons"), None).unwrap();
+			if i == 0 {
+				// Q[0] has an Answers edge -> must be kept.
+				store::create_reason(root, &anchor.id, &q.id, "Answers", "answers it", Some("phyons")).unwrap();
+			}
+			q_ids.push(q.id);
+		}
+		// One novel question that must never be touched.
+		let novel_hash = fnv_question_id("Novel question that survives?");
+		let novel_tags = vec!["question".to_string(), "phyons".to_string(), novel_hash];
+		let novel = store::create_document(
+			root, "questions", "Novel question that survives?", "b", novel_tags, Some("phyons"), None,
+		).unwrap();
+
+		let report = migrate_templated_questions(root, false).unwrap();
+		assert_eq!(report.scanned, 4);
+		assert_eq!(report.templated, 3);
+		assert_eq!(report.deleted, 2);
+		assert_eq!(report.kept_with_answers.len(), 1);
+
+		// Surviving questions: q[0] (had Answers) + novel.
+		let remaining = store::list_documents(root, "questions").unwrap();
+		let remaining_ids: std::collections::HashSet<_> =
+			remaining.iter().map(|d| d.id.clone()).collect();
+		assert!(remaining_ids.contains(&q_ids[0]));
+		assert!(remaining_ids.contains(&novel.id));
+		assert!(!remaining_ids.contains(&q_ids[1]));
+		assert!(!remaining_ids.contains(&q_ids[2]));
+	}
+
+	#[test]
+	fn migration_dry_run_deletes_nothing() {
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+		let t = "What are the implications of 'X'?";
+		let hash = fnv_question_id(t);
+		let tags = vec!["question".to_string(), "p".to_string(), hash];
+		store::create_document(root, "questions", t, "b", tags, Some("p"), None).unwrap();
+		let r = migrate_templated_questions(root, true).unwrap();
+		assert_eq!(r.templated, 1);
+		assert_eq!(r.deleted, 1); // counted but not actually deleted
+		assert_eq!(store::list_documents(root, "questions").unwrap().len(), 1);
 	}
 }

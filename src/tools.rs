@@ -206,6 +206,7 @@ struct LearnPassParams {
 	purpose: Option<String>,
 	dry_run: Option<bool>,
 	qa: Option<bool>,
+	force: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -875,9 +876,9 @@ impl WikiService {
 
 	#[tool(description = "Run a learn pass over the vault: (1) rewrite bare entity mentions as [[wikilinks]], (2) whenever a surface text variant differs from the entity canonical title and all known aliases it is automatically added as an alias to that entity's frontmatter — so recurring alternate names become first-class aliases rather than one-off links, (3) fold paragraphs >=WIKI_DEDUPE_THRESHOLD (default 0.85) cosine-similar to an entity body into that entity (emits Consolidates reasons), (4) write a report to ingest_log/. Prefer alias merging over wikilink-only when two names refer to the same concept. Args: limit? (default 25), purpose? (filter doc set), dry_run? (default false)")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
-		let LearnPassParams { limit, purpose, dry_run, qa } = params.0;
+		let LearnPassParams { limit, purpose, dry_run, qa, force } = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);
-		match learn::run_pass(self.root(), limit, purpose.as_deref(), dry_run.unwrap_or(false), qa.unwrap_or(true)).await {
+		match learn::run_pass(self.root(), limit, purpose.as_deref(), dry_run.unwrap_or(false), qa.unwrap_or(true), force.unwrap_or(false)).await {
 			Ok(v) => v.to_string(),
 			Err(e) => json_err(e),
 		}

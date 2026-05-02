@@ -349,6 +349,32 @@ pub fn add_alias_to_entity(root: &Path, entity_id: &str, alias: &str) -> anyhow:
 	Ok(true)
 }
 
+/// Lower-level helper: round-trip frontmatter and set a single field.
+/// Does not bump `updated_at`. Used for derived/computed fields like
+/// `node_size` where touching the timestamp would dirty the doc.
+pub fn set_frontmatter_field(
+	root: &Path,
+	doc_type: &str,
+	id: &str,
+	key: &str,
+	value: serde_json::Value,
+) -> anyhow::Result<()> {
+	let dir = root.join(doc_type);
+	let file_path = find_document_path_by_id(&dir, id)?;
+	let raw = std::fs::read_to_string(&file_path)?;
+	let (mut fm, body) = parse_frontmatter(&raw)?;
+	if let Some(obj) = fm.as_object_mut() {
+		obj.insert(key.to_string(), value);
+	} else {
+		let mut m = serde_json::Map::new();
+		m.insert(key.to_string(), value);
+		fm = serde_json::Value::Object(m);
+	}
+	let fm_str = serde_yaml::to_string(&fm)?;
+	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
+	Ok(())
+}
+
 pub fn parse_frontmatter(content: &str) -> anyhow::Result<(serde_json::Value, String)> {
 	if !content.starts_with("---") {
 		return Ok((serde_json::Value::Null, content.to_string()));
@@ -450,39 +476,36 @@ pub fn log_ingest(root: &Path, doc_type: &str, doc_id: &str, title: &str) -> any
 }
 
 pub fn search_by_tag(root: &Path, tag: &str) -> anyhow::Result<Vec<Document>> {
-	let mut results = Vec::new();
-	for doc_type in DOC_TYPES {
-		let dir = root.join(doc_type);
-		for path in walk_md_paths(&dir) {
-			let raw = std::fs::read_to_string(&path)?;
-			let (fm, body) = parse_frontmatter(&raw)?;
-			let tags: Vec<String> = fm["tags"]
-				.as_array()
-				.map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-				.unwrap_or_default();
-			if tags.iter().any(|t| t == tag) {
-				results.push(doc_from_fm(&fm, body, ""));
-			}
+	let refs = cache::tag_index_lookup(root, tag);
+	let mut results = Vec::with_capacity(refs.len());
+	for r in refs {
+		if let Ok(doc) = get_document(root, &r.doc_type, &r.id) {
+			results.push(doc);
 		}
 	}
+	results.sort_by(|a, b| a.id.cmp(&b.id));
 	Ok(results)
 }
 
 pub fn search_reasons_for(root: &Path, node_id: &str, direction: &str) -> anyhow::Result<Vec<Document>> {
-	let dir = root.join("reasons");
-	let mut results = Vec::new();
-	for path in walk_md_paths(&dir) {
-		let raw = std::fs::read_to_string(&path)?;
-		let (fm, body) = parse_frontmatter(&raw)?;
-		let from_id = fm["from_id"].as_str().unwrap_or("");
-		let to_id = fm["to_id"].as_str().unwrap_or("");
-		let matches = match direction {
-			"from" => from_id == node_id,
-			"to" => to_id == node_id,
-			_ => from_id == node_id || to_id == node_id,
-		};
-		if matches {
-			results.push(doc_from_fm(&fm, body, ""));
+	let adj = cache::reason_index_lookup(root, node_id);
+	let mut ids: Vec<String> = match direction {
+		"from" => adj.from,
+		"to" => adj.to,
+		_ => {
+			let mut v = adj.from;
+			v.extend(adj.to);
+			v.sort();
+			v.dedup();
+			v
+		}
+	};
+	ids.sort();
+	ids.dedup();
+	let mut results = Vec::with_capacity(ids.len());
+	for id in ids {
+		if let Ok(doc) = get_document(root, "reasons", &id) {
+			results.push(doc);
 		}
 	}
 	Ok(results)

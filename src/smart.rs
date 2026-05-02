@@ -4,6 +4,7 @@ use crate::http;
 use crate::io as wiki_io;
 use crate::search;
 use crate::store::{self, Document};
+use crate::walk::{tag_walk, WalkOpts};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -180,10 +181,70 @@ fn load_all_docs(root: &Path) -> Vec<(String, Document)> {
 async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 	let dir = emb_dir(root);
 	std::fs::create_dir_all(&dir)?;
-	let docs = load_all_docs(root);
 
 	let pool_was_seeded = cache::pool_seeded();
 
+	// Hot path (already seeded): only re-check ids in the dirty set, then
+	// return the full pool snapshot. Avoids walking 250+ docs per query.
+	if pool_was_seeded {
+		let dirty: HashSet<String> = cache::drain_dirty_pool().into_iter().collect();
+		if !dirty.is_empty() {
+			let docs: Vec<(String, Document)> = load_all_docs(root)
+				.into_iter()
+				.filter(|(_, d)| dirty.contains(&d.id))
+				.collect();
+			let mut stale_text: Vec<String> = Vec::new();
+			let mut stale_meta: Vec<(String, Document, String)> = Vec::new();
+			for (dt, doc) in docs.iter() {
+				let hash = format!("{:x}", wiki_io::fnv64(&doc.content));
+				// Disk sidecar may already be fresh from a peer process.
+				let vec_p = dir.join(format!("{}.vec", doc.id));
+				let hash_p = dir.join(format!("{}.hash", doc.id));
+				let disk_fresh = vec_p.exists()
+					&& std::fs::read_to_string(&hash_p)
+						.map(|s| s.trim() == hash)
+						.unwrap_or(false);
+				if disk_fresh {
+					if let Ok(v) = wiki_io::read_vec_f32(&vec_p, None) {
+						cache::pool_insert(cache::PoolEntry {
+							doc_type: dt.clone(),
+							doc: doc.clone(),
+							content_hash: hash,
+							vec: v,
+						});
+						continue;
+					}
+				}
+				stale_text.push(format!("{}\n\n{}", doc.title, doc.content));
+				stale_meta.push((dt.clone(), doc.clone(), hash));
+			}
+			let mut cursor = 0usize;
+			while cursor < stale_meta.len() {
+				let end = (cursor + EMB_BATCH).min(stale_meta.len());
+				let embs = http::embed_batch(&stale_text[cursor..end]).await?;
+				for (offset, emb) in embs.into_iter().enumerate() {
+					let (dt, doc, hash) = &stale_meta[cursor + offset];
+					let vec_p = dir.join(format!("{}.vec", doc.id));
+					let hash_p = dir.join(format!("{}.hash", doc.id));
+					wiki_io::write_vec_f32(&vec_p, &emb)?;
+					wiki_io::write_atomic_str(&hash_p, hash)?;
+					cache::pool_insert(cache::PoolEntry {
+						doc_type: dt.clone(),
+						doc: doc.clone(),
+						content_hash: hash.clone(),
+						vec: emb,
+					});
+				}
+				cursor = end;
+			}
+			// Deleted docs were already evicted by `on_doc_deleted` before
+			// being marked dirty — nothing to clean up here.
+		}
+		return Ok(cache::pool_snapshot());
+	}
+
+	// Cold path (first call): full walk to seed the pool.
+	let docs = load_all_docs(root);
 	let mut stale_idx: Vec<usize> = Vec::new();
 	let mut stale_text: Vec<String> = Vec::new();
 	let mut entries: Vec<Option<Arc<cache::PoolEntry>>> = Vec::with_capacity(docs.len());
@@ -262,6 +323,8 @@ async fn refresh_pool(root: &Path) -> Result<Vec<Arc<cache::PoolEntry>>> {
 			cache::pool_remove(&stale.doc.id);
 		}
 		cache::mark_pool_seeded();
+		// Cold path embedded everything; nothing left to redo.
+		let _ = cache::drain_dirty_pool();
 	}
 
 	Ok(entries.into_iter().flatten().collect())
@@ -300,6 +363,39 @@ fn mmr_select(
 	chosen
 }
 
+/// Tier-2: tag-walk over reason graph. Zero-LLM. Returns Some when it
+/// produces >= 3 hits; otherwise lets the BM25/HyDE/MMR fallback run.
+fn tag_walk_tier(root: &Path, question: &str, tag_filter: Option<&str>, k: usize) -> Option<serde_json::Value> {
+	let opts = WalkOpts { k: k.max(20), ..WalkOpts::default() };
+	let hits = tag_walk(root, question, opts).ok()?;
+	let hits: Vec<_> = hits.into_iter()
+		.filter(|h| tag_filter.map(|t| {
+			store::get_document(root, &h.doc_type, &h.doc_id)
+				.map(|d| d.tags.iter().any(|x| x == t))
+				.unwrap_or(false)
+		}).unwrap_or(true))
+		.collect();
+	if hits.len() < 3 { return None; }
+	let results: Vec<serde_json::Value> = hits.iter().map(|h| {
+		let doc = store::get_document(root, &h.doc_type, &h.doc_id).ok();
+		serde_json::json!({
+			"id": h.doc_id,
+			"doc_type": h.doc_type,
+			"score": h.score,
+			"path": h.path,
+			"title": doc.as_ref().map(|d| d.title.clone()),
+			"tags": doc.as_ref().map(|d| d.tags.clone()),
+			"purpose": doc.as_ref().and_then(|d| d.purpose.clone()),
+			"content": doc.as_ref().map(|d| d.content.clone()),
+		})
+	}).collect();
+	Some(serde_json::json!({
+		"question": question,
+		"entry_kind": "tag_walk",
+		"results": results,
+	}))
+}
+
 /// Detect a known-purpose mention in the query — boosts docs of that purpose.
 fn detect_purpose_bias(root: &Path, query: &str) -> Option<String> {
 	let purposes = store::list_purposes(root).ok()?;
@@ -321,6 +417,9 @@ pub async fn smart_search(
 ) -> Result<serde_json::Value> {
 	if let Some(tree) = conclusions_first(root, question, tag_filter, k)? {
 		return Ok(tree);
+	}
+	if let Some(walk) = tag_walk_tier(root, question, tag_filter, k) {
+		return Ok(walk);
 	}
 	let q_text = vec![question.to_string()];
 	let q_emb_vec = http::embed_batch(&q_text).await?;
@@ -453,6 +552,9 @@ pub async fn smart_search_with_qemb(
 ) -> Result<serde_json::Value> {
 	if let Some(tree) = conclusions_first(root, question, tag_filter, k)? {
 		return Ok(tree);
+	}
+	if let Some(walk) = tag_walk_tier(root, question, tag_filter, k) {
+		return Ok(walk);
 	}
 	let pool_size = k.max(top_n * 4).max(20);
 
