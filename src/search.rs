@@ -84,13 +84,6 @@ pub fn delete_by_id(index: &SearchIndex, id: &str) -> anyhow::Result<()> {
 	Ok(())
 }
 
-pub fn search_documents(index: &SearchIndex, query_str: &str) -> anyhow::Result<Vec<Document>> {
-	Ok(search_topk(index, query_str, None, 10)?
-		.into_iter()
-		.map(|(d, _)| d)
-		.collect())
-}
-
 pub fn search_topk(
 	index: &SearchIndex,
 	query_str: &str,
