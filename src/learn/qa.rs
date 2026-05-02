@@ -9,7 +9,6 @@ use super::links::link_doc_internal;
 use super::promote::{
 	cross_reference_question, cross_topic_pass, promote_to_conclusion, should_invoke_cross_topic,
 };
-use super::raise::raise_questions_for_doc;
 use crate::cache;
 use crate::{search, store};
 use anyhow::Result;
@@ -26,7 +25,10 @@ async fn qa_for_doc(
 		return Ok((0, 0, 0));
 	}
 	*llm_budget = llm_budget.saturating_sub(1);
-	let raised = raise_questions_for_doc(root, doc, false).await.unwrap_or_default();
+	// Ingest-time question raising disabled: questions are now raised only on
+	// search-miss (see learn::raise::raise_question_from_search_miss). This
+	// prevents user-ingested content from spawning unwanted questions.
+	let raised: Vec<super::infra::RaisedQuestion> = Vec::new();
 
 	let mut q_targets: Vec<(String, String, Option<String>)> = raised
 		.iter()

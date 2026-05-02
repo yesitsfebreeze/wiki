@@ -51,15 +51,6 @@ impl Default for PassConfig {
 	}
 }
 
-const DEFAULT_QUESTION_DEDUPE_THRESHOLD: f32 = 0.88;
-
-pub(crate) fn question_dedupe_threshold() -> f32 {
-	std::env::var("WIKI_QUESTION_DEDUPE_THRESHOLD")
-		.ok()
-		.and_then(|s| s.parse().ok())
-		.unwrap_or(DEFAULT_QUESTION_DEDUPE_THRESHOLD)
-}
-
 #[derive(Clone)]
 pub struct EntityRef {
 	pub id: String,
@@ -178,22 +169,6 @@ pub(crate) struct LlmDecision {
 	pub resolved: bool,
 	#[serde(default)]
 	pub edges: Vec<LlmEdge>,
-}
-
-// ── Raise structs (used by raise module + tests) ─────────────────────────────
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct RaisedQItem {
-	#[serde(default)]
-	pub title: String,
-	#[serde(default)]
-	pub body: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub(crate) struct RaisedQResp {
-	#[serde(default)]
-	pub questions: Vec<RaisedQItem>,
 }
 
 // ── Cursors ──────────────────────────────────────────────────────────────────

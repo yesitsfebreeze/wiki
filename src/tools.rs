@@ -849,6 +849,14 @@ impl WikiService {
 		if !suggested.is_empty() {
 			out["suggested_conclusions"] = serde_json::json!(suggested);
 		}
+		// Knowledge-gap question raise: if a smart/qa search found nothing,
+		// the agent is seeking info we don't have — raise it as an open
+		// question. Idempotent (deduped by query hash).
+		if raw_hits.is_empty() && (mode == "smart" || mode == "qa") {
+			if let Some(qid) = learn::raise_question_from_search_miss(self.root(), &query, None).await {
+				out["raised_question_id"] = serde_json::json!(qid);
+			}
+		}
 		out.to_string()
 	}
 

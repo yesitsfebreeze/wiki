@@ -16,5 +16,6 @@ pub use links::link_doc;
 pub use qa::run_pass;
 pub use feedback::run_feedback_pass;
 pub use migrate::migrate_templated_questions;
+pub use raise::raise_question_from_search_miss;
 #[allow(unused_imports)]
 pub use promote::cross_topic_pass;
