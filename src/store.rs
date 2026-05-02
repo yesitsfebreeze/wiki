@@ -505,68 +505,6 @@ pub fn search_reasons_for(root: &Path, node_id: &str, direction: &str) -> anyhow
 	Ok(results)
 }
 
-/// Migrate the legacy flat layout (`<type>/<purpose>-<slug>.md`) to the
-/// hierarchical layout (`<type>/<purpose>/<slug>.md`). Strips the
-/// `<purpose>-` prefix from filenames when present. Idempotent: files already
-/// inside a purpose subdir are left alone.
-///
-/// Wipes `.search/` so tantivy reindexes against the new paths.
-pub fn migrate_layout(root: &Path) -> anyhow::Result<serde_json::Value> {
-	let doc_types = ["thoughts", "entities", "reasons", "questions", "conclusions"];
-	let mut moved: usize = 0;
-	let mut skipped: usize = 0;
-	let mut by_type: HashMap<String, usize> = HashMap::new();
-
-	for doc_type in &doc_types {
-		let dir = root.join(doc_type);
-		if !dir.exists() { continue; }
-		let entries: Vec<PathBuf> = std::fs::read_dir(&dir)?
-			.filter_map(|e| e.ok().map(|e| e.path()))
-			.collect();
-		for path in entries {
-			if path.is_dir() { continue; }
-			if path.extension().and_then(|s| s.to_str()) != Some("md") { continue; }
-
-			let raw = match std::fs::read_to_string(&path) {
-				Ok(s) => s,
-				Err(_) => { skipped += 1; continue; }
-			};
-			let (fm, _body) = match parse_frontmatter(&raw) {
-				Ok(v) => v,
-				Err(_) => { skipped += 1; continue; }
-			};
-			let purpose = fm.get("purpose").and_then(|v| v.as_str())
-				.unwrap_or("uncategorized")
-				.to_string();
-			let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-			let bare = stem.strip_prefix(&format!("{}-", purpose)).unwrap_or(&stem).to_string();
-
-			let new_dir = dir.join(&purpose);
-			std::fs::create_dir_all(&new_dir)?;
-			let new_path = unique_path(&new_dir, &bare);
-			std::fs::rename(&path, &new_path)?;
-			moved += 1;
-			*by_type.entry((*doc_type).to_string()).or_insert(0) += 1;
-		}
-	}
-
-	// Force reindex: drop the search index dir so the next search rebuilds it.
-	let search_dir = root.join(".search");
-	if search_dir.exists() {
-		let _ = std::fs::remove_dir_all(&search_dir);
-	}
-	std::fs::create_dir_all(&search_dir)?;
-
-	let _ = update_link_index(root);
-
-	Ok(serde_json::json!({
-		"moved": moved,
-		"skipped": skipped,
-		"by_type": by_type,
-		"note": "search index wiped; will rebuild on next query",
-	}))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

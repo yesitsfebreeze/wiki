@@ -382,14 +382,6 @@ fn run_cli() -> Option<anyhow::Result<()>> {
         "stop-hook" => {
             return Some(run_stop_hook());
         }
-        "migrate-layout" => {
-            let root = store::wiki_root();
-            let _ = store::ensure_wiki_layout(&root);
-            return Some(match store::migrate_layout(&root) {
-                Ok(v) => { println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()); Ok(()) }
-                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
-            });
-        }
         "learn-feedback" => {
             let mut limit: usize = 25;
             let mut dry_run = false;
