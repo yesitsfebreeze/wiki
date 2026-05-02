@@ -221,6 +221,10 @@ struct SmartSearchParams {
 	tag: Option<String>,
 	k: Option<u64>,
 	top_n: Option<u64>,
+	/// When true, contradicting docs are appended to `results` as separate
+	/// hits (each carrying `contradicts: <original_hit_id>`). Per-hit
+	/// `contradictions: [...]` refs are always included.
+	include_contradictions: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -896,10 +900,13 @@ impl WikiService {
 
 	#[tool(description = "Smart search: BM25 top-K + OpenAI rerank. Returns ranked context with reasons. Logs (question, picked, reasons) to feedback.jsonl for the learn loop. Args: question, tag? (filter), k? (BM25 pool, default 20), top_n? (final results, default 5)")]
 	async fn smart_search(&self, params: Parameters<SmartSearchParams>) -> String {
-		let SmartSearchParams { question, tag, k, top_n } = params.0;
+		let SmartSearchParams { question, tag, k, top_n, include_contradictions } = params.0;
 		let k = k.map(|n| n as usize).unwrap_or(20);
 		let top_n = top_n.map(|n| n as usize).unwrap_or(5);
-		match smart::smart_search(self.root(), &question, tag.as_deref(), k, top_n).await {
+		let opts = smart::SmartSearchOpts {
+			include_contradiction_docs: include_contradictions.unwrap_or(false),
+		};
+		match smart::smart_search_with_opts(self.root(), &question, tag.as_deref(), k, top_n, &opts).await {
 			Ok(v) => v.to_string(),
 			Err(e) => json_err(e),
 		}

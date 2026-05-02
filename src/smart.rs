@@ -17,6 +17,90 @@ const RRF_K: f32 = 60.0;
 const MMR_LAMBDA: f32 = 0.72;
 const PURPOSE_BIAS: f32 = 0.05;
 
+/// Direction of a `Contradicts` edge relative to the originating hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContradictionDirection {
+	/// Hit is the `from_id` of the reason — i.e. the hit contradicts `other`.
+	FromHit,
+	/// Hit is the `to_id` — i.e. `other` contradicts the hit.
+	ToHit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContradictionRef {
+	pub reason_id: String,
+	pub other_doc_id: String,
+	pub other_doc_type: String,
+	pub direction: ContradictionDirection,
+}
+
+/// Optional knobs for `smart_search_with_opts`. Defaults preserve legacy
+/// behavior so the public `smart_search` signature is unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct SmartSearchOpts {
+	/// When true, append separate result hits for each contradicting doc
+	/// reachable via a `Contradicts` reason from a returned hit.
+	pub include_contradiction_docs: bool,
+}
+
+/// Resolve `id` against any doc directory. Returns `(doc_type, Document)`.
+fn resolve_doc_full(root: &Path, id: &str) -> Option<(String, Document)> {
+	for dt in &["conclusions", "thoughts", "entities", "questions", "reasons"] {
+		if let Ok(d) = store::get_document(root, dt, id) {
+			return Some(((*dt).to_string(), d));
+		}
+	}
+	None
+}
+
+/// Look up `Contradicts` edges incident to `doc_id` (in either direction)
+/// and resolve the contradicting peers.
+pub(crate) fn gather_contradictions(root: &Path, doc_id: &str) -> Vec<ContradictionRef> {
+	let mut out = Vec::new();
+	for (dir, direction) in &[("from", ContradictionDirection::FromHit), ("to", ContradictionDirection::ToHit)] {
+		let reasons = match store::search_reasons_for(root, doc_id, dir) {
+			Ok(v) => v,
+			Err(_) => continue,
+		};
+		for r in reasons {
+			let kind = match extract_kind(&r) { Some(k) => k, None => continue };
+			if kind != "Contradicts" { continue; }
+			let to_id = extract_to_id(&r);
+			let other_id = match direction {
+				ContradictionDirection::FromHit => to_id.clone(),
+				ContradictionDirection::ToHit => Some(extract_from_id(&r).unwrap_or_default()),
+			};
+			let Some(other_id) = other_id else { continue };
+			if other_id.is_empty() { continue; }
+			let other_type = resolve_doc_full(root, &other_id)
+				.map(|(dt, _)| dt)
+				.unwrap_or_else(|| "?".to_string());
+			out.push(ContradictionRef {
+				reason_id: r.id.clone(),
+				other_doc_id: other_id,
+				other_doc_type: other_type,
+				direction: *direction,
+			});
+		}
+	}
+	out
+}
+
+fn contradictions_to_json(refs: &[ContradictionRef]) -> serde_json::Value {
+	serde_json::Value::Array(refs.iter().map(|c| {
+		serde_json::json!({
+			"reason_id": c.reason_id,
+			"other_doc_id": c.other_doc_id,
+			"other_doc_type": c.other_doc_type,
+			"direction": match c.direction {
+				ContradictionDirection::FromHit => "from_hit",
+				ContradictionDirection::ToHit => "to_hit",
+			},
+		})
+	}).collect())
+}
+
 #[derive(Serialize)]
 struct Candidate<'a> {
 	id: &'a str,
@@ -415,7 +499,18 @@ pub async fn smart_search(
 	k: usize,
 	top_n: usize,
 ) -> Result<serde_json::Value> {
-	if let Some(tree) = conclusions_first(root, question, tag_filter, k)? {
+	smart_search_with_opts(root, question, tag_filter, k, top_n, &SmartSearchOpts::default()).await
+}
+
+pub async fn smart_search_with_opts(
+	root: &Path,
+	question: &str,
+	tag_filter: Option<&str>,
+	k: usize,
+	top_n: usize,
+	opts: &SmartSearchOpts,
+) -> Result<serde_json::Value> {
+	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts)? {
 		return Ok(tree);
 	}
 	if let Some(walk) = tag_walk_tier(root, question, tag_filter, k) {
@@ -424,7 +519,7 @@ pub async fn smart_search(
 	let q_text = vec![question.to_string()];
 	let q_emb_vec = http::embed_batch(&q_text).await?;
 	let q_emb = q_emb_vec.into_iter().next().ok_or_else(|| anyhow!("query embed empty"))?;
-	let mut v = smart_search_with_qemb(root, question, tag_filter, k, top_n, &q_emb).await?;
+	let mut v = smart_search_with_qemb_opts(root, question, tag_filter, k, top_n, &q_emb, opts).await?;
 	if let Some(obj) = v.as_object_mut() {
 		obj.entry("entry_kind").or_insert(serde_json::json!("fallback"));
 	}
@@ -433,7 +528,7 @@ pub async fn smart_search(
 
 /// Score a conclusion against the query: count of lowercase term hits in
 /// title (×3) + body. Cheap deterministic scoring — no embeddings needed.
-fn score_conclusion(doc: &Document, qterms: &[String]) -> usize {
+fn term_score(doc: &Document, qterms: &[String]) -> usize {
 	if qterms.is_empty() { return 0; }
 	let title_lc = doc.title.to_lowercase();
 	let body_lc = doc.content.to_lowercase();
@@ -442,14 +537,87 @@ fn score_conclusion(doc: &Document, qterms: &[String]) -> usize {
 		.sum()
 }
 
+/// Edge-kind weight contribution. Plan §6: typed edges encode answer-quality.
+fn edge_kind_weight(kind: &str) -> f64 {
+	match kind {
+		"Answers" => 2.0,
+		"Derives" | "Consolidates" => 1.5,
+		"Supports" => 1.0,
+		"Extends" => 0.7,
+		"References" => 0.3,
+		"Contradicts" => -0.5,
+		_ => 0.0,
+	}
+}
+
+/// Σ(weight × incoming_count_of_kind) for `doc_id`. Reads incoming reasons
+/// once via `search_reasons_for(_,"to")`; kind comes from the canonical
+/// reason title. O(reasons) — cheap, no embeddings.
+fn edge_score_for(root: &Path, doc_id: &str) -> f64 {
+	let reasons = match store::search_reasons_for(root, doc_id, "to") {
+		Ok(v) => v,
+		Err(_) => return 0.0,
+	};
+	let mut sum = 0.0f64;
+	for r in &reasons {
+		if let Some(k) = extract_kind(r) {
+			sum += edge_kind_weight(&k);
+		}
+	}
+	sum
+}
+
+/// Read `node_size` from a doc's frontmatter and convert to a multiplier:
+/// `size / 50` (50→1.0, 100→2.0, 6→~0.12). Missing → 1.0.
+fn node_weight_factor(root: &Path, doc_id: &str, doc_type: &str) -> f64 {
+	let dir = root.join(doc_type);
+	let path = match store::find_document_path_by_id(&dir, doc_id) {
+		Ok(p) => p,
+		Err(_) => return 1.0,
+	};
+	let raw = match std::fs::read_to_string(&path) {
+		Ok(s) => s,
+		Err(_) => return 1.0,
+	};
+	let (fm, _) = match store::parse_frontmatter(&raw) {
+		Ok(v) => v,
+		Err(_) => return 1.0,
+	};
+	let n = fm.get("node_size").and_then(|v| v.as_f64());
+	match n {
+		Some(v) if v > 0.0 => v / 50.0,
+		_ => 1.0,
+	}
+}
+
+/// Final conclusions-first score: `(term + edge) × weight_factor`.
+fn score_conclusion(root: &Path, doc: &Document, qterms: &[String]) -> f64 {
+	let term = term_score(doc, qterms) as f64;
+	if term <= 0.0 { return 0.0; }
+	let edge = edge_score_for(root, &doc.id);
+	let factor = node_weight_factor(root, &doc.id, "conclusions");
+	(term + edge) * factor
+}
+
 /// Conclusions-first stage: if the query hits any conclusion, return its
 /// depth-1 reason fanout (cap 5) as the primary tree. None → caller falls
 /// back to the hybrid path.
+#[cfg(test)]
 pub(crate) fn conclusions_first(
 	root: &Path,
 	query: &str,
 	tag_filter: Option<&str>,
+	k: usize,
+) -> Result<Option<serde_json::Value>> {
+	conclusions_first_with_opts(root, query, tag_filter, k, &SmartSearchOpts::default())
+}
+
+pub(crate) fn conclusions_first_with_opts(
+	root: &Path,
+	query: &str,
+	tag_filter: Option<&str>,
 	_k: usize,
+	opts: &SmartSearchOpts,
 ) -> Result<Option<serde_json::Value>> {
 	let qterms = lowercase_terms(query);
 	if qterms.is_empty() { return Ok(None); }
@@ -459,19 +627,21 @@ pub(crate) fn conclusions_first(
 		Err(_) => return Ok(None),
 	};
 
-	let mut scored: Vec<(usize, Document)> = conclusions
+	let mut scored: Vec<(f64, Document)> = conclusions
 		.into_iter()
 		.filter(|d| tag_filter.map(|t| d.tags.iter().any(|x| x == t)).unwrap_or(true))
 		.filter_map(|d| {
-			let s = score_conclusion(&d, &qterms);
-			if s > 0 { Some((s, d)) } else { None }
+			let s = score_conclusion(root, &d, &qterms);
+			if s > 0.0 { Some((s, d)) } else { None }
 		})
 		.collect();
 	if scored.is_empty() { return Ok(None); }
-	scored.sort_by(|a, b| b.0.cmp(&a.0));
+	scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 	scored.truncate(3);
 
 	let mut tree = Vec::with_capacity(scored.len());
+	let mut extra_hits: Vec<serde_json::Value> = Vec::new();
+	let mut seen_extras: HashSet<String> = HashSet::new();
 	for (_, conc) in &scored {
 		let reasons = store::search_reasons_for(root, &conc.id, "from")
 			.unwrap_or_default();
@@ -491,6 +661,24 @@ pub(crate) fn conclusions_first(
 				})
 			})
 			.collect();
+		let contradictions = gather_contradictions(root, &conc.id);
+		if opts.include_contradiction_docs {
+			for c in &contradictions {
+				if !seen_extras.insert(c.other_doc_id.clone()) { continue; }
+				if let Some((dt, d)) = resolve_doc_full(root, &c.other_doc_id) {
+					extra_hits.push(serde_json::json!({
+						"id": d.id,
+						"doc_type": dt,
+						"title": d.title,
+						"tags": d.tags,
+						"purpose": d.purpose,
+						"content": d.content,
+						"contradicts": conc.id,
+						"reason_id": c.reason_id,
+					}));
+				}
+			}
+		}
 		tree.push(serde_json::json!({
 			"conclusion": {
 				"id": conc.id,
@@ -500,6 +688,7 @@ pub(crate) fn conclusions_first(
 				"content": conc.content,
 			},
 			"reasons": reasons_json,
+			"contradictions": contradictions_to_json(&contradictions),
 		}));
 	}
 
@@ -507,7 +696,7 @@ pub(crate) fn conclusions_first(
 		"question": query,
 		"entry_kind": "conclusions",
 		"tree": tree,
-		"results": [],
+		"results": extra_hits,
 	})))
 }
 
@@ -515,6 +704,12 @@ pub(crate) fn conclusions_first(
 /// We don't re-parse the frontmatter — the title is canonical.
 fn extract_to_id(reason: &Document) -> Option<String> {
 	reason.title.split("]-> ").nth(1).map(|s| s.trim().to_string())
+}
+
+fn extract_from_id(reason: &Document) -> Option<String> {
+	let t = &reason.title;
+	let end = t.find(" -[")?;
+	Some(t[..end].trim().to_string())
 }
 
 fn extract_kind(reason: &Document) -> Option<String> {
@@ -550,7 +745,19 @@ pub async fn smart_search_with_qemb(
 	top_n: usize,
 	q_emb: &[f32],
 ) -> Result<serde_json::Value> {
-	if let Some(tree) = conclusions_first(root, question, tag_filter, k)? {
+	smart_search_with_qemb_opts(root, question, tag_filter, k, top_n, q_emb, &SmartSearchOpts::default()).await
+}
+
+pub async fn smart_search_with_qemb_opts(
+	root: &Path,
+	question: &str,
+	tag_filter: Option<&str>,
+	k: usize,
+	top_n: usize,
+	q_emb: &[f32],
+	opts: &SmartSearchOpts,
+) -> Result<serde_json::Value> {
+	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts)? {
 		return Ok(tree);
 	}
 	if let Some(walk) = tag_walk_tier(root, question, tag_filter, k) {
@@ -697,8 +904,28 @@ pub async fn smart_search_with_qemb(
 	sorted.truncate(top_n);
 
 	let mut out = Vec::new();
+	let mut extra_hits: Vec<serde_json::Value> = Vec::new();
+	let mut seen_extras: HashSet<String> = HashSet::new();
 	for r in &sorted {
 		if let Some(d) = indexed.remove(r.id.as_str()) {
+			let contradictions = gather_contradictions(root, &d.id);
+			if opts.include_contradiction_docs {
+				for c in &contradictions {
+					if !seen_extras.insert(c.other_doc_id.clone()) { continue; }
+					if let Some((dt, od)) = resolve_doc_full(root, &c.other_doc_id) {
+						extra_hits.push(serde_json::json!({
+							"id": od.id,
+							"doc_type": dt,
+							"title": od.title,
+							"tags": od.tags,
+							"purpose": od.purpose,
+							"content": od.content,
+							"contradicts": d.id,
+							"reason_id": c.reason_id,
+						}));
+					}
+				}
+			}
 			out.push(serde_json::json!({
 				"id": d.id,
 				"title": d.title,
@@ -707,9 +934,11 @@ pub async fn smart_search_with_qemb(
 				"score": r.score,
 				"reason": r.reason,
 				"content": d.content,
+				"contradictions": contradictions_to_json(&contradictions),
 			}));
 		}
 	}
+	out.extend(extra_hits);
 
 	let _ = append_feedback(root, &serde_json::json!({
 		"ts": chrono::Utc::now().to_rfc3339(),
@@ -777,6 +1006,185 @@ mod tests {
 			.collect();
 		assert!(target_ids.contains(&t1.id), "missing t1: {:?}", target_ids);
 		assert!(target_ids.contains(&t2.id), "missing t2: {:?}", target_ids);
+	}
+
+	fn set_node_size(root: &Path, doc_type: &str, id: &str, size: u32) {
+		let dir = root.join(doc_type);
+		let path = store::find_document_path_by_id(&dir, id).unwrap();
+		let raw = std::fs::read_to_string(&path).unwrap();
+		let (mut fm, body) = store::parse_frontmatter(&raw).unwrap();
+		if let Some(obj) = fm.as_object_mut() {
+			obj.insert("node_size".into(), serde_json::json!(size));
+		}
+		let fm_str = serde_yaml::to_string(&fm).unwrap();
+		std::fs::write(&path, format!("---\n{}---\n\n{}", fm_str, body)).unwrap();
+	}
+
+	#[test]
+	fn score_higher_with_more_answers_edges() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let a = create_document(root, "conclusions", "alpha topic",
+			"alpha topic body", vec!["conclusion".into()], None, None).unwrap();
+		let b = create_document(root, "conclusions", "alpha topic two",
+			"alpha topic body", vec!["conclusion".into()], None, None).unwrap();
+		for i in 0..5 {
+			let q = create_document(root, "questions", &format!("q{}", i),
+				"qbody", vec!["question".into()], None, None).unwrap();
+			create_reason(root, &q.id, &a.id, "Answers", "ans", None).unwrap();
+		}
+		let qterms = lowercase_terms("alpha topic");
+		let sa = score_conclusion(root, &a, &qterms);
+		let sb = score_conclusion(root, &b, &qterms);
+		assert!(sa > sb, "A({}) should beat B({})", sa, sb);
+	}
+
+	#[test]
+	fn score_lower_with_contradicts() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let a = create_document(root, "conclusions", "beta topic",
+			"beta topic body", vec!["conclusion".into()], None, None).unwrap();
+		let b = create_document(root, "conclusions", "beta topic two",
+			"beta topic body", vec!["conclusion".into()], None, None).unwrap();
+		let src = create_document(root, "thoughts", "src", "src body",
+			vec!["thought".into()], None, None).unwrap();
+		create_reason(root, &src.id, &a.id, "Contradicts", "no", None).unwrap();
+		let qterms = lowercase_terms("beta topic");
+		let sa = score_conclusion(root, &a, &qterms);
+		let sb = score_conclusion(root, &b, &qterms);
+		assert!(sa < sb, "Contradicts should reduce A({}) below B({})", sa, sb);
+	}
+
+	#[test]
+	fn weight_factor_amplifies_score() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let big = create_document(root, "conclusions", "gamma topic",
+			"gamma topic body", vec!["conclusion".into()], None, None).unwrap();
+		let small = create_document(root, "conclusions", "gamma topic alt",
+			"gamma topic body", vec!["conclusion".into()], None, None).unwrap();
+		set_node_size(root, "conclusions", &big.id, 100);
+		set_node_size(root, "conclusions", &small.id, 6);
+		let qterms = lowercase_terms("gamma topic");
+		let s_big = score_conclusion(root, &big, &qterms);
+		let s_small = score_conclusion(root, &small, &qterms);
+		assert!(s_big > s_small * 5.0,
+			"node_size=100 should heavily amplify vs 6: big={} small={}", s_big, s_small);
+		assert!((node_weight_factor(root, &big.id, "conclusions") - 2.0).abs() < 1e-6);
+		assert!((node_weight_factor(root, &small.id, "conclusions") - 0.12).abs() < 1e-6);
+	}
+
+	#[test]
+	fn missing_node_size_defaults_to_one() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let c = create_document(root, "conclusions", "delta topic",
+			"delta body", vec!["conclusion".into()], None, None).unwrap();
+		assert!((node_weight_factor(root, &c.id, "conclusions") - 1.0).abs() < 1e-9);
+	}
+
+	#[test]
+	fn hit_carries_contradiction_refs() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let a = create_document(
+			root, "conclusions", "Alpha says X causes Y",
+			"alpha body discussing causal claim",
+			vec!["conclusion".into()], None, None,
+		).unwrap();
+		let b = create_document(
+			root, "conclusions", "Beta refutes X causes Y",
+			"beta body refuting alpha",
+			vec!["conclusion".into()], None, None,
+		).unwrap();
+		create_reason(root, &a.id, &b.id, "Contradicts", "they disagree", None).unwrap();
+
+		let v = conclusions_first(root, "alpha causal claim", None, 10)
+			.unwrap()
+			.expect("must hit alpha");
+		let tree = v["tree"].as_array().unwrap();
+		let alpha_node = tree.iter()
+			.find(|n| n["conclusion"]["id"] == serde_json::Value::String(a.id.clone()))
+			.expect("alpha in tree");
+		let contradictions = alpha_node["contradictions"].as_array().unwrap();
+		assert_eq!(contradictions.len(), 1, "alpha should have 1 contradiction");
+		assert_eq!(contradictions[0]["other_doc_id"], b.id);
+		assert_eq!(contradictions[0]["other_doc_type"], "conclusions");
+		assert_eq!(contradictions[0]["direction"], "from_hit");
+	}
+
+	#[test]
+	fn bidirectional_detection() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let a = create_document(
+			root, "conclusions", "Alpha unique-term-aaa",
+			"body aaa", vec!["conclusion".into()], None, None,
+		).unwrap();
+		let b = create_document(
+			root, "conclusions", "Beta unique-term-bbb",
+			"body bbb", vec!["conclusion".into()], None, None,
+		).unwrap();
+		create_reason(root, &a.id, &b.id, "Contradicts", "x", None).unwrap();
+
+		let va = conclusions_first(root, "unique-term-aaa", None, 10)
+			.unwrap()
+			.expect("hit a");
+		let tree_a = va["tree"].as_array().unwrap();
+		let a_node = tree_a.iter()
+			.find(|n| n["conclusion"]["id"] == serde_json::Value::String(a.id.clone()))
+			.unwrap();
+		let ca = a_node["contradictions"].as_array().unwrap();
+		assert_eq!(ca.len(), 1);
+		assert_eq!(ca[0]["other_doc_id"], b.id);
+		assert_eq!(ca[0]["direction"], "from_hit");
+
+		let vb = conclusions_first(root, "unique-term-bbb", None, 10)
+			.unwrap()
+			.expect("hit b");
+		let tree_b = vb["tree"].as_array().unwrap();
+		let b_node = tree_b.iter()
+			.find(|n| n["conclusion"]["id"] == serde_json::Value::String(b.id.clone()))
+			.unwrap();
+		let cb = b_node["contradictions"].as_array().unwrap();
+		assert_eq!(cb.len(), 1);
+		assert_eq!(cb[0]["other_doc_id"], a.id);
+		assert_eq!(cb[0]["direction"], "to_hit");
+	}
+
+	#[test]
+	fn include_contradiction_docs_expands_results() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		ensure_wiki_layout(root).unwrap();
+		let a = create_document(
+			root, "conclusions", "Alpha widgetzzz claim",
+			"alpha body", vec!["conclusion".into()], None, None,
+		).unwrap();
+		let b = create_document(
+			root, "conclusions", "Beta retort orthogonal",
+			"beta body", vec!["conclusion".into()], None, None,
+		).unwrap();
+		create_reason(root, &a.id, &b.id, "Contradicts", "x", None).unwrap();
+
+		let v = conclusions_first(root, "widgetzzz", None, 10).unwrap().expect("hit");
+		assert!(v["results"].as_array().unwrap().is_empty());
+
+		let opts = SmartSearchOpts { include_contradiction_docs: true };
+		let v2 = conclusions_first_with_opts(root, "widgetzzz", None, 10, &opts)
+			.unwrap()
+			.expect("hit");
+		let results = v2["results"].as_array().unwrap();
+		assert_eq!(results.len(), 1, "should include B as a separate hit");
+		assert_eq!(results[0]["id"], b.id);
+		assert_eq!(results[0]["contradicts"], a.id);
 	}
 
 	#[test]

@@ -38,6 +38,38 @@ fn qa_max_per_pass() -> usize {
 	std::env::var("WIKI_QA_MAX_PER_PASS").ok().and_then(|s| s.parse().ok()).unwrap_or(50)
 }
 
+const DEFAULT_QUESTION_DEDUPE_THRESHOLD: f32 = 0.88;
+
+fn question_dedupe_threshold() -> f32 {
+	std::env::var("WIKI_QUESTION_DEDUPE_THRESHOLD")
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(DEFAULT_QUESTION_DEDUPE_THRESHOLD)
+}
+
+/// Pure: drop candidate indices whose max cosine against any existing
+/// embedding meets/exceeds `threshold`. Returns indices kept, in input order.
+pub fn dedupe_candidates_by_embedding(
+	cand_embs: &[Vec<f32>],
+	existing_embs: &[Vec<f32>],
+	threshold: f32,
+) -> Vec<usize> {
+	let mut kept = Vec::with_capacity(cand_embs.len());
+	for (i, c) in cand_embs.iter().enumerate() {
+		let mut dup = false;
+		for e in existing_embs {
+			if classifier::cosine(c, e) >= threshold {
+				dup = true;
+				break;
+			}
+		}
+		if !dup {
+			kept.push(i);
+		}
+	}
+	kept
+}
+
 #[derive(Clone)]
 pub struct EntityRef {
 	pub id: String,
@@ -499,7 +531,9 @@ async fn qa_for_doc(
 		};
 		let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
 		let mut got_answer = false;
+		let mut max_score: f32 = 0.0;
 		for c in &cands {
+			if c.score > max_score { max_score = c.score; }
 			let kind = if c.score >= strong { "Answers" } else { "Supports" };
 			if c.score >= strong { got_answer = true; }
 			let _ = store::create_reason(root, &qid, &c.doc_id, kind, &c.body, qpurpose.as_deref());
@@ -517,6 +551,16 @@ async fn qa_for_doc(
 			*llm_budget = llm_budget.saturating_sub(1);
 			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &strong_edges).await {
 				promoted += 1;
+			}
+		} else if max_score >= support_threshold() && *llm_budget >= 2 {
+			// In-purpose answer fell below threshold but cleared the support
+			// floor. Try ONE cross-topic fallback pass (no recursion).
+			*llm_budget = llm_budget.saturating_sub(2);
+			if let Ok(n) = cross_topic_pass(root, &qid).await {
+				if n > 0 {
+					answered += 1;
+					promoted += 1;
+				}
 			}
 		}
 	}
@@ -631,6 +675,34 @@ pub async fn run_pass(
 		}
 	}
 
+	// Auto-trigger: open questions with Supports edges from ≥2 distinct
+	// purposes get a cross-topic pass even if their docs were not QA'd above.
+	let mut crosstopic_invoked = 0u64;
+	if qa && !dry_run {
+		let resolved: HashSet<String> = cache::tag_index_lookup(root, "resolved")
+			.into_iter()
+			.filter(|d| d.doc_type == "questions")
+			.map(|d| d.id)
+			.collect();
+		let candidates: Vec<String> = cache::tag_index_lookup(root, "question")
+			.into_iter()
+			.filter(|d| d.doc_type == "questions" && !resolved.contains(&d.id))
+			.map(|d| d.id)
+			.collect();
+		for qid in candidates {
+			if llm_budget < 2 { break; }
+			if !should_invoke_cross_topic(root, &qid) { continue; }
+			llm_budget = llm_budget.saturating_sub(2);
+			if let Ok(n) = cross_topic_pass(root, &qid).await {
+				if n > 0 {
+					crosstopic_invoked += 1;
+					questions_answered += 1;
+					conclusions_promoted += 1;
+				}
+			}
+		}
+	}
+
 	// Persist cursor at last-processed doc so the next pass resumes after it.
 	if !dry_run {
 		if let Some((dt, id)) = &last_processed {
@@ -653,6 +725,7 @@ pub async fn run_pass(
 		"qa": qa,
 		"force": force,
 		"skipped_recent": skipped_recent,
+		"crosstopic_invoked": crosstopic_invoked,
 		"cursor": last_processed.as_ref().map(|(dt, id)| format!("{}/{}", dt, id)),
 		"details": details,
 	});
@@ -839,6 +912,39 @@ struct RaisedQResp {
 	questions: Vec<RaisedQItem>,
 }
 
+/// Collect embeddings for OPEN (not `resolved`) questions in `purpose_tag`.
+/// Uses the in-memory pool when present; live-embeds missing titles via a
+/// single `embed_batch` call. Returns embeddings (order is arbitrary).
+pub async fn gather_open_question_embeddings(
+	root: &Path,
+	purpose_tag: &str,
+) -> Result<Vec<Vec<f32>>> {
+	let by_purpose = cache::tag_index_lookup(root, purpose_tag);
+	let resolved: HashSet<String> = cache::tag_index_lookup(root, "resolved")
+		.into_iter()
+		.filter(|d| d.doc_type == "questions")
+		.map(|d| d.id)
+		.collect();
+
+	let mut from_pool: Vec<Vec<f32>> = Vec::new();
+	let mut miss_titles: Vec<String> = Vec::new();
+	for dref in by_purpose {
+		if dref.doc_type != "questions" || resolved.contains(&dref.id) {
+			continue;
+		}
+		if let Some(entry) = cache::pool_get(&dref.id) {
+			from_pool.push(entry.vec.clone());
+		} else if let Ok(qd) = store::get_document(root, "questions", &dref.id) {
+			miss_titles.push(qd.title);
+		}
+	}
+	if !miss_titles.is_empty() {
+		let live = http::embed_batch(&miss_titles).await?;
+		from_pool.extend(live);
+	}
+	Ok(from_pool)
+}
+
 /// Counts open (i.e. not yet `resolved`) questions for the given purpose using
 /// the cached tag index. `purpose` of `None` falls back to `"general"`.
 pub fn count_open_questions_in_purpose(root: &Path, purpose: Option<&str>) -> usize {
@@ -914,6 +1020,42 @@ pub async fn raise_questions_for_doc(
 	}
 
 	let purpose = doc.purpose.clone();
+	let purpose_tag_for_dedupe = purpose.clone().unwrap_or_else(|| "general".to_string());
+	let templated_dropped = skipped.len();
+
+	// Embedding-cosine dedupe vs existing OPEN questions in same purpose.
+	let mut kept = kept;
+	let mut semantic_dropped = 0usize;
+	if !kept.is_empty() {
+		let cand_titles: Vec<String> = kept.iter().map(|q| q.title.clone()).collect();
+		let cand_embs = http::embed_batch(&cand_titles).await?;
+		let existing_embs = gather_open_question_embeddings(root, &purpose_tag_for_dedupe).await?;
+		let threshold = question_dedupe_threshold();
+		let keep_idx = dedupe_candidates_by_embedding(&cand_embs, &existing_embs, threshold);
+		semantic_dropped = kept.len() - keep_idx.len();
+		let kept_set: HashSet<usize> = keep_idx.into_iter().collect();
+		kept = kept
+			.into_iter()
+			.enumerate()
+			.filter(|(i, _)| kept_set.contains(i))
+			.map(|(_, q)| q)
+			.collect();
+	}
+
+	// Cap interaction: trim survivors to fit (cap - existing_open).
+	let existing_open = count_open_questions_in_purpose(root, doc.purpose.as_deref());
+	let slots = cap.saturating_sub(existing_open);
+	if kept.len() > slots {
+		kept.truncate(slots);
+	}
+
+	eprintln!(
+		"raise_questions_for_doc: deduped {} templated, {} semantic, {} passed",
+		templated_dropped,
+		semantic_dropped,
+		kept.len(),
+	);
+
 	let mut out = Vec::new();
 	for q in kept {
 		let title = q.title;
@@ -1068,6 +1210,199 @@ pub async fn cross_reference_question(
 		})
 		.collect();
 	Ok(out)
+}
+
+const BRIDGING_BONUS: f32 = 1.5;
+
+/// Read a reason doc's frontmatter and return `(from_id, to_id, kind, purpose)`.
+fn read_reason_meta(root: &Path, reason_id: &str) -> Option<(String, String, String, Option<String>)> {
+	let dir = root.join("reasons");
+	let path = store::find_document_path_by_id(&dir, reason_id).ok()?;
+	let raw = std::fs::read_to_string(&path).ok()?;
+	let (fm, _) = store::parse_frontmatter(&raw).ok()?;
+	let from_id = fm.get("from_id").and_then(|v| v.as_str())?.to_string();
+	let to_id = fm.get("to_id").and_then(|v| v.as_str())?.to_string();
+	let kind = fm.get("kind").and_then(|v| v.as_str())?.to_string();
+	let purpose = fm.get("purpose").and_then(|v| v.as_str()).map(String::from);
+	Some((from_id, to_id, kind, purpose))
+}
+
+/// Return the set of distinct purposes from which a candidate doc has inbound
+/// `Supports` reason edges. The candidate's own purpose is not excluded; the
+/// caller decides what counts as "different".
+pub fn candidate_support_purposes(root: &Path, doc_id: &str) -> HashSet<String> {
+	let mut set = HashSet::new();
+	let adj = cache::reason_index_lookup(root, doc_id);
+	for rid in &adj.to {
+		let Some((from_id, _to, kind, _rp)) = read_reason_meta(root, rid) else { continue };
+		if kind != "Supports" { continue; }
+		// Resolve the from-doc's purpose by trying common doc types.
+		for dt in &["thoughts", "conclusions", "entities", "questions"] {
+			if let Ok(d) = store::get_document(root, dt, &from_id) {
+				if let Some(p) = d.purpose {
+					if !p.is_empty() { set.insert(p); }
+				}
+				break;
+			}
+		}
+	}
+	set
+}
+
+/// Apply the bridging bonus to candidate scores: any candidate whose
+/// `candidate_support_purposes` set contains a purpose distinct from
+/// `question_purpose` gets its score multiplied by `BRIDGING_BONUS`.
+pub fn apply_bridging_bonus(
+	root: &Path,
+	candidates: Vec<AnswerCandidate>,
+	question_purpose: Option<&str>,
+) -> Vec<AnswerCandidate> {
+	candidates
+		.into_iter()
+		.map(|mut c| {
+			let supports = candidate_support_purposes(root, &c.doc_id);
+			let bridges = supports
+				.iter()
+				.any(|p| Some(p.as_str()) != question_purpose);
+			if bridges {
+				c.score *= BRIDGING_BONUS;
+			}
+			c
+		})
+		.collect()
+}
+
+/// Distinct purposes among `Supports` edges into `question_id`. Used by the
+/// auto-trigger heuristic in `run_pass`.
+pub fn question_support_purposes(root: &Path, question_id: &str) -> HashSet<String> {
+	let mut set = HashSet::new();
+	let adj = cache::reason_index_lookup(root, question_id);
+	for rid in &adj.to {
+		let Some((from_id, _to, kind, _rp)) = read_reason_meta(root, rid) else { continue };
+		if kind != "Supports" { continue; }
+		for dt in &["thoughts", "conclusions", "entities", "questions"] {
+			if let Ok(d) = store::get_document(root, dt, &from_id) {
+				if let Some(p) = d.purpose {
+					if !p.is_empty() { set.insert(p); }
+				}
+				break;
+			}
+		}
+	}
+	set
+}
+
+/// `true` when the question has Supports edges from at least two distinct
+/// purposes — the auto-trigger condition for `cross_topic_pass`.
+pub fn should_invoke_cross_topic(root: &Path, question_id: &str) -> bool {
+	question_support_purposes(root, question_id).len() >= 2
+}
+
+/// Add `bridges-<purpose>` extra tags + `crosstopic` purpose tag to a
+/// conclusion doc. Idempotent: existing tags are preserved and new ones are
+/// only appended when missing.
+fn tag_conclusion_with_bridges(
+	root: &Path,
+	conclusion_id: &str,
+	bridge_purposes: &HashSet<String>,
+) -> Result<()> {
+	let doc = store::get_document(root, "conclusions", conclusion_id)?;
+	let mut tags = doc.tags.clone();
+	let crosstopic = "crosstopic".to_string();
+	if !tags.iter().any(|t| t == &crosstopic) {
+		tags.push(crosstopic);
+	}
+	for p in bridge_purposes {
+		let bt = format!("bridges-{}", p);
+		if !tags.iter().any(|t| t == &bt) {
+			tags.push(bt);
+		}
+	}
+	if tags != doc.tags {
+		store::update_document(root, "conclusions", conclusion_id, None, Some(tags))?;
+	}
+	Ok(())
+}
+
+/// Inner promote step for cross-topic pass. Pure of LLM if `candidates` already
+/// have `Answers`-strong scores AND the conclusion can be merged into an
+/// existing one (bypassing the synthesis call). Used by tests and by
+/// `cross_topic_pass`.
+async fn cross_topic_emit_and_promote(
+	root: &Path,
+	question_id: &str,
+	question_purpose: Option<&str>,
+	candidates: &[AnswerCandidate],
+) -> Result<usize> {
+	let strong = answer_threshold();
+	let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
+	let mut got_answer = false;
+	for c in candidates {
+		let kind = if c.score >= strong { "Answers" } else { "Supports" };
+		if c.score >= strong { got_answer = true; }
+		let _ = store::create_reason(
+			root, question_id, &c.doc_id, kind, &c.body, question_purpose,
+		);
+		if c.score >= strong { strong_edges.push(c.clone()); }
+	}
+	if !got_answer {
+		return Ok(0);
+	}
+
+	if let Ok(mut q) = store::get_document(root, "questions", question_id) {
+		if !q.tags.iter().any(|t| t == "resolved") {
+			q.tags.push("resolved".to_string());
+			let _ = store::update_document(root, "questions", question_id, None, Some(q.tags));
+		}
+	}
+
+	// Collect bridging purposes from each strong candidate's existing Supports
+	// edges (the purposes being bridged INTO this answer).
+	let mut bridges: HashSet<String> = HashSet::new();
+	for c in &strong_edges {
+		for p in candidate_support_purposes(root, &c.doc_id) {
+			if Some(p.as_str()) != question_purpose {
+				bridges.insert(p);
+			}
+		}
+		// Also include the candidate doc's own purpose if it differs.
+		for dt in &["thoughts", "conclusions", "entities"] {
+			if let Ok(d) = store::get_document(root, dt, &c.doc_id) {
+				if let Some(p) = d.purpose {
+					if !p.is_empty() && Some(p.as_str()) != question_purpose {
+						bridges.insert(p);
+					}
+				}
+				break;
+			}
+		}
+	}
+
+	let cid = promote_to_conclusion(root, question_id, &strong_edges).await?;
+	if let Some(cid) = cid.as_ref() {
+		let _ = tag_conclusion_with_bridges(root, cid, &bridges);
+	}
+	Ok(strong_edges.len())
+}
+
+/// Cross-purpose synthesis pass for a single question.
+///
+/// Re-runs `cross_reference_question` with no purpose filter (full vault),
+/// applies a `BRIDGING_BONUS` multiplier to candidates that already have
+/// `Supports` edges from a different purpose than the question's, and on
+/// strong matches emits `Answers` edges + marks the question resolved + tags
+/// the resulting conclusion as `crosstopic` with `bridges-<purpose>` tags.
+///
+/// Returns the number of strong (≥ `WIKI_ANSWER_THRESHOLD`) edges emitted.
+/// Does NOT recurse — call once per question per pass.
+pub async fn cross_topic_pass(root: &Path, question_id: &str) -> Result<usize> {
+	let q = store::get_document(root, "questions", question_id)?;
+	let cands = cross_reference_question(root, &q.title, None).await?;
+	if cands.is_empty() {
+		return Ok(0);
+	}
+	let scored = apply_bridging_bonus(root, cands, q.purpose.as_deref());
+	cross_topic_emit_and_promote(root, question_id, q.purpose.as_deref(), &scored).await
 }
 
 const DEFAULT_CONCLUSION_MERGE_THRESHOLD: f32 = 0.92;
@@ -1751,6 +2086,133 @@ mod tests {
 		std::env::remove_var("WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP");
 	}
 
+	fn seed_open_question(root: &Path, purpose: &str, title: &str, vec: Vec<f32>) -> String {
+		let hash = fnv_question_id(title);
+		let tags = vec!["question".to_string(), purpose.to_string(), hash];
+		let q = store::create_document(root, "questions", title, "body", tags, Some(purpose), None).unwrap();
+		seed_pool_entry(&q.id, "questions", title, "body", vec);
+		q.id
+	}
+
+	#[tokio::test]
+	async fn dedupe_drops_near_duplicate() {
+		cache::invalidate_indexes();
+		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		// Existing open question w/ embedding e1.
+		let e1 = vec![1.0, 0.0, 0.0];
+		let qid = seed_open_question(root, "p1", "What causes X?", e1.clone());
+
+		// Candidate near-identical embedding e2 (cosine ≈ 1.0 with e1).
+		let e2 = vec![1.0, 0.0, 0.0];
+		let existing = gather_open_question_embeddings(root, "p1").await.unwrap();
+		assert_eq!(existing.len(), 1);
+		let kept = dedupe_candidates_by_embedding(&[e2], &existing, 0.88);
+		assert!(kept.is_empty(), "near-duplicate must be dropped");
+
+		cache::pool_remove(&qid);
+	}
+
+	#[tokio::test]
+	async fn dedupe_keeps_distinct() {
+		cache::invalidate_indexes();
+		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		let qid = seed_open_question(root, "p1", "What causes X?", vec![1.0, 0.0, 0.0]);
+		let cand = vec![0.0, 1.0, 0.0]; // orthogonal -> cosine 0
+		let existing = gather_open_question_embeddings(root, "p1").await.unwrap();
+		let kept = dedupe_candidates_by_embedding(&[cand], &existing, 0.88);
+		assert_eq!(kept, vec![0]);
+
+		cache::pool_remove(&qid);
+	}
+
+	#[tokio::test]
+	async fn dedupe_threshold_respects_env() {
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		let qid = seed_open_question(root, "p1", "What causes X?", vec![1.0, 0.0, 0.0]);
+		// Near-but-not-perfect cosine ≈ 0.94.
+		let cand = vec![0.94, 0.34, 0.0];
+		let cos = classifier::cosine(&cand, &[1.0, 0.0, 0.0]);
+		assert!(cos > 0.88 && cos < 0.99, "cos={}", cos);
+
+		// Default 0.88 threshold -> dropped.
+		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
+		let t_default = question_dedupe_threshold();
+		assert!((t_default - 0.88).abs() < 1e-6);
+		let existing = gather_open_question_embeddings(root, "p1").await.unwrap();
+		assert!(dedupe_candidates_by_embedding(std::slice::from_ref(&cand), &existing, t_default).is_empty());
+
+		// 0.99 threshold -> kept.
+		std::env::set_var("WIKI_QUESTION_DEDUPE_THRESHOLD", "0.99");
+		let t_strict = question_dedupe_threshold();
+		assert!((t_strict - 0.99).abs() < 1e-6);
+		assert_eq!(
+			dedupe_candidates_by_embedding(&[cand], &existing, t_strict),
+			vec![0]
+		);
+
+		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
+		cache::pool_remove(&qid);
+	}
+
+	#[tokio::test]
+	async fn dedupe_runs_after_template_filter() {
+		cache::invalidate_indexes();
+		std::env::remove_var("WIKI_QUESTION_DEDUPE_THRESHOLD");
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		// Existing open Q in purpose w/ known embedding.
+		let qid = seed_open_question(root, "p1", "What causes X?", vec![1.0, 0.0, 0.0]);
+
+		// Three LLM-shaped candidates: 1 templated, 1 semantic dupe, 1 novel.
+		let raw = vec![
+			RaisedQItem {
+				title: "How does 'X' relate to or differ from similar concepts?".into(),
+				body: "b".into(),
+			},
+			RaisedQItem {
+				title: "What is the cause of X?".into(),
+				body: "Body sentence one. Body sentence two.".into(),
+			},
+			RaisedQItem {
+				title: "Why does X happen at high latency?".into(),
+				body: "Body sentence one. Body sentence two.".into(),
+			},
+		];
+		let (kept_after_template, skipped) = filter_raised_candidates(raw);
+		let templated_dropped = skipped.len();
+		assert_eq!(templated_dropped, 1);
+		assert_eq!(kept_after_template.len(), 2);
+
+		// Inject candidate embeddings: index 0 = near-dupe of e1; index 1 = orthogonal.
+		let cand_embs = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
+		let existing = gather_open_question_embeddings(root, "p1").await.unwrap();
+		let keep_idx = dedupe_candidates_by_embedding(&cand_embs, &existing, 0.88);
+		let semantic_dropped = cand_embs.len() - keep_idx.len();
+		assert_eq!(semantic_dropped, 1);
+		assert_eq!(keep_idx, vec![1]); // novel survives
+
+		// Counts distinguished: 1 templated, 1 semantic, 1 passed.
+		assert_eq!(templated_dropped, 1);
+		assert_eq!(semantic_dropped, 1);
+		assert_eq!(keep_idx.len(), 1);
+
+		cache::pool_remove(&qid);
+	}
+
 	#[test]
 	fn migration_deletes_unanswered_templates() {
 		cache::invalidate_indexes();
@@ -1816,5 +2278,169 @@ mod tests {
 		assert_eq!(r.templated, 1);
 		assert_eq!(r.deleted, 1); // counted but not actually deleted
 		assert_eq!(store::list_documents(root, "questions").unwrap().len(), 1);
+	}
+
+	// ── Cross-purpose synthesis (item #4) ────────────────────────────────────
+
+	#[tokio::test]
+	async fn cross_topic_finds_bridging_answer() {
+		// Question lives in purpose A, candidate doc in purpose B is the actual
+		// answer. We exercise the LLM-free inner step
+		// (`cross_topic_emit_and_promote`) with a hand-built strong candidate
+		// to verify edges + resolved + bridge tags. The pre-seeded conclusion
+		// short-circuits `promote_to_conclusion`'s LLM call.
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		// Question in purpose A.
+		let qtitle = "How does Clustered Forward+ relate to deferred shading?";
+		let qhash = fnv_question_id(qtitle);
+		let qtags = vec!["question".to_string(), "phyons".to_string(), qhash.clone()];
+		let qdoc = store::create_document(root, "questions", qtitle, "qbody", qtags, Some("phyons"), None).unwrap();
+
+		// Candidate doc in purpose B (the bridging answer).
+		let cand = store::create_document(
+			root,
+			"thoughts",
+			"Forward+ Clustering",
+			"Clustered Forward+ partitions the view frustum into 3D clusters.",
+			vec!["thought".to_string(), "forward-plus".to_string()],
+			Some("forward-plus"),
+			None,
+		).unwrap();
+
+		// Pre-seed a conclusion with the matching qhash so promote short-circuits.
+		let cdoc = store::create_document(
+			root,
+			"conclusions",
+			qtitle,
+			"existing",
+			vec!["conclusion".to_string(), "phyons".to_string(), qhash.clone()],
+			Some("phyons"),
+			None,
+		).unwrap();
+
+		let cands = vec![AnswerCandidate {
+			doc_id: cand.id.clone(),
+			doc_type: "thoughts".to_string(),
+			score: 0.95,
+			kind: "Answers".to_string(),
+			body: "directly explains the relation".to_string(),
+		}];
+
+		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("phyons"), &cands).await.unwrap();
+		assert_eq!(n, 1, "one strong edge expected");
+
+		// Question is now resolved.
+		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
+		assert!(q.tags.iter().any(|t| t == "resolved"));
+
+		// Answers edge emitted.
+		let from_q = store::search_reasons_for(root, &qdoc.id, "from").unwrap();
+		assert!(
+			from_q.iter().any(|r| r.title.contains("-[Answers]->") && r.title.ends_with(&cand.id)),
+			"expected Answers edge q→cand"
+		);
+
+		// Existing conclusion picked up bridge tags.
+		let cf = store::get_document(root, "conclusions", &cdoc.id).unwrap();
+		assert!(cf.tags.iter().any(|t| t == "crosstopic"));
+		assert!(cf.tags.iter().any(|t| t == "bridges-forward-plus"));
+	}
+
+	#[test]
+	fn bridging_bonus_applied() {
+		// Candidate w/ Supports from 2 purposes (one different from question's)
+		// should be boosted; candidate w/ Supports only from same-purpose docs
+		// should not.
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		let cand_a = store::create_document(
+			root, "thoughts", "A", "a body",
+			vec!["thought".to_string(), "phyons".to_string()],
+			Some("phyons"), None,
+		).unwrap();
+		let cand_b = store::create_document(
+			root, "thoughts", "B", "b body",
+			vec!["thought".to_string(), "phyons".to_string()],
+			Some("phyons"), None,
+		).unwrap();
+
+		// Source docs that emit Supports edges into the candidates.
+		let same_purpose_src = store::create_document(
+			root, "thoughts", "src-same", "x",
+			vec!["thought".to_string(), "phyons".to_string()],
+			Some("phyons"), None,
+		).unwrap();
+		let other_purpose_src = store::create_document(
+			root, "thoughts", "src-other", "y",
+			vec!["thought".to_string(), "forward-plus".to_string()],
+			Some("forward-plus"), None,
+		).unwrap();
+
+		// cand_a gets Supports from BOTH purposes (bridges).
+		store::create_reason(root, &same_purpose_src.id, &cand_a.id, "Supports", "z", Some("phyons")).unwrap();
+		store::create_reason(root, &other_purpose_src.id, &cand_a.id, "Supports", "z", Some("forward-plus")).unwrap();
+		// cand_b gets Supports only from the question's own purpose.
+		store::create_reason(root, &same_purpose_src.id, &cand_b.id, "Supports", "z", Some("phyons")).unwrap();
+
+		cache::invalidate_indexes();
+
+		let cands = vec![
+			AnswerCandidate { doc_id: cand_a.id.clone(), doc_type: "thoughts".into(), score: 0.5, kind: "Supports".into(), body: "".into() },
+			AnswerCandidate { doc_id: cand_b.id.clone(), doc_type: "thoughts".into(), score: 0.5, kind: "Supports".into(), body: "".into() },
+		];
+		let scored = apply_bridging_bonus(root, cands, Some("phyons"));
+		let a = scored.iter().find(|c| c.doc_id == cand_a.id).unwrap();
+		let b = scored.iter().find(|c| c.doc_id == cand_b.id).unwrap();
+		assert!(a.score > b.score, "bridging candidate should outrank single-purpose");
+		assert!((a.score - 0.75).abs() < 1e-5, "expected 1.5× boost, got {}", a.score);
+		assert!((b.score - 0.5).abs() < 1e-5, "expected no boost, got {}", b.score);
+	}
+
+	#[test]
+	fn auto_trigger_on_multi_support_question() {
+		// A question with Supports edges from ≥2 distinct purposes triggers
+		// `should_invoke_cross_topic` without needing a QA failure.
+		cache::invalidate_indexes();
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::ensure_wiki_layout(root).unwrap();
+
+		let qtitle = "Open question?";
+		let qhash = fnv_question_id(qtitle);
+		let qdoc = store::create_document(
+			root, "questions", qtitle, "body",
+			vec!["question".to_string(), "phyons".to_string(), qhash],
+			Some("phyons"), None,
+		).unwrap();
+
+		let src_a = store::create_document(
+			root, "thoughts", "src-A", "a",
+			vec!["thought".to_string(), "phyons".to_string()],
+			Some("phyons"), None,
+		).unwrap();
+		let src_b = store::create_document(
+			root, "thoughts", "src-B", "b",
+			vec!["thought".to_string(), "forward-plus".to_string()],
+			Some("forward-plus"), None,
+		).unwrap();
+
+		store::create_reason(root, &src_a.id, &qdoc.id, "Supports", "z", Some("phyons")).unwrap();
+		// Single-purpose so far → must NOT trigger.
+		cache::invalidate_indexes();
+		assert!(!should_invoke_cross_topic(root, &qdoc.id));
+
+		store::create_reason(root, &src_b.id, &qdoc.id, "Supports", "z", Some("forward-plus")).unwrap();
+		cache::invalidate_indexes();
+		assert!(should_invoke_cross_topic(root, &qdoc.id));
+		let purposes = question_support_purposes(root, &qdoc.id);
+		assert!(purposes.contains("phyons"));
+		assert!(purposes.contains("forward-plus"));
 	}
 }
