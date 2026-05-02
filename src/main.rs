@@ -6,10 +6,11 @@ mod chunker;
 mod classifier;
 mod code;
 mod config;
-mod extract;
+mod docs;
 mod http;
 mod io;
 mod learn;
+mod sanitize;
 mod search;
 mod smart;
 mod store;
@@ -102,7 +103,7 @@ async fn run_hook() -> anyhow::Result<()> {
     let cwd_path = cwd_from_payload(&payload);
     let Some(wiki_path) = resolve_wiki_and_key(&cwd_path) else { return emit_empty_hook(); };
 
-    let _ = store::ensure_wiki_layout(&wiki_path);
+    let _ = store::bootstrap(&wiki_path);
 
     // Persist prompt for the Stop hook to pick up after the turn ends.
     let state_dir = wiki_path.join(".hook_state");
@@ -114,7 +115,7 @@ async fn run_hook() -> anyhow::Result<()> {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let mut queries: Vec<String> = vec![prompt.clone()];
     if n_sub > 0 {
-        if let Ok(extra) = smart::expand_questions(&prompt, n_sub).await {
+        if let Ok(extra) = smart::expand_questions(&wiki_path, &prompt, n_sub).await {
             for q in extra {
                 if !queries.iter().any(|x| x.eq_ignore_ascii_case(&q)) {
                     queries.push(q);
@@ -133,8 +134,8 @@ async fn run_hook() -> anyhow::Result<()> {
         let emb = q_embs.get(i).cloned();
         async move {
             match emb {
-                Some(e) => smart::smart_search_with_qemb(&wiki_path, &q, None, 10, 3, &e).await,
-                None => smart::smart_search(&wiki_path, &q, None, 10, 3).await,
+                Some(e) => smart::query_with_qemb(&wiki_path, &q, None, 10, 3, &e).await,
+                None => smart::query(&wiki_path, &q, None, 10, 3).await,
             }
         }
     });
@@ -331,6 +332,15 @@ enum CliCmd {
     LearnFeedback { limit: usize, dry_run: bool },
     MigrateTemplatedQuestions { dry_run: bool },
     RecomputeWeights { dry_run: bool },
+    PurposeCreate { tag: String, title: String, description: String },
+    PurposeDelete { tag: String },
+    PurposeList,
+    PurposeReembed,
+    LearnPass { qa: bool, force: bool, limit: usize },
+    Link { doc_type: String, id: String },
+    IndexCode { src_dir: String, ext: String },
+    IndexValidate { fix: bool },
+    Sanitize { dry_run: bool },
 }
 
 fn parse_cli() -> Option<CliCmd> {
@@ -386,6 +396,112 @@ fn parse_cli() -> Option<CliCmd> {
             let dry_run = args.iter().skip(2).any(|a| a == "--dry-run");
             Some(CliCmd::RecomputeWeights { dry_run })
         }
+        "purpose" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("");
+            match sub {
+                "create" => {
+                    let tag = args.get(3).cloned().unwrap_or_default();
+                    let title = args.get(4).cloned().unwrap_or_default();
+                    let description = args.get(5).cloned().unwrap_or_default();
+                    if tag.is_empty() {
+                        eprintln!("usage: wiki purpose create <tag> <title> <description>");
+                        std::process::exit(2);
+                    }
+                    Some(CliCmd::PurposeCreate { tag, title, description })
+                }
+                "delete" => {
+                    let tag = args.get(3).cloned().unwrap_or_default();
+                    if tag.is_empty() {
+                        eprintln!("usage: wiki purpose delete <tag>");
+                        std::process::exit(2);
+                    }
+                    Some(CliCmd::PurposeDelete { tag })
+                }
+                "list" => Some(CliCmd::PurposeList),
+                "reembed" => Some(CliCmd::PurposeReembed),
+                _ => {
+                    eprintln!("usage: wiki purpose create|delete|list|reembed");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "learn" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("");
+            match sub {
+                "pass" => {
+                    let mut qa = false;
+                    let mut force = false;
+                    let mut limit: usize = 25;
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--qa" => { qa = true; i += 1; }
+                            "--force" => { force = true; i += 1; }
+                            "--limit" => { limit = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(25); i += 2; }
+                            _ => i += 1,
+                        }
+                    }
+                    Some(CliCmd::LearnPass { qa, force, limit })
+                }
+                "feedback" => {
+                    let mut limit: usize = 25;
+                    let mut dry_run = false;
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--limit" => { limit = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(25); i += 2; }
+                            "--dry-run" => { dry_run = true; i += 1; }
+                            _ => i += 1,
+                        }
+                    }
+                    Some(CliCmd::LearnFeedback { limit, dry_run })
+                }
+                _ => {
+                    eprintln!("usage: wiki learn pass|feedback [...]");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "link" => {
+            let doc_type = args.get(2).cloned().unwrap_or_default();
+            let id = args.get(3).cloned().unwrap_or_default();
+            if doc_type.is_empty() || id.is_empty() {
+                eprintln!("usage: wiki link <doc_type> <id>");
+                std::process::exit(2);
+            }
+            Some(CliCmd::Link { doc_type, id })
+        }
+        "index" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("");
+            match sub {
+                "code" => {
+                    let src_dir = args.get(3).cloned().unwrap_or_default();
+                    if src_dir.is_empty() {
+                        eprintln!("usage: wiki index code <src_dir> [--ext rs]");
+                        std::process::exit(2);
+                    }
+                    let mut ext = "rs".to_string();
+                    let mut i = 4;
+                    while i < args.len() {
+                        if args[i] == "--ext" { ext = args.get(i+1).cloned().unwrap_or(ext); i += 2; }
+                        else { i += 1; }
+                    }
+                    Some(CliCmd::IndexCode { src_dir, ext })
+                }
+                "validate" => {
+                    let fix = args.iter().skip(3).any(|a| a == "--fix");
+                    Some(CliCmd::IndexValidate { fix })
+                }
+                _ => {
+                    eprintln!("usage: wiki index code|validate [...]");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "sanitize" => {
+            let dry_run = args.iter().skip(2).any(|a| a == "--dry-run");
+            Some(CliCmd::Sanitize { dry_run })
+        }
         _ => None,
     }
 }
@@ -394,8 +510,8 @@ async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
     match cmd {
         CliCmd::Search { query, tag, k, top_n } => {
             let root = store::wiki_root();
-            store::ensure_wiki_layout(&root)?;
-            match smart::smart_search(&root, &query, tag.as_deref(), k, top_n).await {
+            store::bootstrap(&root)?;
+            match smart::query(&root, &query, tag.as_deref(), k, top_n).await {
                 Ok(v) => { println!("{}", v); Ok(()) }
                 Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
             }
@@ -405,7 +521,7 @@ async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
         CliCmd::StopHook => run_stop_hook().await,
         CliCmd::LearnFeedback { limit, dry_run } => {
             let root = store::wiki_root();
-            store::ensure_wiki_layout(&root)?;
+            store::bootstrap(&root)?;
             match learn::run_feedback_pass(&root, limit, dry_run).await {
                 Ok(v) => { println!("{}", v); Ok(()) }
                 Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
@@ -413,7 +529,7 @@ async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
         }
         CliCmd::MigrateTemplatedQuestions { dry_run } => {
             let root = store::wiki_root();
-            store::ensure_wiki_layout(&root)?;
+            store::bootstrap(&root)?;
             match learn::migrate_templated_questions(&root, dry_run) {
                 Ok(report) => {
                     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -428,10 +544,96 @@ async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
         }
         CliCmd::RecomputeWeights { dry_run } => {
             let root = store::wiki_root();
-            store::ensure_wiki_layout(&root)?;
+            store::bootstrap(&root)?;
             match weight::run_cli(&root, dry_run) {
                 Ok(n) => {
                     eprintln!("{} doc(s) {}", n, if dry_run { "would update" } else { "updated" });
+                    Ok(())
+                }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::PurposeCreate { tag, title, description } => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            match store::create_purpose(&root, &tag, &title, &description) {
+                Ok(p) => { println!("{}", serde_json::to_string_pretty(&p)?); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::PurposeDelete { tag } => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            match store::delete_purpose(&root, &tag) {
+                Ok(_) => { eprintln!("Purpose '{}' deleted", tag); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::PurposeList => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            match store::list_purposes(&root) {
+                Ok(p) => { println!("{}", serde_json::to_string_pretty(&p)?); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::PurposeReembed => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            if let Ok(purposes) = store::list_purposes(&root) {
+                for p in &purposes {
+                    let _ = std::fs::remove_file(p.path.with_extension("vec"));
+                }
+            }
+            match classifier::ensure_purpose_embeddings(&root).await {
+                Ok(v) => { eprintln!("Re-embedded {} purposes", v.len()); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::LearnPass { qa, force, limit } => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            let cfg = learn::PassConfig::default();
+            match learn::run_pass(&root, limit, None, false, qa, force, &cfg).await {
+                Ok(v) => { println!("{}", v); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::Link { doc_type, id } => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            match learn::link_doc(&root, &doc_type, &id, false).await {
+                Ok(v) => { println!("{}", v); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::IndexCode { src_dir, ext } => {
+            match code::index_dir(&PathBuf::from(src_dir), &ext) {
+                Ok(s) => { println!("{}", s); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::IndexValidate { fix } => {
+            match code::validate(fix) {
+                Ok(s) => { println!("{}", s); Ok(()) }
+                Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+            }
+        }
+        CliCmd::Sanitize { dry_run } => {
+            let root = store::wiki_root();
+            store::bootstrap(&root)?;
+            match sanitize::sanitize_vault(&root, dry_run) {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    let total_links: usize = report.link_rewrites.iter().map(|(_, n)| n).sum();
+                    eprintln!(
+                        "sanitize: renamed={} link_rewrites={} (across {} file(s)) skipped={} dry_run={}",
+                        report.renamed.len(),
+                        total_links,
+                        report.link_rewrites.len(),
+                        report.skipped.len(),
+                        dry_run,
+                    );
                     Ok(())
                 }
                 Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }

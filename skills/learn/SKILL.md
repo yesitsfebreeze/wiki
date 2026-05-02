@@ -13,7 +13,7 @@ tags:
 
 `/learn` is the **only** wiki skill. Covers ingest → link → raise questions → cross-reference → answer → promote → query. Single Obsidian vault at `.wiki/`. Topics separated by **purpose tags**, not folders.
 
-Always read `.claude/tools/wiki/INGEST_FLOW.md` for vocab.
+The MCP tool surface was consolidated to ~13 tools. Most loops now finish in 1–2 calls because invariants (auto-link, auto-mark-answered, auto-suggest-conclusion, lazy reindex) run server-side. Read `docs/concepts/ingest_flow.md` for vocab; read `docs/tools/<name>.md` for any tool you call.
 
 ## Doc model
 
@@ -30,125 +30,97 @@ Each doc: 1 type tag + 1 purpose tag.
 ## Lifecycle (the loop)
 
 ```
-ingest source → ingest_thought (auto-chunked by purpose)
-              → link_doc       (wikilink + paragraph dedupe)
-              → raise          (LLM extracts open questions from new content)
-              → cross_reference (search wiki for candidate answers)
-              → answer         (if score ≥ 0.8: ingest_reason Answers, mark resolved)
-              → promote        (resolved Q → conclusion + Derives/References edges)
+ingest source → ingest({type:"thought", body})    [auto: classify, embed, link, wikilink-resolve]
+              → (questions surface as open via background learn pass)
+              → search({mode:"qa"}) when ready to answer        [returns suggested_conclusions]
+              → ingest({type:"conclusion", body})  [auto: marks matching open question answered]
 
-query → smart_search (conclusions first → walk reasons → return tree)
+query → search({query, include:{bodies:true, reasons:true, edges_depth:1}})
+        (conclusions-first inside server; one call returns hits + bodies + edges + reasons)
 ```
 
 ## Modes
 
 | Mode | Trigger | Action |
 |------|---------|--------|
-| **ingest** | files in `.wiki/ingest/` | drain inbox via `ingest_thought` per atomic claim, then run `learn_pass` on new docs |
-| **batch learn** | `/learn [limit] [purpose]` | full pipeline (link + dedupe + raise + cross-ref + answer + promote) on docs |
-| **query** | substantive question or pre-conclusion synthesis | `smart_search` conclusions-first, walk depth-1 fanout-5 |
-| **health** | periodic | `list_purposes`, `list_open_questions`, drain `find_answers` queue |
+| **ingest** | files in `.wiki/ingest/` | one `ingest({type:"thought", body})` per atomic claim. |
+| **query** | substantive question or pre-conclusion synthesis | `search({query, mode:"smart"})` — single call returns hits, bodies, reasons, edges, and any `suggested_conclusions` banner. |
+| **answer** | open question with enough support | `ingest({type:"conclusion", body})` — auto-marks the matching question. |
+| **health** | periodic | `list_open_questions`, scan ingest responses for `auto_linked` precision. |
+
+Background processes run automatically (no MCP call needed):
+- **Auto-`learn`**: triggers on N=20 ingests OR M=10min idle. Runs link/dedupe + Q&A pass.
+- **Auto-`code_index`**: filesystem watcher; lazy reindex on `code_search` if stale.
+- **Auto-conclusion-suggestion**: surfaced inside `search` response, not a separate tool.
+
+Force a learn pass via CLI: `wiki learn --force`. Purpose admin via CLI: `wiki purpose create|delete|list`.
 
 ## Ingest
 
 When user adds files to `.wiki/ingest/`:
 
-1. For each source, extract atomic claims.
-2. `ingest_thought({title, content})` per claim. Auto-chunked by purpose; multi-purpose yields parent + children + `PartOf` reasons.
-3. Recurring concepts → `ingest_entity({title, content})`.
-4. Manual entity↔thought link: `ingest_reason({from_id, to_id, kind: "Consolidates", body})`.
-5. Delete source from `.wiki/ingest/` after success.
-6. Run `learn_pass({limit: <new_doc_count>})` to fold new docs into the graph.
+1. For each plain-text source, extract atomic claims.
+2. **One call per claim**: `ingest({type:"thought", body})`. Server auto-classifies purpose, embeds, scans nearest neighbors within the purpose cluster, creates edges (cosine ≥ 0.82, top-5 cap), and resolves any `[[wikilinks]]` in the body.
+3. For recurring concepts: `ingest({type:"entity", body})`.
+4. Audit `auto_linked` in the response. To override a wrong edge: `update({id, edges:[...]})` or `delete_doc` on the bad reason.
+5. Delete the source from `.wiki/ingest/` after success.
 
-Pass `purpose_hint` only when bucket certain (skips one OpenAI call).
+`link_doc` is gone — auto-link is built into every `ingest`.
 
-## Learn pass — full pipeline
+## Q&A loop
 
-`learn_pass({limit, purpose, dry_run})` walks `thoughts` ∪ `conclusions` and runs each doc through:
+Old loop: `find_answers` → `ingest_conclusion` → `mark_question` (3 calls). New loop:
 
-### Step 1 — Link & dedupe (existing)
+1. `list_open_questions({purpose})` — pick a question worth answering.
+2. `search({query: question_body, mode:"qa", include:{bodies:true, reasons:true, edges_depth:1}})` — one call returns evidence; check the `suggested_conclusions` banner for a server-suggested synthesis.
+3. `ingest({type:"conclusion", body: synthesis})` — server scans open questions; if cosine match ≥ threshold, the matching question is auto-marked `answered` and an `Answers` edge is created. Check `promoted: {question_id, marked: "answered"}` in the response.
 
-- Build entity index. Embed bodies once per pass.
-- Per doc: regex-find entity titles + aliases, skip protected ranges (code fences, backticks, existing `[[...]]`, markdown links), rewrite as `[[entities/<purpose>/<slug>|<surface>]]`. One link per entity per doc.
-- Paragraph dedupe: split on `\n\n`, embed paragraphs ≥40 chars, drop those ≥ `WIKI_DEDUPE_THRESHOLD` (default `0.85`) cosine vs an entity body, emit `Consolidates` reason.
+`mark_question` only needed for manual overrides (e.g. dropping a stale question).
 
-### Step 2 — Raise questions (NEW)
+## Query — `search` conclusions-first
 
-- LLM extracts ≤3 open questions raised by the doc body.
-- Dedup via `fnv_question_id(question)` against existing `questions/`.
-- New ones: `ingest_question({body, purpose: doc.purpose})`, link `question →References→ source_doc`.
-
-### Step 3 — Cross-reference (NEW)
-
-- For each new (or still-open) question, run `smart_search(question, k=5)` against the vault.
-- LLM scores candidates 0..1.
-
-### Step 4 — Answer (NEW)
-
-- Score ≥ 0.8 → `ingest_reason(question →Answers→ candidate)`, mark question `resolved`.
-- 0.3..0.8 → `Supports`, leave open.
-- < 0.3 → skip.
-
-### Step 5 — Promote (NEW)
-
-When a question becomes resolved:
-
-- LLM synthesizes a 1-paragraph answer from the question + top Answers edges.
-- `ingest_conclusion({title: question.title, body: synthesis, purpose: question.purpose})`.
-- `ingest_reason(question →Derives→ conclusion)`.
-- `ingest_reason(conclusion →References→ answer_doc)` per top edge.
-- Idempotent: skip if conclusion w/ same `fnv_question_id` tag already exists.
-
-## Query — `smart_search` conclusions-first
+`search({query, mode:"smart", k:5})` returns hits with full `body`, inline `reasons`, and depth-1 `edges` already attached. No follow-up `get` or `search_reasons_for` needed for shallow reads. For deeper traversal: `get({id, depth:2})`.
 
 ```
-1. search_fulltext(query) restricted to type=conclusion → top-k entry points
-2. for each conclusion:
-     walk search_reasons_for(conclusion.id, "from") depth-1, fanout-5
-     collect linked thoughts/entities/questions
-3. if zero conclusion hits → fall back to full-vault hybrid search (BM25+cosine+RRF+MMR)
-4. return: conclusions (primary) + supporting docs (context) + reason kinds
+1. search({query, mode:"smart"}) — server runs hybrid search, prefers conclusions as entry points,
+   walks reasons, returns hits + bodies + edges + reasons inline.
+2. If shallow read insufficient → get({id, depth:2}) on the most relevant hit.
+3. If zero conclusion hits → server falls back to full-vault hybrid (BM25+cosine+RRF+MMR) automatically.
 ```
 
-Cite all walked IDs in answers. If answer adds durable insight → `ingest_conclusion`.
+Cite all walked IDs in answers. If the answer adds durable insight → `ingest({type:"conclusion", body})`.
 
-## Inputs
+## Tool reference (final surface, ~13 tools)
 
-| Param | Default | Purpose |
-|-------|---------|---------|
-| `limit` | 25 | Max docs per pass — bound OpenAI cost |
-| `purpose` | `null` | Restrict to one purpose tag |
-| `dry_run` | `false` | Log proposed edits + questions, no write |
-| `qa` | `true` | Skip steps 2–5 if `false` (link+dedupe only) |
+### Query
+- `search({query, mode?, k?, include?})` — primary read path. Modes: `smart` (default), `fts`, `tag`, `qa`. Returns bodies + reasons + edges + `suggested_conclusions`.
+- `get({id, depth?})` — single doc with reasons + 1-hop edges always; `depth>1` for deeper walks.
 
-## Tool reference
+### Write
+- `ingest({type, body, tags?, refs?})` — all 5 doc types. Auto-embeds, auto-links, auto-resolves `[[wikilinks]]`, auto-answers matching questions when `type=conclusion`.
+- `mark_question({id, state})` — manual override only.
+- `update({id, body?, title?, tags?, edges?})` — auto re-embeds + re-links.
+- `delete_doc({id})` — cascades edge cleanup.
 
-### Purpose
-- `list_purposes()` / `create_purpose` / `delete_purpose` / `reembed_purposes`
+### Code
+- `code_search({query, kind?, lang?, k?})` — symbol/regex/semantic. Lazy reindex.
+- `code_read({path?|symbol?, granularity})` — `outline | file | fn`.
+- `code_refs({symbol, direction?, depth?})` — `callers | callees | both`.
 
-### Ingest (all accept optional `purpose_hint`)
-- `ingest_thought` / `ingest_entity` / `ingest_reason` / `ingest_question` / `ingest_conclusion`
+### Meta
+- `list_open_questions({purpose?, k?})` — gap-finding entry point.
+- `docs({name?})` — fetch this surface's own documentation.
 
-### Read
-- `get({doc_type, id})` / `list({doc_type})` / `list_open_questions` / `list_ingest_log`
+### Removed (moved to CLI)
+`list`, `list_purposes`, `create_purpose`, `delete_purpose`, `reembed_purposes`, `list_ingest_log`, `code_index`, `code_validate`, `code_list_languages`, `code_list_bodies`, `code_find_large`, `learn_pass`, `learn_from_feedback`. Use `wiki <subcommand>` from a shell.
 
-### Search
-- `smart_search({question, tag?, k, top_n})` — **default for substantive queries**
-- `search_fulltext({query})` — raw FTS sweep
-- `search_by_tag({tag})`
-- `search_reasons_for({node_id, direction})`
-
-### Modify
-- `update` / `delete_doc` / `mark_question`
-
-### Workflow
-- `learn_pass({limit, purpose, dry_run, qa})` — full pipeline
-- `link_doc({doc_type, id, dry_run})` — single doc, link+dedupe only
-- `find_answers({question_id})`
-- `suggest_conclusion({entity_id})`
-
-### Extract
-- `extract_pdfs({paths})` / `extract_youtube({ids})`
+### Replaced (do not call — stale tool names)
+| Old | New |
+|---|---|
+| `query`, `search_fulltext`, `search_by_tag`, `find_answers`, `search_reasons_for`, `suggest_conclusion` | `search` |
+| `ingest_thought`, `ingest_entity`, `ingest_question`, `ingest_reason`, `ingest_conclusion`, `link_doc` | `ingest` |
+| `code_open`, `code_read_body`, `code_outline` | `code_read` |
+| `code_fn_tree`, `code_ref_graph` | `code_refs` |
 
 ## Aliases
 
@@ -160,27 +132,6 @@ aliases:
 ```
 Linker matches title + aliases. ≥3 chars to avoid stop-word noise.
 
-## Output schema (learn_pass)
-
-```json
-{
-  "pass_id": "<rfc3339>",
-  "docs_scanned": N,
-  "docs_modified": M,
-  "links_added": K,
-  "paragraphs_merged": P,
-  "questions_raised": Q,
-  "questions_answered": A,
-  "conclusions_promoted": C,
-  "entity_count": E,
-  "purpose_filter": "<tag|null>",
-  "dry_run": false,
-  "details": [...]
-}
-```
-
-Dump at `.wiki/ingest_log/learn-<ts>.json`.
-
 ## Environment
 
 - `WIKI_PATH` — vault root (default `./.wiki`)
@@ -188,34 +139,35 @@ Dump at `.wiki/ingest_log/learn-<ts>.json`.
 - `WIKI_SIMILARITY_THRESHOLD` — purpose classification cosine (default `0.35`)
 - `WIKI_DEDUPE_THRESHOLD` — paragraph dedupe cosine (default `0.85`)
 - `WIKI_ALIAS_THRESHOLD` — entity alias merge cosine (default `0.92`)
-- `WIKI_ANSWER_THRESHOLD` — Q&A answer-link cosine (default `0.8`)
-- `WIKI_SUPPORT_THRESHOLD` — weak-link floor (default `0.3`)
+- `WIKI_AUTO_INVARIANTS` — set `1` to enable server-side auto-link/auto-answer (default on after Phase B)
+
+Per-call tunables: `auto_link_threshold` (default `0.82`), `auto_link_cap` (default `5`), `answer_threshold` (default `0.8`).
 
 ## Guardrails
 
 - `.wiki/ingest/` is an inbox — drains on successful ingest.
 - No `store` parameter — single store.
 - Reason filenames deterministic (`<from>-<kind>-<to>`) — never rename.
-- One purpose per doc; multi-purpose auto-splits.
-- Contradictions visible — emit `Contradicts` reason, keep prior claim.
+- One purpose per doc; multi-purpose auto-splits during ingest.
+- Contradictions visible — `Contradicts` reason auto-created if scan finds opposing claims; prior claim retained.
 - No entities without supporting thoughts.
-- No conclusions without resolved-question Derives chain (auto-promote path) or explicit `suggest_conclusion` review.
+- Conclusions ideally come from the Q&A loop (matching open question), not freehand. Freehand `ingest({type:"conclusion"})` works but skips the auto-answer link.
 - Self-link prevented.
-- Skip code fences, inline backticks, existing `[[...]]`, markdown links during rewrite.
+- Skip code fences, inline backticks, existing `[[...]]`, markdown links during wikilink rewrite.
 - Paragraphs <40 chars not embedded.
-- `dry_run: true` first on a fresh vault to inspect proposed merges + questions.
+- Always audit `auto_linked` in ingest responses — false positives are tunable but not zero.
 - After MCP signature changes, restart MCP server/client session.
 
 ## When to run
 
-- After every `/ingest` batch — `limit` = number of newly ingested docs.
-- Periodic full-vault sweep — paginated by `limit`.
-- Before substantive query — `smart_search` (read-only).
-- When user reports "wiki feels disconnected", "too much duplication", "missing answers", or "no conclusions".
+- After every `/ingest` batch — ingest each claim then trust the auto-`learn` background pass.
+- Before substantive query — `search` (read-only).
+- When user reports "wiki feels disconnected", "too much duplication", "missing answers", or "no conclusions": run `wiki learn --force` from CLI.
 
 ## Anti-patterns
 
-- Querying via `search_fulltext` directly when `smart_search` would walk conclusion tree → shallow answers.
-- Calling `ingest_conclusion` manually without a resolved question chain → orphan conclusion.
-- Running `learn_pass` with `qa: false` permanently → wiki never grows the conclusion layer.
-- Running without `dry_run` on first pass over fresh vault → noisy false-positive merges.
+- Calling old tool names (`query`, `ingest_thought`, `link_doc`, `find_answers`, `search_reasons_for`, etc.) — they are removed/deprecated. Use the new surface.
+- Calling `get` after `search` for the body — `search` already returns bodies inline.
+- Calling `mark_question` after `ingest({type:"conclusion"})` — it is auto-marked; check `promoted` in the response.
+- Running freehand `ingest({type:"conclusion"})` without first checking `suggested_conclusions` from `search` → orphan conclusions.
+- Calling `reembed_purposes` / `learn_pass` from MCP — moved to CLI.

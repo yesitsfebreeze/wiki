@@ -67,16 +67,6 @@
 				]
 			},
 			{
-				"matcher": "mcp__wiki__extract_pdfs|mcp__wiki__extract_youtube",
-				"hooks": [
-					{
-						"type": "command",
-						"command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"Extraction complete. Move the resulting file(s) to .wiki/ingest/ and run /ingest to atomize into thoughts and entities.\"}}'",
-						"timeout": 5
-					}
-				]
-			},
-			{
 				"matcher": "mcp__wiki__learn_pass",
 				"hooks": [
 					{

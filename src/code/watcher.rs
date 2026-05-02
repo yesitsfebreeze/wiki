@@ -3,19 +3,10 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use crate::code::splitter;
 
 pub fn watch(src_dirs: &[PathBuf], index_dir: &Path, exts: &[String]) -> Result<()> {
-    let debounce_ms = std::env::var("SPLIT_DEBOUNCE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(500);
-    watch_with_debounce(src_dirs, index_dir, exts, Duration::from_millis(debounce_ms))
-}
-
-pub fn watch_with_debounce(src_dirs: &[PathBuf], index_dir: &Path, exts: &[String], _debounce: Duration) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(move |res| { let _ = tx.send(res); }, Config::default())?;
 

@@ -56,14 +56,12 @@ source doc  →  ingest_thought / ingest_entity
 | `search_fulltext` | 🔍 Tantivy full-text search across all docs |
 | `search_by_tag` | 🏷️ Filter by type, purpose, or sub-tag |
 | `search_reasons_for` | 🕸️ Traverse edges from/to a node |
-| `smart_search` | 🧠 Embedding + fulltext hybrid search |
+| `query` | 🧠 Embedding + fulltext hybrid search |
 | `get` / `list` | 📖 Read individual docs or list by type |
 | `link_doc` | 🔗 Wikilink entity mentions in a doc |
 | `learn_pass` | 🔁 Batch link + dedupe across the vault |
 | `suggest_conclusion` | 💡 Gate synthesis on graph signals |
 | `find_answers` | 🔎 Find candidates for an open question |
-| `extract_pdfs` | 📄 Extract text from PDFs |
-| `extract_youtube` | 🎥 Extract transcripts from YouTube |
 | `code_open` | 📂 Open a source file → function map |
 | `code_search` | 🔍 Grep across all indexed functions |
 | `code_read_body` | 📄 Load one function body |
@@ -104,7 +102,7 @@ Create `~/.config/wiki/config.toml`:
 ```toml
 openai_api_key = "sk-..."
 
-# wiki_rerank_model = "gpt-4o-mini"        # model for smart_search reranking
+# wiki_rerank_model = "gpt-4o-mini"        # model for query reranking
 # wiki_similarity_threshold = 0.35
 # wiki_dedupe_threshold = 0.85
 
