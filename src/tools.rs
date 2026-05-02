@@ -32,63 +32,6 @@ struct PurposeTagParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct IngestThoughtParams {
-	title: String,
-	content: String,
-	purpose_hint: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct IngestEntityParams {
-	title: String,
-	content: String,
-	purpose_hint: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct IngestReasonParams {
-	from_id: String,
-	to_id: String,
-	kind: String,
-	body: String,
-	purpose_hint: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct IngestQuestionParams {
-	body: String,
-	purpose_hint: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct IngestConclusionParams {
-	title: String,
-	body: String,
-	purpose_hint: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct FulltextParams {
-	query: String,
-	limit: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct TagParams {
-	tag: String,
-	limit: Option<u64>,
-	cursor: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct ReasonsForParams {
-	node_id: String,
-	direction: String,
-	limit: Option<u64>,
-	cursor: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct DocRefParams {
 	doc_type: String,
 	id: String,
@@ -116,11 +59,6 @@ struct UpdateDocParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct AnswerQuestionParams {
-	question_id: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct MarkQuestionParams {
 	question_id: String,
 	status: String,
@@ -135,19 +73,6 @@ struct SuggestConclusionParams {
 struct CodeIndexParams {
 	src_dir: String,
 	ext: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CodeOpenParams {
-	source_path: String,
-	ext: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CodeReadBodyParams {
-	path: String,
-	start: Option<u64>,
-	limit: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -176,25 +101,8 @@ struct CodeFindLargeParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct CodeRefGraphParams {
-	path: String,
-	direction: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CodeOutlineParams {
-	path: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct CodeValidateParams {
 	fix: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CodeFnTreeParams {
-	fn_id: String,
-	depth: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -217,28 +125,6 @@ struct LearnPassParams {
 #[derive(Deserialize, JsonSchema)]
 struct LearnFeedbackParams {
 	limit: Option<u64>,
-	dry_run: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct QueryParams {
-	question: String,
-	tag: Option<String>,
-	k: Option<u64>,
-	top_n: Option<u64>,
-	/// When true, contradicting docs are appended to `results` as separate
-	/// hits (each carrying `contradicts: <original_hit_id>`). Per-hit
-	/// `contradictions: [...]` refs are always included.
-	include_contradictions: Option<bool>,
-	/// When true, blend a HyDE-synthesized answer embedding into the query
-	/// embedding before retrieval. Adds one LLM + one embed call. Default `false`.
-	hyde: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct LinkDocParams {
-	doc_type: String,
-	id: String,
 	dry_run: Option<bool>,
 }
 
@@ -655,126 +541,6 @@ impl WikiService {
 		}
 	}
 
-	async fn ingest_thought(&self, params: Parameters<IngestThoughtParams>) -> String {
-		let IngestThoughtParams { title, content, purpose_hint } = params.0;
-		self.ingest_chunked("thoughts", &title, &content, "thought", purpose_hint.as_deref())
-			.await
-			.to_string()
-	}
-
-	async fn ingest_entity(&self, params: Parameters<IngestEntityParams>) -> String {
-		let IngestEntityParams { title, content, purpose_hint } = params.0;
-		match learn::find_near_duplicate_entity(self.root(), &title, &content).await {
-			Ok(Some(existing)) => {
-				let added = if existing.title.to_lowercase() != title.to_lowercase() {
-					store::add_alias_to_entity(self.root(), &existing.id, &title).unwrap_or(false)
-				} else {
-					false
-				};
-				serde_json::json!({
-					"merged_into": existing.id,
-					"existing_title": existing.title,
-					"alias_added": if added { Some(title.as_str()) } else { None },
-					"note": "near-duplicate found — merged as alias, no new doc created"
-				}).to_string()
-			}
-			_ => self.ingest_chunked("entities", &title, &content, "entity", purpose_hint.as_deref()).await.to_string(),
-		}
-	}
-
-	async fn ingest_reason(&self, params: Parameters<IngestReasonParams>) -> String {
-		let IngestReasonParams { from_id, to_id, kind, body, purpose_hint } = params.0;
-		let purpose = self.classify_or_hint(purpose_hint.as_deref(), &body).await;
-		match store::create_reason(self.root(), &from_id, &to_id, &kind, &body, Some(&purpose)) {
-			Ok(doc) => {
-				self.try_index_doc(&doc);
-				let _ = store::log_ingest(self.root(), "reasons", &doc.id, &doc.title);
-				to_json(&doc)
-			}
-			Err(e) => json_err(e),
-		}
-	}
-
-	async fn ingest_question(&self, params: Parameters<IngestQuestionParams>) -> String {
-		let IngestQuestionParams { body, purpose_hint } = params.0;
-		let purpose = self.classify_or_hint(purpose_hint.as_deref(), &body).await;
-		let tags = vec!["question".to_string(), purpose.clone()];
-		match store::create_document(
-			self.root(), "questions", "question", &body, tags, Some(&purpose), None,
-		) {
-			Ok(doc) => {
-				self.try_index_doc(&doc);
-				let _ = store::log_ingest(self.root(), "questions", &doc.id, &doc.title);
-				to_json(&doc)
-			}
-			Err(e) => json_err(e),
-		}
-	}
-
-	async fn ingest_conclusion(&self, params: Parameters<IngestConclusionParams>) -> String {
-		let IngestConclusionParams { title, body, purpose_hint } = params.0;
-		self.ingest_chunked("conclusions", &title, &body, "conclusion", purpose_hint.as_deref())
-			.await
-			.to_string()
-	}
-
-	fn search_fulltext(&self, params: Parameters<FulltextParams>) -> String {
-		let FulltextParams { query, limit } = params.0;
-		let lim = limit.map(|n| n as usize).unwrap_or(DEFAULT_LIST_LIMIT);
-		let index = match cache::search_index(self.root()) {
-			Ok(i) => i,
-			Err(e) => return json_err(e),
-		};
-		match search::search_topk(&index, &query, None, lim) {
-			Ok(hits) => {
-				let items: Vec<serde_json::Value> = hits
-					.into_iter()
-					.map(|(d, score)| {
-						let mut v = doc_preview(&d);
-						v["score"] = serde_json::json!(score);
-						v
-					})
-					.collect();
-				serde_json::json!({
-					"query": query,
-					"returned": items.len(),
-					"items": items,
-				}).to_string()
-			}
-			Err(e) => json_err(e),
-		}
-	}
-
-	fn search_by_tag(&self, params: Parameters<TagParams>) -> String {
-		let TagParams { tag, limit, cursor } = params.0;
-		match store::search_by_tag(self.root(), &tag) {
-			Ok(docs) => {
-				let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
-				paginate(previews, cursor, limit).to_string()
-			}
-			Err(e) => json_err(e),
-		}
-	}
-
-	fn search_reasons_for(&self, params: Parameters<ReasonsForParams>) -> String {
-		let ReasonsForParams { node_id, direction, limit, cursor } = params.0;
-		match store::search_reasons_for(self.root(), &node_id, &direction) {
-			Ok(docs) => {
-				let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
-				paginate(previews, cursor, limit).to_string()
-			}
-			Err(e) => json_err(e),
-		}
-	}
-
-	fn get_legacy(&self, params: Parameters<DocRefParams>) -> String {
-		let DocRefParams { doc_type, id } = params.0;
-		match store::get_document(self.root(), &doc_type, &id) {
-			Ok(doc) => to_json(&doc),
-			Err(e) => json_err(e),
-		}
-	}
-
 	fn list(&self, params: Parameters<DocTypeParams>) -> String {
 		let DocTypeParams { doc_type, limit, cursor } = params.0;
 		match store::list_documents(self.root(), &doc_type) {
@@ -845,34 +611,6 @@ impl WikiService {
 		}
 	}
 
-	fn find_answers(&self, params: Parameters<AnswerQuestionParams>) -> String {
-		let qid = &params.0.question_id;
-		let question = match store::get_document(self.root(), "questions", qid) {
-			Ok(d) => d,
-			Err(e) => return json_err(e),
-		};
-		let mut candidates = Vec::new();
-		if let Ok(index) = cache::search_index(self.root()) {
-			if let Ok(results) = search::search_documents(&index, &question.content) {
-				for doc in results.iter().take(5) {
-					let doc_type = doc.tags.first().map(|s| s.as_str()).unwrap_or("unknown");
-					let kind = if doc.title.contains('?') { "Answers" } else { "Supports" };
-					candidates.push(serde_json::json!({
-						"id": doc.id,
-						"title": doc.title,
-						"doc_type": doc_type,
-						"suggested_reason_kind": kind,
-					}));
-				}
-			}
-		}
-		serde_json::json!({
-			"question_id": qid,
-			"question": question.content,
-			"candidates": candidates,
-		}).to_string()
-	}
-
 	#[tool(description = "Mark question status (resolved/unanswerable/partial_answer). Docs: docs(\"mark_question\").")]
 	fn mark_question(&self, params: Parameters<MarkQuestionParams>) -> String {
 		let MarkQuestionParams { question_id, status } = params.0;
@@ -935,25 +673,6 @@ impl WikiService {
 		}
 	}
 
-	fn code_open(&self, params: Parameters<CodeOpenParams>) -> String {
-		let CodeOpenParams { source_path, ext } = params.0;
-		let ext = ext.unwrap_or_else(|| "rs".to_string());
-		match code::open_source(&PathBuf::from(source_path), &ext) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
-
-	fn code_read_body(&self, params: Parameters<CodeReadBodyParams>) -> String {
-		let CodeReadBodyParams { path, start, limit } = params.0;
-		let start = start.map(|n| n as usize).unwrap_or(1);
-		let limit = limit.map(|n| n as usize);
-		match code::read_body(&PathBuf::from(path), start, limit) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
-
 	#[tool(description = "Grep across indexed fn bodies/skeletons. Docs: docs(\"code_search\").")]
 	fn code_search(&self, params: Parameters<CodeSearchParams>) -> String {
 		let CodeSearchParams { query, regex, scope, cursor, limit } = params.0;
@@ -995,32 +714,8 @@ impl WikiService {
 		code::list_languages()
 	}
 
-	fn code_ref_graph(&self, params: Parameters<CodeRefGraphParams>) -> String {
-		let CodeRefGraphParams { path, direction } = params.0;
-		let direction = direction.unwrap_or_else(|| "both".to_string());
-		match code::ref_graph(&PathBuf::from(path), &direction) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
-
-	fn code_outline(&self, params: Parameters<CodeOutlineParams>) -> String {
-		match code::outline(&PathBuf::from(params.0.path)) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
-
 	fn code_validate(&self, params: Parameters<CodeValidateParams>) -> String {
 		match code::validate(params.0.fix.unwrap_or(false)) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
-
-	fn code_fn_tree(&self, params: Parameters<CodeFnTreeParams>) -> String {
-		let CodeFnTreeParams { fn_id, depth } = params.0;
-		match code::fn_tree(&PathBuf::from(fn_id), depth.unwrap_or(2) as usize) {
 			Ok(s) => s,
 			Err(e) => format!("Error: {e}"),
 		}
@@ -1049,28 +744,6 @@ impl WikiService {
 		let LearnFeedbackParams { limit, dry_run } = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);
 		match learn::run_feedback_pass(self.root(), limit, dry_run.unwrap_or(false)).await {
-			Ok(v) => v.to_string(),
-			Err(e) => json_err(e),
-		}
-	}
-
-	async fn query(&self, params: Parameters<QueryParams>) -> String {
-		let QueryParams { question, tag, k, top_n, include_contradictions, hyde } = params.0;
-		let k = k.map(|n| n as usize).unwrap_or(20);
-		let top_n = top_n.map(|n| n as usize).unwrap_or(5);
-		let opts = smart::QueryOpts {
-			include_contradiction_docs: include_contradictions.unwrap_or(false),
-			hyde: hyde.unwrap_or(false),
-		};
-		match smart::query_with_opts(self.root(), &question, tag.as_deref(), k, top_n, &opts).await {
-			Ok(v) => v.to_string(),
-			Err(e) => json_err(e),
-		}
-	}
-
-	async fn link_doc(&self, params: Parameters<LinkDocParams>) -> String {
-		let LinkDocParams { doc_type, id, dry_run } = params.0;
-		match learn::link_doc(self.root(), &doc_type, &id, dry_run.unwrap_or(false)).await {
 			Ok(v) => v.to_string(),
 			Err(e) => json_err(e),
 		}
