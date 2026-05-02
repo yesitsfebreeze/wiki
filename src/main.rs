@@ -1,6 +1,7 @@
 use rmcp::{transport::stdio, ServiceExt};
 use std::path::{Path, PathBuf};
 
+mod cache;
 mod chunker;
 mod classifier;
 mod code;
@@ -120,12 +121,20 @@ async fn run_hook() -> anyhow::Result<()> {
         }
     }
 
-    // 2. Search each sub-query in parallel; fuse by best score per doc id.
+    // 2. Batch-embed all sub-queries in one OpenAI call, then fan out
+    //    parallel BM25+vector searches sharing the cached embedding pool.
     use futures::future::join_all;
-    let search_futs = queries.iter().map(|q| {
+    let q_embs = http::embed_batch(&queries).await.unwrap_or_default();
+    let search_futs = queries.iter().enumerate().map(|(i, q)| {
         let wiki_path = wiki_path.clone();
         let q = q.clone();
-        async move { smart::smart_search(&wiki_path, &q, None, 10, 3).await }
+        let emb = q_embs.get(i).cloned();
+        async move {
+            match emb {
+                Some(e) => smart::smart_search_with_qemb(&wiki_path, &q, None, 10, 3, &e).await,
+                None => smart::smart_search(&wiki_path, &q, None, 10, 3).await,
+            }
+        }
     });
     let results = join_all(search_futs).await;
 

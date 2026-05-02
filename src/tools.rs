@@ -1,4 +1,4 @@
-use crate::{chunker, classifier, code, learn, search, smart, store};
+use crate::{cache, chunker, classifier, code, io as wiki_io, learn, search, smart, store};
 use anyhow::Result;
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
@@ -63,17 +63,22 @@ struct IngestConclusionParams {
 #[derive(Deserialize, JsonSchema)]
 struct QueryParams {
 	query: String,
+	limit: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct TagParams {
 	tag: String,
+	limit: Option<u64>,
+	cursor: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ReasonsForParams {
 	node_id: String,
 	direction: String,
+	limit: Option<u64>,
+	cursor: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -85,6 +90,14 @@ struct DocRefParams {
 #[derive(Deserialize, JsonSchema)]
 struct DocTypeParams {
 	doc_type: String,
+	limit: Option<u64>,
+	cursor: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ListLogParams {
+	limit: Option<u64>,
+	cursor: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -217,6 +230,9 @@ struct LinkDocParams {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+const DEFAULT_LIST_LIMIT: usize = 25;
+const SNIPPET_CHARS: usize = 600;
+
 fn json_err(e: impl std::fmt::Display) -> String {
 	serde_json::json!({ "error": e.to_string() }).to_string()
 }
@@ -225,14 +241,54 @@ fn to_json<T: serde::Serialize>(v: &T) -> String {
 	serde_json::to_string(v).unwrap_or_else(json_err)
 }
 
+/// Render a doc as a paginated-list entry: snippet, not full content.
+/// Callers should use `get` to fetch full bodies.
+fn doc_preview(d: &store::Document) -> serde_json::Value {
+	serde_json::json!({
+		"id": d.id,
+		"title": d.title,
+		"tags": d.tags,
+		"purpose": d.purpose,
+		"snippet": wiki_io::truncate_chars(&d.content, SNIPPET_CHARS),
+		"len": d.content.len(),
+	})
+}
+
+/// Slice + envelope: applies cursor + limit and returns a JSON object with
+/// a `next_cursor` (only present when more remains). Keeps tool output
+/// deterministically small.
+fn paginate<T: serde::Serialize>(
+	items: Vec<T>,
+	cursor: Option<u64>,
+	limit: Option<u64>,
+) -> serde_json::Value {
+	let total = items.len();
+	let cur = cursor.unwrap_or(0) as usize;
+	let lim = limit.map(|n| n as usize).unwrap_or(DEFAULT_LIST_LIMIT).max(1);
+	let cur = cur.min(total);
+	let end = (cur + lim).min(total);
+	let mut iter = items.into_iter();
+	for _ in 0..cur { iter.next(); }
+	let page: Vec<T> = iter.take(end - cur).collect();
+	let mut out = serde_json::json!({
+		"total": total,
+		"cursor": cur,
+		"returned": page.len(),
+		"items": page,
+	});
+	if end < total {
+		out["next_cursor"] = serde_json::json!(end);
+	}
+	out
+}
+
 impl WikiService {
 	fn root(&self) -> &std::path::Path {
 		&self.wiki_path
 	}
 
 	fn try_index_doc(&self, doc: &store::Document) {
-		let index_path = self.root().join(".search");
-		if let Ok(index) = search::create_index(&index_path) {
+		if let Ok(index) = cache::search_index(self.root()) {
 			let _ = search::index_document(&index, doc);
 		}
 	}
@@ -449,31 +505,54 @@ impl WikiService {
 			.to_string()
 	}
 
-	#[tool(description = "Full-text search across all docs. Args: query")]
+	#[tool(description = "Full-text search across all docs. Returns paginated previews (snippets, not full bodies). Use `get` to fetch a full body. Args: query, limit? (default 25)")]
 	fn search_fulltext(&self, params: Parameters<QueryParams>) -> String {
-		let index_path = self.root().join(".search");
-		match search::create_index(&index_path) {
-			Ok(index) => match search::search_documents(&index, &params.0.query) {
-				Ok(results) => to_json(&results),
-				Err(e) => json_err(e),
-			},
+		let QueryParams { query, limit } = params.0;
+		let lim = limit.map(|n| n as usize).unwrap_or(DEFAULT_LIST_LIMIT);
+		let index = match cache::search_index(self.root()) {
+			Ok(i) => i,
+			Err(e) => return json_err(e),
+		};
+		match search::search_topk(&index, &query, None, lim) {
+			Ok(hits) => {
+				let items: Vec<serde_json::Value> = hits
+					.into_iter()
+					.map(|(d, score)| {
+						let mut v = doc_preview(&d);
+						v["score"] = serde_json::json!(score);
+						v
+					})
+					.collect();
+				serde_json::json!({
+					"query": query,
+					"returned": items.len(),
+					"items": items,
+				}).to_string()
+			}
 			Err(e) => json_err(e),
 		}
 	}
 
-	#[tool(description = "Search by tag (purpose tag, type tag, or sub-tag). Args: tag")]
+	#[tool(description = "Search by tag (purpose tag, type tag, or sub-tag). Returns paginated previews. Args: tag, limit? (default 25), cursor? (default 0)")]
 	fn search_by_tag(&self, params: Parameters<TagParams>) -> String {
-		match store::search_by_tag(self.root(), &params.0.tag) {
-			Ok(docs) => to_json(&docs),
+		let TagParams { tag, limit, cursor } = params.0;
+		match store::search_by_tag(self.root(), &tag) {
+			Ok(docs) => {
+				let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
+				paginate(previews, cursor, limit).to_string()
+			}
 			Err(e) => json_err(e),
 		}
 	}
 
-	#[tool(description = "Get reasons connected to a node. direction: from|to|both. Args: node_id, direction")]
+	#[tool(description = "Get reasons connected to a node. direction: from|to|both. Args: node_id, direction, limit? (default 25), cursor? (default 0)")]
 	fn search_reasons_for(&self, params: Parameters<ReasonsForParams>) -> String {
-		let ReasonsForParams { node_id, direction } = params.0;
+		let ReasonsForParams { node_id, direction, limit, cursor } = params.0;
 		match store::search_reasons_for(self.root(), &node_id, &direction) {
-			Ok(docs) => to_json(&docs),
+			Ok(docs) => {
+				let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
+				paginate(previews, cursor, limit).to_string()
+			}
 			Err(e) => json_err(e),
 		}
 	}
@@ -487,10 +566,14 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "List documents by type. Args: doc_type")]
+	#[tool(description = "List documents by type. Returns paginated previews. Args: doc_type, limit? (default 25), cursor? (default 0)")]
 	fn list(&self, params: Parameters<DocTypeParams>) -> String {
-		match store::list_documents(self.root(), &params.0.doc_type) {
-			Ok(docs) => to_json(&docs),
+		let DocTypeParams { doc_type, limit, cursor } = params.0;
+		match store::list_documents(self.root(), &doc_type) {
+			Ok(docs) => {
+				let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
+				paginate(previews, cursor, limit).to_string()
+			}
 			Err(e) => json_err(e),
 		}
 	}
@@ -513,11 +596,12 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "List ingest log entries")]
-	fn list_ingest_log(&self) -> String {
+	#[tool(description = "List ingest log entries. Returns paginated entries. Args: limit? (default 25), cursor? (default 0)")]
+	fn list_ingest_log(&self, params: Parameters<ListLogParams>) -> String {
+		let ListLogParams { limit, cursor } = params.0;
 		let log_dir = self.root().join("ingest_log");
 		if !log_dir.exists() {
-			return "[]".to_string();
+			return paginate::<serde_json::Value>(vec![], cursor, limit).to_string();
 		}
 		let entries: Vec<serde_json::Value> = std::fs::read_dir(&log_dir)
 			.into_iter()
@@ -527,7 +611,7 @@ impl WikiService {
 			.filter_map(|e| std::fs::read_to_string(e.path()).ok())
 			.filter_map(|s| serde_json::from_str(&s).ok())
 			.collect();
-		to_json(&entries)
+		paginate(entries, cursor, limit).to_string()
 	}
 
 	#[tool(description = "Extract text and assets from PDFs (batch). Args: paths")]
@@ -580,14 +664,16 @@ impl WikiService {
 		serde_json::json!({ "extracted": results.len(), "results": results }).to_string()
 	}
 
-	#[tool(description = "List all open questions for answering")]
-	fn list_open_questions(&self) -> String {
+	#[tool(description = "List all open (unresolved) questions. Returns paginated previews. Args: limit? (default 25), cursor? (default 0)")]
+	fn list_open_questions(&self, params: Parameters<ListLogParams>) -> String {
+		let ListLogParams { limit, cursor } = params.0;
 		match store::list_documents(self.root(), "questions") {
 			Ok(docs) => {
-				let open: Vec<_> = docs.into_iter()
+				let open: Vec<serde_json::Value> = docs.iter()
 					.filter(|d| !d.tags.iter().any(|t| t == "resolved"))
+					.map(doc_preview)
 					.collect();
-				to_json(&open)
+				paginate(open, cursor, limit).to_string()
 			}
 			Err(e) => json_err(e),
 		}
@@ -601,8 +687,7 @@ impl WikiService {
 			Err(e) => return json_err(e),
 		};
 		let mut candidates = Vec::new();
-		let index_path = self.root().join(".search");
-		if let Ok(index) = search::create_index(&index_path) {
+		if let Ok(index) = cache::search_index(self.root()) {
 			if let Ok(results) = search::search_documents(&index, &question.content) {
 				for doc in results.iter().take(5) {
 					let doc_type = doc.tags.first().map(|s| s.as_str()).unwrap_or("unknown");

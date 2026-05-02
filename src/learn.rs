@@ -1,5 +1,7 @@
+use crate::cache;
 use crate::io::fnv64;
 use crate::{classifier, http, search, store};
+use std::sync::Arc;
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
@@ -59,7 +61,10 @@ fn read_entity_meta(root: &Path, id: &str) -> Option<(Vec<String>, String, Optio
 	None
 }
 
-pub async fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
+pub async fn build_entity_index(root: &Path) -> Result<Arc<Vec<EntityRef>>> {
+	if let Some(cached) = cache::entity_index_get() {
+		return Ok(cached);
+	}
 	let entities = store::list_documents(root, "entities")?;
 	let mut refs: Vec<EntityRef> = Vec::new();
 	let mut texts: Vec<String> = Vec::new();
@@ -83,7 +88,7 @@ pub async fn build_entity_index(root: &Path) -> Result<Vec<EntityRef>> {
 			}
 		}
 	}
-	Ok(refs)
+	Ok(cache::entity_index_set(refs))
 }
 
 fn protected_re() -> &'static [Regex] {
@@ -183,7 +188,7 @@ pub async fn find_near_duplicate_entity(root: &Path, title: &str, content: &str)
 	let entities = build_entity_index(root).await?;
 	let title_lc = title.trim().to_lowercase();
 
-	for e in &entities {
+	for e in entities.iter() {
 		if e.title.to_lowercase() == title_lc
 			|| e.aliases.iter().any(|a| a.to_lowercase() == title_lc)
 		{
@@ -194,7 +199,7 @@ pub async fn find_near_duplicate_entity(root: &Path, title: &str, content: &str)
 	if !content.is_empty() {
 		if let Ok(embs) = http::embed_batch(&[content.to_string()]).await {
 			if let Some(content_emb) = embs.into_iter().next() {
-				for e in &entities {
+				for e in entities.iter() {
 					if let Some(ev) = &e.body_embedding {
 						if classifier::cosine(&content_emb, ev) >= threshold {
 							return Ok(Some(e.clone()));
@@ -406,7 +411,7 @@ pub async fn link_doc_internal(
 
 pub async fn link_doc(root: &Path, doc_type: &str, id: &str, dry_run: bool) -> Result<serde_json::Value> {
 	let entities = build_entity_index(root).await?;
-	link_doc_internal(root, doc_type, id, &entities, dry_run).await
+	link_doc_internal(root, doc_type, id, entities.as_slice(), dry_run).await
 }
 
 pub async fn run_pass(
@@ -440,7 +445,7 @@ pub async fn run_pass(
 	let mut merges_total = 0u64;
 	let mut details = Vec::new();
 	for (dt, id) in &targets {
-		match link_doc_internal(root, dt, id, &entities, dry_run).await {
+		match link_doc_internal(root, dt, id, entities.as_slice(), dry_run).await {
 			Ok(v) => {
 				if v["modified"].as_bool().unwrap_or(false) {
 					docs_modified += 1;
@@ -472,13 +477,12 @@ pub async fn run_pass(
 	write_pass_log(root, "learn", &report)?;
 
 	if !dry_run {
-		let index_path = root.join(".search");
-		if let Ok(index) = search::create_index(&index_path) {
-			for (dt, id) in &targets {
-				if let Ok(doc) = store::get_document(root, dt, id) {
-					let _ = search::index_document(&index, &doc);
-				}
-			}
+		if let Ok(index) = cache::search_index(root) {
+			let docs: Vec<store::Document> = targets
+				.iter()
+				.filter_map(|(dt, id)| store::get_document(root, dt, id).ok())
+				.collect();
+			let _ = search::index_documents(&index, &docs);
 		}
 	}
 
@@ -751,7 +755,7 @@ pub async fn run_feedback_pass(root: &Path, limit: usize, dry_run: bool) -> Resu
 				continue;
 			}
 		};
-		match process_entry(root, &entry, &entities, dry_run).await {
+		match process_entry(root, &entry, entities.as_slice(), dry_run).await {
 			Ok(v) => details.push(v),
 			Err(e) => details.push(serde_json::json!({"error": e.to_string()})),
 		}

@@ -1,3 +1,4 @@
+use crate::cache;
 use crate::io::write_atomic_str;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -247,6 +248,7 @@ pub fn create_document(
 	let file_path = unique_path(&dir, &slug);
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, content))?;
 	let _ = update_link_index(root);
+	cache::on_doc_changed(&id, doc_type);
 
 	Ok(Document {
 		id,
@@ -312,6 +314,7 @@ pub fn update_document(
 
 	let fm_str = serde_yaml::to_string(&fm)?;
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
+	cache::on_doc_changed(id, doc_type);
 
 	Ok(doc_from_fm(&fm, body, id))
 }
@@ -342,6 +345,7 @@ pub fn add_alias_to_entity(root: &Path, entity_id: &str, alias: &str) -> anyhow:
 	}
 	let fm_str = serde_yaml::to_string(&fm)?;
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm_str, body))?;
+	cache::on_doc_changed(entity_id, "entities");
 	Ok(true)
 }
 
@@ -396,6 +400,7 @@ pub fn create_reason(
 	let file_path = unique_path(&dir, &slug);
 	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, body))?;
 	let _ = update_link_index(root);
+	cache::on_doc_changed(&id, "reasons");
 
 	let mut tags = vec!["reason".to_string()];
 	if let Some(p) = purpose {
@@ -419,6 +424,10 @@ pub fn delete_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<
 	let file_path = find_document_path_by_id(&dir, id)?;
 	std::fs::remove_file(&file_path)?;
 	let _ = update_link_index(root);
+	cache::on_doc_deleted(id, doc_type);
+	if let Ok(idx) = cache::search_index(root) {
+		let _ = crate::search::delete_by_id(&idx, id);
+	}
 	Ok(())
 }
 

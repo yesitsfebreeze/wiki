@@ -70,6 +70,23 @@ pub fn read_vec_f32(path: &Path, expected_dim: Option<usize>) -> Result<Vec<f32>
 	Ok(out)
 }
 
+/// Truncate `s` to at most `max` chars (not bytes), appending `…` if cut.
+/// Char-boundary safe — never panics on multi-byte input.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+	let mut count = 0;
+	let mut end = 0;
+	for (i, _) in s.char_indices() {
+		if count == max { end = i; break; }
+		count += 1;
+		end = s.len();
+	}
+	if count < max || end == s.len() {
+		s.to_string()
+	} else {
+		format!("{}…", &s[..end])
+	}
+}
+
 /// FNV-1a 64-bit hash. Stable across runs, used for content fingerprints.
 pub fn fnv64(s: &str) -> u64 {
 	let mut h: u64 = 0xcbf29ce484222325;
