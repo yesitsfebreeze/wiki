@@ -7,7 +7,8 @@ Single retrieval entry point. Returns hits with full bodies, reasons, and 1-hop 
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `query` | string | (required) | Natural-language query, tag, or FTS expression depending on `mode`. |
-| `mode` | enum | `"smart"` | `"smart"` (hybrid conclusion-first), `"fts"` (raw BM25), `"tag"` (exact tag match), `"qa"` (filter to question→conclusion edges). |
+| `mode` | enum | `"smart"` | `"smart"` (hybrid conclusion-first), `"fts"` (raw BM25), `"tag"` (exact tag match), `"qa"` (filter to question→conclusion edges), `"list"` (paginate all docs of a given type). |
+| `doc_type` | string | — | Required when `mode="list"`. One of: `thoughts\|entities\|questions\|conclusions\|reasons`. |
 | `k` | int | 5 | Max hits returned. |
 | `include` | object | `{bodies: true, reasons: true, edges_depth: 1}` | Toggle inline payload. Set `edges_depth: 0` to skip edges. |
 
@@ -42,7 +43,7 @@ Single retrieval entry point. Returns hits with full bodies, reasons, and 1-hop 
 
 ## Notes
 
-- Replaces `query`, `search_fulltext`, `search_by_tag`, `find_answers`, `search_reasons_for`, `suggest_conclusion`.
+- Replaces `query`, `search_fulltext`, `search_by_tag`, `find_answers`, `search_reasons_for`, `suggest_conclusion`, and the old `list` tool (via `mode="list"`).
 - `mode="qa"` is the new equivalent of `find_answers`.
 - `suggested_conclusions` only present when an open question hits the converging-reasons threshold; review then call `ingest({type:"conclusion", body})` to materialize.
 - For deeper traversal of a single doc, use `get` with `depth > 1`.

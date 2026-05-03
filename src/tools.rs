@@ -20,28 +20,9 @@ struct DocsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct CreatePurposeParams {
-	tag: String,
-	title: String,
-	description: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct PurposeTagParams {
-	tag: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct DocRefParams {
 	doc_type: String,
 	id: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct DocTypeParams {
-	doc_type: String,
-	limit: Option<u64>,
-	cursor: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -70,17 +51,44 @@ struct SuggestConclusionParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct CodeIndexParams {
-	src_dir: String,
-	ext: Option<String>,
+struct PurposeParams {
+	/// list | create | delete | reembed
+	action: String,
+	tag: Option<String>,
+	title: Option<String>,
+	description: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct CodeSearchParams {
-	query: String,
+struct CodeParams {
+	/// index | search | read | refs | validate
+	action: String,
+	// index
+	src_dir: Option<String>,
+	ext: Option<String>,
+	// search
+	query: Option<String>,
 	regex: Option<bool>,
 	scope: Option<String>,
+	// read
+	path: Option<String>,
+	symbol: Option<String>,
+	granularity: Option<String>,
+	// refs
+	direction: Option<String>,
+	depth: Option<u64>,
+	// validate
+	fix: Option<bool>,
+	// shared pagination
 	cursor: Option<u64>,
+	limit: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AdminParams {
+	/// recompute | sanitize | migrate | feedback
+	action: String,
+	dry_run: Option<bool>,
 	limit: Option<u64>,
 }
 
@@ -101,19 +109,13 @@ struct CodeFindLargeParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct CodeValidateParams {
-	fix: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct LearnPassParams {
 	limit: Option<u64>,
 	purpose: Option<String>,
 	dry_run: Option<bool>,
 	qa: Option<bool>,
 	force: Option<bool>,
-	/// Enable LLM question raising during the pass. Default `false` (background
-	/// passes stay quiet). Flip to `true` for deliberate `/learn` runs.
+	/// Enable LLM question raising during the pass. Default `false`.
 	raise_questions: Option<bool>,
 	/// Cosine ≥ this → `Answers` edge + mark question resolved. Default `0.8`.
 	answer_threshold: Option<f32>,
@@ -130,24 +132,16 @@ struct LearnPassParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct LearnFeedbackParams {
-	limit: Option<u64>,
-	dry_run: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct DryRunParams {
-	dry_run: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 struct SearchParams {
 	query: String,
+	/// smart | fts | tag | qa | list
 	mode: Option<String>,
 	k: Option<u64>,
 	include_bodies: Option<bool>,
 	include_reasons: Option<bool>,
 	edges_depth: Option<u64>,
+	/// Required when mode="list". One of: thoughts|entities|questions|conclusions|reasons.
+	doc_type: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -168,20 +162,6 @@ struct IngestParams {
 	from_id: Option<String>,
 	to_id: Option<String>,
 	reason_kind: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CodeReadParams {
-	path: Option<String>,
-	symbol: Option<String>,
-	granularity: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CodeRefsParams {
-	symbol: String,
-	direction: Option<String>,
-	depth: Option<u64>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -519,53 +499,42 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "List all configured purposes. Returns [{tag, title, description}]. Docs: docs(\"list_purposes\"). Zero args.")]
-	fn list_purposes(&self) -> String {
-		match store::list_purposes(self.root()) {
-			Ok(p) => to_json(&p),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Create a new purpose bucket. description drives embedding classification — write clearly. Docs: docs(\"create_purpose\"). Args: tag, title, description.")]
-	fn create_purpose(&self, params: Parameters<CreatePurposeParams>) -> String {
-		let CreatePurposeParams { tag, title, description } = params.0;
-		match store::create_purpose(self.root(), &tag, &title, &description) {
-			Ok(p) => to_json(&p),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Delete a purpose by tag. Tagged docs are NOT deleted. Docs: docs(\"delete_purpose\"). Args: tag.")]
-	fn delete_purpose(&self, params: Parameters<PurposeTagParams>) -> String {
-		match store::delete_purpose(self.root(), &params.0.tag) {
-			Ok(_) => format!("Purpose '{}' deleted", params.0.tag),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Rebuild all purpose .vec embedding files. Run after editing purpose descriptions or upgrading embedding model. Docs: docs(\"reembed_purposes\"). Zero args.")]
-	async fn reembed_purposes(&self) -> String {
-		if let Ok(purposes) = store::list_purposes(self.root()) {
-			for p in &purposes {
-				let _ = std::fs::remove_file(p.path.with_extension("vec"));
-			}
-		}
-		match classifier::ensure_purpose_embeddings(self.root()).await {
-			Ok(v) => format!("Re-embedded {} purposes", v.len()),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Paginate docs by type. Docs: docs(\"list\"). Args: doc_type (thoughts|entities|questions|conclusions|reasons), limit?, cursor?.")]
-	fn list(&self, params: Parameters<DocTypeParams>) -> String {
-		let DocTypeParams { doc_type, limit, cursor } = params.0;
-		match store::list_documents(self.root(), &doc_type) {
-			Ok(docs) => {
-				let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
-				paginate(previews, cursor, limit).to_string()
-			}
-			Err(e) => json_err(e),
+	#[tool(description = "Manage purposes. action: list | create | delete | reembed. Docs: docs(\"purpose\"). Args: action, tag?, title?, description?.")]
+	async fn purpose(&self, params: Parameters<PurposeParams>) -> String {
+		let PurposeParams { action, tag, title, description } = params.0;
+		match action.as_str() {
+			"list" => match store::list_purposes(self.root()) {
+				Ok(p) => to_json(&p),
+				Err(e) => json_err(e),
+			},
+			"create" => {
+				let (Some(tag), Some(title), Some(description)) = (tag, title, description) else {
+					return json_err("create requires tag, title, description");
+				};
+				match store::create_purpose(self.root(), &tag, &title, &description) {
+					Ok(p) => to_json(&p),
+					Err(e) => json_err(e),
+				}
+			},
+			"delete" => {
+				let Some(tag) = tag else { return json_err("delete requires tag"); };
+				match store::delete_purpose(self.root(), &tag) {
+					Ok(_) => format!("Purpose '{}' deleted", tag),
+					Err(e) => json_err(e),
+				}
+			},
+			"reembed" => {
+				if let Ok(purposes) = store::list_purposes(self.root()) {
+					for p in &purposes {
+						let _ = std::fs::remove_file(p.path.with_extension("vec"));
+					}
+				}
+				match classifier::ensure_purpose_embeddings(self.root()).await {
+					Ok(v) => format!("Re-embedded {} purposes", v.len()),
+					Err(e) => json_err(e),
+				}
+			},
+			other => json_err(format!("Unknown action: {} (list|create|delete|reembed)", other)),
 		}
 	}
 
@@ -679,27 +648,75 @@ impl WikiService {
 		}).to_string()
 	}
 
-	// ── Code tools ──────────────────────────────────────────────────────────
+	// ── Code tool ───────────────────────────────────────────────────────────
 
-	#[tool(description = "Index source code via tree-sitter: structure outlines + fn bodies → .wiki/code/. Docs: docs(\"code_index\"). Args: src_dir, ext? (default rs).")]
-	fn code_index(&self, params: Parameters<CodeIndexParams>) -> String {
-		let CodeIndexParams { src_dir, ext } = params.0;
-		let ext = ext.unwrap_or_else(|| "rs".to_string());
-		match code::index_dir(&PathBuf::from(src_dir), &ext) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
-
-	#[tool(description = "Grep indexed fn bodies + skeletons. Symbol|regex|semantic. Docs: docs(\"code_search\"). Args: query, kind?, lang?, k?.")]
-	fn code_search(&self, params: Parameters<CodeSearchParams>) -> String {
-		let CodeSearchParams { query, regex, scope, cursor, limit } = params.0;
-		let scope = scope.unwrap_or_else(|| "body".to_string());
-		let cursor = cursor.unwrap_or(0) as usize;
-		let limit = limit.map(|n| n as usize).unwrap_or(100);
-		match code::search_bodies(&query, regex.unwrap_or(false), &scope, cursor, limit) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
+	#[tool(description = "Read docs(\"code\") first. Code index ops. action: index | search | read | refs | validate. Docs: docs(\"code\"). Args: action, src_dir?, ext?, query?, regex?, scope?, path?, symbol?, granularity?, direction?, depth?, fix?, cursor?, limit?.")]
+	fn code(&self, params: Parameters<CodeParams>) -> String {
+		let CodeParams { action, src_dir, ext, query, regex, scope, path, symbol, granularity, direction, depth, fix, cursor, limit } = params.0;
+		match action.as_str() {
+			"index" => {
+				let Some(src_dir) = src_dir else { return json_err("index requires src_dir"); };
+				let ext = ext.unwrap_or_else(|| "rs".to_string());
+				match code::index_dir(&PathBuf::from(src_dir), &ext) {
+					Ok(s) => s,
+					Err(e) => format!("Error: {e}"),
+				}
+			},
+			"search" => {
+				let Some(query) = query else { return json_err("search requires query"); };
+				let scope = scope.unwrap_or_else(|| "body".to_string());
+				let cursor = cursor.unwrap_or(0) as usize;
+				let limit = limit.map(|n| n as usize).unwrap_or(100);
+				match code::search_bodies(&query, regex.unwrap_or(false), &scope, cursor, limit) {
+					Ok(s) => s,
+					Err(e) => format!("Error: {e}"),
+				}
+			},
+			"read" => {
+				let g = granularity.unwrap_or_else(|| "outline".to_string());
+				let p = match path.as_deref().or(symbol.as_deref()) {
+					Some(s) => PathBuf::from(s),
+					None => return json_err("read requires path or symbol"),
+				};
+				let result = match g.as_str() {
+					"outline" => code::outline(&p),
+					"file" => {
+						let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("rs").to_string();
+						code::open_source(&p, &ext)
+					},
+					"fn" => code::read_body(&p, 1, None),
+					other => return json_err(format!("Unknown granularity: {} (outline|file|fn)", other)),
+				};
+				match result {
+					Ok(s) => s,
+					Err(e) => json_err(e),
+				}
+			},
+			"refs" => {
+				let Some(symbol) = symbol.or(path) else { return json_err("refs requires symbol"); };
+				let dir = direction.unwrap_or_else(|| "both".to_string());
+				let (p, resolution) = resolve_symbol_path(&symbol);
+				let mut out = serde_json::Map::new();
+				out.insert("resolved_path".into(), serde_json::json!(p.display().to_string().replace('\\', "/")));
+				out.insert("resolution".into(), serde_json::json!(resolution));
+				match code::ref_graph(&p, &dir) {
+					Ok(s) => { out.insert("ref_graph".into(), serde_json::json!(s)); },
+					Err(e) => return json_err(e),
+				}
+				let d = depth.unwrap_or(1);
+				if d > 1 {
+					match code::fn_tree(&p, d as usize) {
+						Ok(s) => { out.insert("fn_tree".into(), serde_json::json!(s)); },
+						Err(e) => { out.insert("fn_tree_error".into(), serde_json::json!(e.to_string())); },
+					}
+				}
+				serde_json::Value::Object(out).to_string()
+			},
+			"validate" => match code::validate(fix.unwrap_or(false)) {
+				Ok(s) => s,
+				Err(e) => format!("Error: {e}"),
+			},
+			other => json_err(format!("Unknown action: {} (index|search|read|refs|validate)", other)),
 		}
 	}
 
@@ -732,13 +749,6 @@ impl WikiService {
 		code::list_languages()
 	}
 
-	#[tool(description = "Validate code index: detect orphans, dangling refs, missing bodies. Docs: docs(\"code_validate\"). Args: fix? (repair safe issues).")]
-	fn code_validate(&self, params: Parameters<CodeValidateParams>) -> String {
-		match code::validate(params.0.fix.unwrap_or(false)) {
-			Ok(s) => s,
-			Err(e) => format!("Error: {e}"),
-		}
-	}
 
 	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?.")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
@@ -764,38 +774,53 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Delete legacy template-shaped questions (pre-filter era). Skips any with inbound Answers edges. Docs: docs(\"migrate_templated_questions\"). Args: dry_run?.")]
-	fn migrate_templated_questions(&self, params: Parameters<DryRunParams>) -> String {
-		match learn::migrate_templated_questions(self.root(), params.0.dry_run.unwrap_or(false)) {
-			Ok(rep) => to_json(&rep),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Recompute pagerank node weights. Writes node_size to frontmatter. Docs: docs(\"recompute_weights\"). Args: dry_run?.")]
-	fn recompute_weights(&self, params: Parameters<DryRunParams>) -> String {
-		match crate::weight::run_cli(self.root(), params.0.dry_run.unwrap_or(false)) {
-			Ok(n) => serde_json::json!({ "recomputed": n, "dry_run": params.0.dry_run.unwrap_or(false) }).to_string(),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Replay .wiki/feedback.jsonl → emit typed edges from picked/dropped candidates. Docs: docs(\"learn_from_feedback\"). Args: limit?, dry_run?.")]
-	async fn learn_from_feedback(&self, params: Parameters<LearnFeedbackParams>) -> String {
-		let LearnFeedbackParams { limit, dry_run } = params.0;
-		let limit = limit.map(|n| n as usize).unwrap_or(25);
-		match learn::run_feedback_pass(self.root(), limit, dry_run.unwrap_or(false)).await {
-			Ok(v) => v.to_string(),
-			Err(e) => json_err(e),
+	#[tool(description = "Vault maintenance. action: recompute | sanitize | migrate | feedback. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
+	async fn admin(&self, params: Parameters<AdminParams>) -> String {
+		let AdminParams { action, dry_run, limit } = params.0;
+		let dry = dry_run.unwrap_or(false);
+		match action.as_str() {
+			"recompute" => match crate::weight::run_cli(self.root(), dry) {
+				Ok(n) => serde_json::json!({ "recomputed": n, "dry_run": dry }).to_string(),
+				Err(e) => json_err(e),
+			},
+			"sanitize" => match sanitize::sanitize_vault(self.root(), false) {
+				Ok(report) => to_json(&report),
+				Err(e) => json_err(e),
+			},
+			"migrate" => match learn::migrate_templated_questions(self.root(), dry) {
+				Ok(rep) => to_json(&rep),
+				Err(e) => json_err(e),
+			},
+			"feedback" => {
+				let limit = limit.map(|n| n as usize).unwrap_or(25);
+				match learn::run_feedback_pass(self.root(), limit, dry).await {
+					Ok(v) => v.to_string(),
+					Err(e) => json_err(e),
+				}
+			},
+			other => json_err(format!("Unknown action: {} (recompute|sanitize|migrate|feedback)", other)),
 		}
 	}
 
 	// ── New consolidated tools ──────────────────────────────────────────────
 
-	#[tool(description = "Read docs(\"search\") first. Hybrid knowledge search. mode: smart (conclusions-first) | fts (BM25) | tag | qa. Returns body + reasons + 1-hop edges inline. Args: query, mode?, k?, include_bodies?, include_reasons?, edges_depth?.")]
+	#[tool(description = "Read docs(\"search\") first. Hybrid knowledge search + doc listing. mode: smart (conclusions-first) | fts (BM25) | tag | qa | list (paginate by doc_type). Returns body + reasons + 1-hop edges inline. Args: query, mode?, k?, include_bodies?, include_reasons?, edges_depth?, doc_type?.")]
 	async fn search(&self, params: Parameters<SearchParams>) -> String {
-		let SearchParams { query, mode, k, include_bodies, include_reasons, edges_depth } = params.0;
+		let SearchParams { query, mode, k, include_bodies, include_reasons, edges_depth, doc_type } = params.0;
 		let mode = mode.unwrap_or_else(|| "smart".to_string());
+
+		// mode="list" — paginate all docs of a given type, no search needed
+		if mode == "list" {
+			let dt = doc_type.unwrap_or_else(|| query.clone());
+			return match store::list_documents(self.root(), &dt) {
+				Ok(docs) => {
+					let previews: Vec<serde_json::Value> = docs.iter().map(doc_preview).collect();
+					paginate(previews, None, k).to_string()
+				}
+				Err(e) => json_err(e),
+			};
+		}
+
 		let k = k.map(|n| n as usize).unwrap_or(5);
 		let want_bodies = include_bodies.unwrap_or(true);
 		let want_reasons = include_reasons.unwrap_or(true);
@@ -1058,58 +1083,6 @@ impl WikiService {
 		out.to_string()
 	}
 
-	#[tool(description = "Read indexed code. granularity: outline (symbol map) | file (full source) | fn (one fn body). Docs: docs(\"code_read\"). Args: path?, symbol?, granularity?.")]
-	fn code_read(&self, params: Parameters<CodeReadParams>) -> String {
-		let CodeReadParams { path, symbol, granularity } = params.0;
-		let g = granularity.unwrap_or_else(|| "outline".to_string());
-		let p = match path.as_deref().or(symbol.as_deref()) {
-			Some(s) => PathBuf::from(s),
-			None => return json_err("code_read requires `path` or `symbol`"),
-		};
-		let result = match g.as_str() {
-			"outline" => code::outline(&p),
-			"file" => {
-				let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("rs").to_string();
-				code::open_source(&p, &ext)
-			}
-			"fn" => code::read_body(&p, 1, None),
-			other => return json_err(format!("Unknown granularity: {} (outline|file|fn)", other)),
-		};
-		match result {
-			Ok(s) => s,
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Sanitize vault filenames + rewrite [[wikilinks]] + .md links vault-wide. Idempotent. Docs: docs(\"sanitize\"). Zero args.")]
-	fn sanitize(&self) -> String {
-		match sanitize::sanitize_vault(self.root(), false) {
-			Ok(report) => to_json(&report),
-			Err(e) => json_err(e),
-		}
-	}
-
-	#[tool(description = "Walk code reference graph. symbol: bare fn name, body path, or structure path. Docs: docs(\"code_refs\"). Args: symbol, direction? (in|out|both), depth?.")]
-	fn code_refs(&self, params: Parameters<CodeRefsParams>) -> String {
-		let CodeRefsParams { symbol, direction, depth } = params.0;
-		let dir = direction.unwrap_or_else(|| "both".to_string());
-		let (p, resolution) = resolve_symbol_path(&symbol);
-		let mut out = serde_json::Map::new();
-		out.insert("resolved_path".into(), serde_json::json!(p.display().to_string().replace('\\', "/")));
-		out.insert("resolution".into(), serde_json::json!(resolution));
-		match code::ref_graph(&p, &dir) {
-			Ok(s) => { out.insert("ref_graph".into(), serde_json::json!(s)); }
-			Err(e) => return json_err(e),
-		}
-		let d = depth.unwrap_or(1);
-		if d > 1 {
-			match code::fn_tree(&p, d as usize) {
-				Ok(s) => { out.insert("fn_tree".into(), serde_json::json!(s)); }
-				Err(e) => { out.insert("fn_tree_error".into(), serde_json::json!(e.to_string())); }
-			}
-		}
-		serde_json::Value::Object(out).to_string()
-	}
 }
 
 impl WikiService {
