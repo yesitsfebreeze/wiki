@@ -302,7 +302,9 @@ async fn run_stop_hook() -> anyhow::Result<()> {
         Err(_) => return emit_empty_hook(),
     };
     let _ = std::fs::remove_file(&pending_path);
-    if prompt.len() < 16 { return emit_empty_hook(); }
+    if !prompt.starts_with("\\?") { return emit_empty_hook(); }
+    let prompt = prompt.trim_start_matches("\\?").trim().to_string();
+    if prompt.len() < 4 { return emit_empty_hook(); }
 
     let pn = normalize_question(&prompt);
     if let Ok(existing) = store::list_documents(&wiki_path, "questions") {

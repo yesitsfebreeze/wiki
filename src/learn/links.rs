@@ -184,6 +184,54 @@ fn move_to_crosstopic(root: &Path, doc_type: &str, id: &str) -> Result<bool> {
 	Ok(true)
 }
 
+/// Move a resolved question to `questions/answered/<purpose>/<stem>.md`,
+/// preserving the frontmatter `id` so all doc lookups remain valid.
+/// Rewrites inbound wikilinks. No-op if already under `answered/`.
+pub fn move_to_answered(root: &Path, question_id: &str) -> Result<bool> {
+	let dir = root.join("questions");
+	let old_path = store::find_document_path_by_id(&dir, question_id)?;
+
+	// Guard: already under answered/ anywhere in path
+	if old_path.components().any(|c| c.as_os_str() == "answered") {
+		return Ok(false);
+	}
+
+	let parent_name = old_path
+		.parent()
+		.and_then(|p| p.file_name())
+		.and_then(|s| s.to_str())
+		.unwrap_or("")
+		.to_string();
+	let stem = old_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.ok_or_else(|| anyhow::anyhow!("missing file stem"))?
+		.to_string();
+
+	let new_dir = dir.join("answered").join(&parent_name);
+	std::fs::create_dir_all(&new_dir)?;
+	let mut new_path = new_dir.join(format!("{}.md", stem));
+	let mut suffix = 1;
+	while new_path.exists() {
+		new_path = new_dir.join(format!("{}-{}.md", stem, suffix));
+		suffix += 1;
+	}
+	let new_stem = new_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.unwrap_or(&stem)
+		.to_string();
+
+	std::fs::rename(&old_path, &new_path)?;
+
+	if !parent_name.is_empty() {
+		let old_target = format!("questions/{}/{}", parent_name, stem);
+		let new_target = format!("questions/answered/{}/{}", parent_name, new_stem);
+		let _ = rewrite_inbound_links(root, &old_target, &new_target);
+	}
+	Ok(true)
+}
+
 pub(crate) async fn link_doc_internal(
 	root: &Path,
 	doc_type: &str,

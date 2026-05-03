@@ -609,10 +609,15 @@ impl WikiService {
 				doc.tags.retain(|t| !VALID.contains(&t.as_str()));
 				doc.tags.push(status.clone());
 				match store::update_document(self.root(), "questions", &question_id, None, Some(doc.tags.clone())) {
-					Ok(_) => serde_json::json!({
-						"question_id": question_id,
-						"status": status,
-					}).to_string(),
+					Ok(_) => {
+						if status == "resolved" {
+							let _ = learn::move_to_answered(self.root(), &question_id);
+						}
+						serde_json::json!({
+							"question_id": question_id,
+							"status": status,
+						}).to_string()
+					}
 					Err(e) => json_err(e),
 				}
 			}

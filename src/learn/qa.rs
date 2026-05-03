@@ -160,6 +160,7 @@ async fn qa_for_doc(
 				if !q.tags.iter().any(|t| t == "resolved") {
 					q.tags.push("resolved".to_string());
 					let _ = store::update_document(root, "questions", &qid, None, Some(q.tags));
+					let _ = super::links::move_to_answered(root, &qid);
 				}
 			}
 			if *llm_budget == 0 { continue; }
@@ -255,6 +256,10 @@ pub async fn run_pass(
 
 		if dry_run {
 			continue;
+		}
+
+		if let Ok(doc) = store::get_document(root, dt, id) {
+			super::code_links::enrich_with_code_refs(root, dt, &doc);
 		}
 
 		// Connect-step: graph densification independent of the question loop.
