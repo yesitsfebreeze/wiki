@@ -43,6 +43,16 @@
 						"command": "wiki code-read-hook"
 					}
 				]
+			},
+			{
+				"matcher": "mcp__plugin_wiki_wiki__.*|mcp__wiki__.*",
+				"hooks": [
+					{
+						"type": "command",
+						"timeout": 5,
+						"command": "echo '{\"systemMessage\":\"[Wiki used]\"}'"
+					}
+				]
 			}
 		],
 		"PostToolUse": [
