@@ -47,7 +47,11 @@ pub fn wiki_root() -> PathBuf {
 	if p.is_absolute() {
 		p
 	} else {
-		std::env::current_dir().ok().map(|d| d.join(&p)).unwrap_or(p)
+		std::env::var("CLAUDE_PROJECT_DIR")
+			.ok()
+			.map(|d| PathBuf::from(d).join(&p))
+			.or_else(|| std::env::current_dir().ok().map(|d| d.join(&p)))
+			.unwrap_or(p)
 	}
 }
 

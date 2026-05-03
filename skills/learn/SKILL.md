@@ -1,6 +1,6 @@
 ---
 name: learn
-description: Single entry point for the wiki — ingest raw sources, link/dedupe, raise questions, cross-reference, answer, promote resolved questions to conclusions, and query via conclusions-first traversal. Replaces the old `/wiki` skill. Use whenever ingesting, querying, or maintaining the persistent Obsidian-vault knowledge base.
+description: Trigger the wiki `learn_pass` MCP tool to run a sensemaker cycle — link/dedupe, raise questions, cross-reference, answer, promote resolved questions to conclusions. Use when the user invokes `/learn`, asks to densify the wiki, force a learn pass, or surface open questions and conclusions.
 tags:
   - skill
   - wiki
@@ -9,9 +9,15 @@ tags:
   - learning
 ---
 
-# Learn — full wiki lifecycle
+# Learn — force a wiki sensemaker pass
 
-`/learn` is the **only** wiki skill. Covers ingest → link → raise questions → cross-reference → answer → promote → query. Single Obsidian vault at `.wiki/`. Topics separated by **purpose tags**, not folders.
+`/learn` triggers the `learn_pass` MCP tool. Runs the random-walk sensemaker: link/dedupe → connect → raise questions → answer → promote resolved questions to conclusions. Other wiki skills (e.g. `/ingest`, `/wiki`, `/reindex`) cover their own slices of the lifecycle — this one is the densifier.
+
+## Trigger
+
+Call `learn_pass({force: true, raise_questions: true})` immediately on invocation. Then summarize: edges added, questions raised, conclusions promoted. Surface open questions via `list_open_questions` if the pass produced new ones.
+
+Single Obsidian vault at `.wiki/`. Topics separated by **purpose tags**, not folders.
 
 The MCP tool surface was consolidated to ~13 tools. Most loops now finish in 1–2 calls because invariants (auto-link, auto-mark-answered, auto-suggest-conclusion, lazy reindex) run server-side. Read `docs/concepts/ingest_flow.md` for vocab; read `docs/tools/<name>.md` for any tool you call.
 
