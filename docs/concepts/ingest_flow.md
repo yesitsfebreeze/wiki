@@ -98,7 +98,7 @@ Only create when an entity has linked reasons + ≥2 resolved questions. Use `su
 1. `list_open_questions()` — all questions not marked resolved
 2. `find_answers({question_id})` — fulltext-search candidates with suggested reason kinds
 3. For each candidate that answers: `ingest_reason({from_id: question_id, to_id: candidate_id, kind: "Answers", body})`
-4. `mark_question({question_id, status: "resolved"|"unanswerable"|"partial_answer"})`
+4. `mark_question({question_id, status: "answered"|"dropped"})`
 
 ## Cross-purpose queries
 

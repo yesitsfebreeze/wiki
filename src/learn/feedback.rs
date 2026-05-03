@@ -1,35 +1,59 @@
-//! Feedback-driven learning pass: walks `feedback.jsonl`, asks an LLM what to
-//! do per entry, and applies the decision (create question, link picks, etc.).
+//! Feedback-driven learning pass: walks `feedback.jsonl`, derives a decision
+//! deterministically from the feedback entry, and applies it (create question,
+//! link picks, etc.).  No LLM call; resolution is left to the QA pass which
+//! can measure cosine similarity against actual answer candidates.
 
 use super::infra::{
 	allowed_kind, build_entity_index, find_question_by_hash, fnv_question_id, read_cursor,
-	write_cursor, write_pass_log, EntityRef, FeedbackEntry, LlmDecision,
+	write_cursor, write_pass_log, EntityRef, FeedbackEntry, LlmDecision, LlmEdge,
 };
 use super::links::link_doc_internal;
-use crate::{http, store};
+use crate::store;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
-async fn decide_via_llm(entry: &FeedbackEntry, picks_ctx: &str) -> Result<LlmDecision> {
-	let sys = "You curate a knowledge wiki from search feedback. Given a user question and the \
-		documents picked as relevant (with reasons), decide: \
-		(a) is the question worth saving as a 'questions' doc? \
-		(b) for each picked doc, what reason kind connects question→doc and what is a 1-sentence \
-		body summarizing WHY it answers/supports/etc the question? \
-		Return JSON: {\"keep_question\":bool, \"question_title\":string|null, \
-		\"question_body\":string|null, \"purpose\":string|null, \"resolved\":bool, \
-		\"edges\":[{\"picked_id\":string, \"score\":0..1, \"kind\":\"Answers|Supports|Contradicts|Extends|Requires|References|Derives|Instances\", \"body\":string}]}. \
-		Set resolved=true only if at least one edge is a strong direct Answers (score>=0.8). \
-		Skip edges below score 0.3.";
-	let user = format!(
-		"Question: {}\nPurpose hint (tag_filter): {:?}\n\nPicks (id, search_reason, snippet):\n{}",
-		entry.question, entry.tag_filter, picks_ctx
-	);
-	let content = http::chat_json(sys, &user).await?;
-	let parsed: LlmDecision = serde_json::from_str(&content)
-		.map_err(|e| anyhow::anyhow!("decision parse: {} body: {}", e, content))?;
-	Ok(parsed)
+/// Derive a decision from the feedback entry without an LLM call.
+///
+/// - `keep_question`: always true (caller already skips empty-picks entries)
+/// - `purpose`: tag_filter from the original search, or "general"
+/// - `resolved`: false — the QA pass resolves questions via cosine threshold
+/// - `edges`: one "References" edge per picked doc; body is the search reason
+fn decide(entry: &FeedbackEntry, reason_map: &HashMap<&str, &str>) -> LlmDecision {
+	let purpose = entry
+		.tag_filter
+		.clone()
+		.unwrap_or_else(|| "general".to_string());
+
+	let edges = entry
+		.picked
+		.iter()
+		.map(|pid| {
+			let body = reason_map
+				.get(pid.as_str())
+				.copied()
+				.filter(|r| !r.is_empty())
+				.map(|r| r.to_string())
+				.unwrap_or_else(|| format!("Picked as relevant to: {}", entry.question));
+			LlmEdge {
+				picked_id: pid.clone(),
+				// 0.7: above the 0.3 edge floor, below the 0.8 "Answers" threshold
+				// so we never auto-mark resolved here.
+				score: 0.7,
+				kind: "References".to_string(),
+				body,
+			}
+		})
+		.collect();
+
+	LlmDecision {
+		keep_question: true,
+		question_title: Some(entry.question.clone()),
+		question_body: Some(entry.question.clone()),
+		purpose: Some(purpose),
+		answered: false,
+		edges,
+	}
 }
 
 async fn process_entry(
@@ -42,36 +66,24 @@ async fn process_entry(
 		return Ok(serde_json::json!({"skipped": "no picks"}));
 	}
 
-	let mut picks_ctx = String::new();
 	let reason_map: HashMap<&str, &str> = entry
 		.reasons
 		.iter()
 		.map(|(a, b)| (a.as_str(), b.as_str()))
 		.collect();
+
 	let mut found_any = false;
 	let mut linked_ids: Vec<String> = Vec::new();
 	for pid in &entry.picked {
-		let mut doc_lookup: Option<(String, store::Document)> = None;
+		let mut resolved_dt: Option<String> = None;
 		for dt in &["entities", "thoughts", "conclusions", "reasons", "questions"] {
-			if let Ok(d) = store::get_document(root, dt, pid) {
-				doc_lookup = Some(((*dt).to_string(), d));
+			if store::get_document(root, dt, pid).is_ok() {
+				resolved_dt = Some((*dt).to_string());
 				break;
 			}
 		}
-		let Some((dt, doc)) = doc_lookup else { continue };
+		let Some(dt) = resolved_dt else { continue };
 		found_any = true;
-		let snippet = if doc.content.len() > 400 {
-			let mut end = 400;
-			while !doc.content.is_char_boundary(end) && end > 0 { end -= 1; }
-			format!("{}…", &doc.content[..end])
-		} else {
-			doc.content.clone()
-		};
-		let r = reason_map.get(pid.as_str()).copied().unwrap_or("");
-		picks_ctx.push_str(&format!(
-			"- id={} type={} title={:?} reason={:?}\n  snippet={}\n",
-			pid, dt, doc.title, r, snippet
-		));
 		if !dry_run {
 			let _ = link_doc_internal(root, &dt, pid, entities, false).await;
 			linked_ids.push(pid.clone());
@@ -81,10 +93,7 @@ async fn process_entry(
 		return Ok(serde_json::json!({"skipped": "no picks resolved"}));
 	}
 
-	let decision = match decide_via_llm(entry, &picks_ctx).await {
-		Ok(d) => d,
-		Err(e) => return Ok(serde_json::json!({"error": e.to_string()})),
-	};
+	let decision = decide(entry, &reason_map);
 
 	let hash_id = fnv_question_id(&entry.question);
 	let mut question_id: Option<String> = find_question_by_hash(root, &hash_id);
@@ -96,8 +105,8 @@ async fn process_entry(
 		});
 		let body = decision.question_body.clone().unwrap_or_else(|| entry.question.clone());
 		let mut tags = vec!["question".to_string(), purpose.clone(), hash_id.clone()];
-		if decision.resolved {
-			tags.push("resolved".to_string());
+		if decision.answered {
+			tags.push("answered".to_string());
 		}
 		if let Ok(qdoc) = store::create_document(
 			root,
@@ -111,11 +120,11 @@ async fn process_entry(
 			question_id = Some(qdoc.id);
 			created_question = true;
 		}
-	} else if decision.resolved && !dry_run {
+	} else if decision.answered && !dry_run {
 		if let Some(qid) = &question_id {
 			if let Ok(mut q) = store::get_document(root, "questions", qid) {
-				if !q.tags.iter().any(|t| t == "resolved") {
-					q.tags.push("resolved".to_string());
+				if !q.tags.iter().any(|t| t == "answered") {
+					q.tags.push("answered".to_string());
 					let _ = store::update_document(root, "questions", qid, None, Some(q.tags.clone()));
 				}
 			}
@@ -137,7 +146,9 @@ async fn process_entry(
 					kind,
 					&edge.body,
 					decision.purpose.as_deref(),
-				).is_ok() {
+				)
+				.is_ok()
+				{
 					edges_created += 1;
 				}
 			}
@@ -148,7 +159,7 @@ async fn process_entry(
 		"question": entry.question,
 		"question_id": question_id,
 		"created_question": created_question,
-		"resolved": decision.resolved,
+		"answered": decision.answered,
 		"edges_created": edges_created,
 		"docs_relinked": linked_ids.len(),
 		"keep_question": decision.keep_question,

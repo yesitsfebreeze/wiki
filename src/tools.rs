@@ -588,7 +588,7 @@ impl WikiService {
 		match store::list_documents(self.root(), "questions") {
 			Ok(docs) => {
 				let open: Vec<serde_json::Value> = docs.iter()
-					.filter(|d| !d.tags.iter().any(|t| t == "resolved"))
+					.filter(|d| !d.tags.iter().any(|t| t == "answered" || t == "dropped"))
 					.map(doc_preview)
 					.collect();
 				paginate(open, cursor, limit).to_string()
@@ -597,10 +597,10 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Manually set question state. Override only — learn_pass auto-marks. Docs: docs(\"mark_question\"). Args: id, state (answered|unanswerable|partial).")]
+	#[tool(description = "Manually set question state. Override only — learn_pass auto-marks. Docs: docs(\"mark_question\"). Args: id, state (answered|dropped).")]
 	fn mark_question(&self, params: Parameters<MarkQuestionParams>) -> String {
 		let MarkQuestionParams { question_id, status } = params.0;
-		const VALID: &[&str] = &["resolved", "unanswerable", "partial_answer"];
+		const VALID: &[&str] = &["answered", "dropped"];
 		if !VALID.contains(&status.as_str()) {
 			return json_err(format!("Invalid status: {}", status));
 		}
@@ -610,8 +610,10 @@ impl WikiService {
 				doc.tags.push(status.clone());
 				match store::update_document(self.root(), "questions", &question_id, None, Some(doc.tags.clone())) {
 					Ok(_) => {
-						if status == "resolved" {
+						if status == "answered" {
 							let _ = learn::move_to_answered(self.root(), &question_id);
+						} else if status == "dropped" {
+							let _ = learn::move_to_dropped(self.root(), &question_id);
 						}
 						serde_json::json!({
 							"question_id": question_id,
@@ -638,17 +640,17 @@ impl WikiService {
 			.filter(|q| q.content.contains(&entity.title) || q.title.contains(&entity.title))
 			.cloned()
 			.collect();
-		let resolved_count = related.iter()
-			.filter(|q| q.tags.iter().any(|t| t == "resolved"))
+		let answered_count = related.iter()
+			.filter(|q| q.tags.iter().any(|t| t == "answered"))
 			.count();
 
-		let can_conclude = !reasons.is_empty() && resolved_count >= 2;
+		let can_conclude = !reasons.is_empty() && answered_count >= 2;
 		serde_json::json!({
 			"entity_id": entity_id,
 			"entity_title": entity.title,
 			"supporting_reasons": reasons.len(),
 			"related_questions": related.len(),
-			"resolved_questions": resolved_count,
+			"answered_questions": answered_count,
 			"can_conclude": can_conclude,
 		}).to_string()
 	}
@@ -1095,7 +1097,7 @@ impl WikiService {
 		const SIM_THRESHOLD: f32 = 0.85;
 		let questions = store::list_documents(self.root(), "questions").ok()?;
 		let open: Vec<store::Document> = questions.into_iter()
-			.filter(|q| !q.tags.iter().any(|t| t == "resolved" || t == "unanswerable"))
+			.filter(|q| !q.tags.iter().any(|t| t == "answered" || t == "dropped"))
 			.collect();
 		if open.is_empty() { return None; }
 		let body_emb = crate::http::embed_batch(&[body.to_string()]).await.ok()?.into_iter().next()?;
@@ -1112,13 +1114,13 @@ impl WikiService {
 		// Mark answered
 		let mut tags_opt = None;
 		if let Ok(mut q) = store::get_document(self.root(), "questions", &qid) {
-			q.tags.retain(|t| t != "resolved" && t != "unanswerable" && t != "partial_answer");
-			q.tags.push("resolved".to_string());
+			q.tags.retain(|t| t != "answered" && t != "dropped");
+			q.tags.push("answered".to_string());
 			tags_opt = Some(q.tags);
 		}
 		let _ = store::update_document(self.root(), "questions", &qid, None, tags_opt);
 		let _ = store::create_reason(self.root(), conclusion_id, &qid, "Answers", "auto-linked from ingest invariant", None);
-		Some(serde_json::json!({"question_id": qid, "score": score, "marked": "resolved"}))
+		Some(serde_json::json!({"question_id": qid, "score": score, "marked": "answered"}))
 	}
 
 	async fn try_match_existing_conclusions(&self, question_id: &str, body: &str) -> Option<serde_json::Value> {
@@ -1138,13 +1140,13 @@ impl WikiService {
 		let (cid, score) = best?;
 		let mut tags_opt = None;
 		if let Ok(mut q) = store::get_document(self.root(), "questions", question_id) {
-			q.tags.retain(|t| t != "resolved" && t != "unanswerable" && t != "partial_answer");
-			q.tags.push("resolved".to_string());
+			q.tags.retain(|t| t != "answered" && t != "dropped");
+			q.tags.push("answered".to_string());
 			tags_opt = Some(q.tags);
 		}
 		let _ = store::update_document(self.root(), "questions", question_id, None, tags_opt);
 		let _ = store::create_reason(self.root(), &cid, question_id, "Answers", "auto-linked from ingest invariant", None);
-		Some(serde_json::json!({"conclusion_id": cid, "score": score, "marked": "resolved"}))
+		Some(serde_json::json!({"conclusion_id": cid, "score": score, "marked": "answered"}))
 	}
 }
 

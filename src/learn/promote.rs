@@ -184,8 +184,8 @@ async fn cross_topic_emit_and_promote(
 	}
 
 	if let Ok(mut q) = store::get_document(root, "questions", question_id) {
-		if !q.tags.iter().any(|t| t == "resolved") {
-			q.tags.push("resolved".to_string());
+		if !q.tags.iter().any(|t| t == "answered") {
+			q.tags.push("answered".to_string());
 			let _ = store::update_document(root, "questions", question_id, None, Some(q.tags));
 		}
 	}
@@ -475,7 +475,7 @@ mod tests {
 		assert_eq!(n, 1, "one strong edge expected");
 
 		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
-		assert!(q.tags.iter().any(|t| t == "resolved"));
+		assert!(q.tags.iter().any(|t| t == "answered"));
 
 		let from_q = store::search_reasons_for(root, &qdoc.id, "from").unwrap();
 		assert!(

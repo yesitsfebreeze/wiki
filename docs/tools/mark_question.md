@@ -7,7 +7,7 @@ Manually transition a question's state. Mostly auto-driven by `ingest(type=concl
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `id` | string | (required) | Question doc id. |
-| `state` | enum | (required) | `"open"`, `"resolved"`, `"answered"`, `"dropped"`. |
+| `state` | enum | (required) | `"answered"`, `"dropped"`. |
 
 ## Returns
 

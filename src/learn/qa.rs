@@ -119,7 +119,7 @@ async fn qa_for_doc(
 	}
 	if let Ok(questions) = store::list_documents(root, "questions") {
 		for q in questions {
-			if q.tags.iter().any(|t| t == "resolved") { continue; }
+			if q.tags.iter().any(|t| t == "answered" || t == "dropped") { continue; }
 			if q_targets.iter().any(|(id, _, _)| id == &q.id) { continue; }
 			let linked = store::search_reasons_for(root, &q.id, "from")
 				.ok()
@@ -157,8 +157,8 @@ async fn qa_for_doc(
 		if got_answer {
 			answered += 1;
 			if let Ok(mut q) = store::get_document(root, "questions", &qid) {
-				if !q.tags.iter().any(|t| t == "resolved") {
-					q.tags.push("resolved".to_string());
+				if !q.tags.iter().any(|t| t == "answered") {
+					q.tags.push("answered".to_string());
 					let _ = store::update_document(root, "questions", &qid, None, Some(q.tags));
 					let _ = super::links::move_to_answered(root, &qid);
 				}
@@ -298,14 +298,15 @@ pub async fn run_pass(
 
 	let mut crosstopic_invoked = 0u64;
 	if qa && !dry_run {
-		let resolved: HashSet<String> = cache::tag_index_lookup(root, "resolved")
+		let answered: HashSet<String> = cache::tag_index_lookup(root, "answered")
 			.into_iter()
+			.chain(cache::tag_index_lookup(root, "dropped"))
 			.filter(|d| d.doc_type == "questions")
 			.map(|d| d.id)
 			.collect();
 		let candidates: Vec<String> = cache::tag_index_lookup(root, "question")
 			.into_iter()
-			.filter(|d| d.doc_type == "questions" && !resolved.contains(&d.id))
+			.filter(|d| d.doc_type == "questions" && !answered.contains(&d.id))
 			.map(|d| d.id)
 			.collect();
 		for qid in candidates {

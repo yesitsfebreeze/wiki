@@ -16,6 +16,7 @@ pub use infra::{EntityRef, PassConfig};
 pub use dedup::find_near_duplicate_entity;
 pub use links::link_doc;
 pub use links::move_to_answered;
+pub use links::move_to_dropped;
 pub use qa::run_pass;
 pub use feedback::run_feedback_pass;
 pub use migrate::migrate_templated_questions;

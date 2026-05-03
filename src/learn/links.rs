@@ -184,15 +184,12 @@ fn move_to_crosstopic(root: &Path, doc_type: &str, id: &str) -> Result<bool> {
 	Ok(true)
 }
 
-/// Move a resolved question to `questions/answered/<purpose>/<stem>.md`,
-/// preserving the frontmatter `id` so all doc lookups remain valid.
-/// Rewrites inbound wikilinks. No-op if already under `answered/`.
-pub fn move_to_answered(root: &Path, question_id: &str) -> Result<bool> {
+fn move_question_to(root: &Path, question_id: &str, subfolder: &str) -> Result<bool> {
 	let dir = root.join("questions");
 	let old_path = store::find_document_path_by_id(&dir, question_id)?;
 
-	// Guard: already under answered/ anywhere in path
-	if old_path.components().any(|c| c.as_os_str() == "answered") {
+	// Guard: already under a resolved subfolder (answered/ or dropped/)
+	if old_path.components().any(|c| c.as_os_str() == "answered" || c.as_os_str() == "dropped") {
 		return Ok(false);
 	}
 
@@ -208,7 +205,7 @@ pub fn move_to_answered(root: &Path, question_id: &str) -> Result<bool> {
 		.ok_or_else(|| anyhow::anyhow!("missing file stem"))?
 		.to_string();
 
-	let new_dir = dir.join("answered").join(&parent_name);
+	let new_dir = dir.join(subfolder).join(&parent_name);
 	std::fs::create_dir_all(&new_dir)?;
 	let mut new_path = new_dir.join(format!("{}.md", stem));
 	let mut suffix = 1;
@@ -226,10 +223,23 @@ pub fn move_to_answered(root: &Path, question_id: &str) -> Result<bool> {
 
 	if !parent_name.is_empty() {
 		let old_target = format!("questions/{}/{}", parent_name, stem);
-		let new_target = format!("questions/answered/{}/{}", parent_name, new_stem);
+		let new_target = format!("questions/{}/{}/{}", subfolder, parent_name, new_stem);
 		let _ = rewrite_inbound_links(root, &old_target, &new_target);
 	}
 	Ok(true)
+}
+
+/// Move an answered question to `questions/answered/<purpose>/<stem>.md`,
+/// preserving the frontmatter `id` so all doc lookups remain valid.
+/// Rewrites inbound wikilinks. No-op if already under a resolved subfolder.
+pub fn move_to_answered(root: &Path, question_id: &str) -> Result<bool> {
+	move_question_to(root, question_id, "answered")
+}
+
+/// Move a dropped question to `questions/dropped/<purpose>/<stem>.md`.
+/// Rewrites inbound wikilinks. No-op if already under a resolved subfolder.
+pub fn move_to_dropped(root: &Path, question_id: &str) -> Result<bool> {
+	move_question_to(root, question_id, "dropped")
 }
 
 pub(crate) async fn link_doc_internal(

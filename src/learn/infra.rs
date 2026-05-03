@@ -179,28 +179,21 @@ pub(crate) struct FeedbackEntry {
 	pub reasons: Vec<(String, String)>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub(crate) struct LlmEdge {
 	pub picked_id: String,
-	#[serde(default)]
 	pub score: f32,
 	pub kind: String,
 	pub body: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub(crate) struct LlmDecision {
-	#[serde(default)]
 	pub keep_question: bool,
-	#[serde(default)]
 	pub question_title: Option<String>,
-	#[serde(default)]
 	pub question_body: Option<String>,
-	#[serde(default)]
 	pub purpose: Option<String>,
-	#[serde(default)]
-	pub resolved: bool,
-	#[serde(default)]
+	pub answered: bool,
 	pub edges: Vec<LlmEdge>,
 }
 
