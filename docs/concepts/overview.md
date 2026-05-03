@@ -2,81 +2,56 @@
 
 Single Obsidian vault at `.wiki/`. Topical separation by **purpose tags**, not folders. Each doc: 1 type tag + 1 purpose tag.
 
+See root `overview.md` for the canonical version. This is a mirror for in-vault discoverability.
+
 ---
 
 ## 1. Ingest (raw → graph)
 
 ```
-ingest (raw data)
-   ↓
-purpose gate (cosine match against purpose descriptions; multi-purpose → parent + chunks + PartOf)
-   ↓
-thoughts (atomic claims, smallest body possible)
-   ↓
-entities (recurring concepts across 3+ thoughts)
-   ↓
-questions (open unknowns raised by content)
-   ↓
-conclusions (synthesized answers to resolved questions)
-   ↓
-reasons (typed edges between any nodes: Consolidates, Answers, Supports,
-         Contradicts, Extends, Requires, References, Derives, Instances, PartOf)
+ingest (raw data) → purpose gate → thoughts → entities → questions → conclusions → reasons
 ```
 
-Tools: `ingest_thought`, `ingest_entity`, `ingest_question`, `ingest_conclusion`, `ingest_reason`.
-Inbox: `.wiki/ingest/` — `/ingest` drains it, then triggers learn pass on new doc IDs.
+Ingest does NOT raise questions (drift prevention). Question raising lives in the `/learn` pass and search-miss path.
 
 ---
 
 ## 2. Learn (graph → connected graph)
 
-`learn_pass({limit, purpose, dry_run, qa})` walks `thoughts ∪ conclusions` and folds each through:
+Random-walk sensemaker. Sample N docs (weighted by inverse edge degree — orphans first), then per doc:
 
-```
-new/unlinked doc
-   ↓
-[1] link & dedupe
-       ├─ regex-find entity titles + aliases → rewrite as [[wikilinks]]
-       └─ paragraph cosine ≥ WIKI_DEDUPE_THRESHOLD → fold into entity, emit Consolidates
-   ↓
-[2] raise questions (LLM extracts ≤3 open questions; dedup via fnv_question_id)
-   ↓
-[3] cross-reference (query top-5 candidates per open question)
-   ↓
-[4] answer (LLM scores 0..1)
-       ├─ ≥0.8 → ingest_reason Answers, mark resolved
-       ├─ 0.3..0.8 → Supports, leave open
-       └─ <0.3 → skip
-   ↓
-[5] promote (resolved Q → ingest_conclusion + Derives + References per top edge)
-```
+1. **link & dedupe** — wikilink rewrite + paragraph-cosine fold into entities (Consolidates).
+2. **connect** — query top-K (default 5) semantic neighbors, LLM classify edge kind (Supports/Contradicts/Extends/Requires/References/Derives/Instances/PartOf), create edges ≥ `cfg.edge_threshold` (default 0.7).
+3. **raise** — only when `cfg.raise_questions=true` (off by default). LLM extracts ≤3 questions, template + semantic dedupe, purpose-cap backpressure.
+4. **interrogate** — for open questions touching the doc, score answers (≥0.8 → Answers + resolved; 0.3..0.8 → Supports).
+5. **promote** — resolved Q with strong Answers edge → conclusion (with merge-into-existing if cosine ≥ 0.92).
 
-Run after every ingest batch. Output dump: `.wiki/ingest_log/learn-<ts>.json`.
+**Invariant:** every run adds ≥1 edge or question or conclusion, else logs `invariant_violated: true`.
+
+Output dump: `.wiki/ingest_log/learn-<ts>.json`.
+
+### PassConfig knobs
+
+| Field | Default |
+|-------|---------|
+| `answer_threshold` | 0.8 |
+| `support_threshold` | 0.3 |
+| `edge_threshold` | 0.7 |
+| `connect_k` | 5 |
+| `raise_questions` | false |
+| `qa_max_per_pass` | 50 |
+| `conclusion_merge_threshold` | 0.92 |
 
 ---
 
 ## 3. Search (query → conclusions-first traversal)
 
-`query({question, tag?, k, top_n})`:
-
 ```
-query
-   ↓
-[1] search_fulltext restricted to type=conclusion → top-k entry points
-   ↓
-[2] for each conclusion:
-       walk search_reasons_for(conclusion.id, "from") depth-1, fanout-5
-       collect linked thoughts/entities/questions
-   ↓
-[3] zero conclusion hits? → fall back to full-vault hybrid (BM25 + cosine + RRF + MMR)
-   ↓
-[4] return:
-       ├─ conclusions (primary answer layer)
-       ├─ supporting docs (context)
-       └─ reason kinds (edge labels)
+query → [1] FTS over conclusions → top-k entry points
+      → [2] walk reasons depth-1, fanout-5
+      → [3] zero hits → hybrid fallback (BM25+cosine+RRF+MMR) + search-miss raise
+      → [4] return conclusions + supporting docs + edge labels
 ```
-
-Cite all walked IDs in answers. Durable insight discovered during search → `ingest_conclusion` to grow the entry-point layer.
 
 ---
 
@@ -85,5 +60,3 @@ Cite all walked IDs in answers. Durable insight discovered during search → `in
 ```
 ingest → learn → search → (insight) → ingest → ...
 ```
-
-Conclusion layer is the primary query surface. Empty conclusion layer = shallow search. Run learn often.

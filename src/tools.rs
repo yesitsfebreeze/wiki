@@ -112,10 +112,17 @@ struct LearnPassParams {
 	dry_run: Option<bool>,
 	qa: Option<bool>,
 	force: Option<bool>,
+	/// Enable LLM question raising during the pass. Default `false` (background
+	/// passes stay quiet). Flip to `true` for deliberate `/learn` runs.
+	raise_questions: Option<bool>,
 	/// Cosine ≥ this → `Answers` edge + mark question resolved. Default `0.8`.
 	answer_threshold: Option<f32>,
 	/// Cosine ≥ this and < `answer_threshold` → `Supports` edge. Default `0.3`.
 	support_threshold: Option<f32>,
+	/// Connect-step: emit typed edge for any LLM-scored neighbor ≥ this. Default `0.7`.
+	edge_threshold: Option<f32>,
+	/// Connect-step: number of semantic neighbors per doc. Default `5`.
+	connect_k: Option<u64>,
 	/// Hard cap on LLM calls per pass. Default `50`.
 	qa_max_per_pass: Option<u64>,
 	/// Merge into existing conclusion if cosine ≥ this. Default `0.92`.
@@ -125,6 +132,11 @@ struct LearnPassParams {
 #[derive(Deserialize, JsonSchema)]
 struct LearnFeedbackParams {
 	limit: Option<u64>,
+	dry_run: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DryRunParams {
 	dry_run: Option<bool>,
 }
 
@@ -507,6 +519,7 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "List all configured purposes (tag, title, description). Zero args.")]
 	fn list_purposes(&self) -> String {
 		match store::list_purposes(self.root()) {
 			Ok(p) => to_json(&p),
@@ -514,6 +527,7 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "Create a new purpose (topic). Args: tag, title, description.")]
 	fn create_purpose(&self, params: Parameters<CreatePurposeParams>) -> String {
 		let CreatePurposeParams { tag, title, description } = params.0;
 		match store::create_purpose(self.root(), &tag, &title, &description) {
@@ -522,6 +536,7 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "Delete a purpose by tag (does not delete docs tagged with it). Args: tag.")]
 	fn delete_purpose(&self, params: Parameters<PurposeTagParams>) -> String {
 		match store::delete_purpose(self.root(), &params.0.tag) {
 			Ok(_) => format!("Purpose '{}' deleted", params.0.tag),
@@ -529,6 +544,7 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "Re-embed all purpose descriptions (drops cached .vec files first). Run after changing purpose descriptions or upgrading embedding model. Zero args.")]
 	async fn reembed_purposes(&self) -> String {
 		if let Ok(purposes) = store::list_purposes(self.root()) {
 			for p in &purposes {
@@ -541,6 +557,7 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "List documents of a given type with optional pagination. Args: doc_type (thoughts|entities|questions|conclusions|reasons), limit?, cursor?")]
 	fn list(&self, params: Parameters<DocTypeParams>) -> String {
 		let DocTypeParams { doc_type, limit, cursor } = params.0;
 		match store::list_documents(self.root(), &doc_type) {
@@ -664,6 +681,7 @@ impl WikiService {
 
 	// ── Code tools ──────────────────────────────────────────────────────────
 
+	#[tool(description = "Index source code under a directory: parse fns/types via tree-sitter, write structure outlines + fn bodies to `.wiki/code/`. Args: src_dir, ext? (default rs).")]
 	fn code_index(&self, params: Parameters<CodeIndexParams>) -> String {
 		let CodeIndexParams { src_dir, ext } = params.0;
 		let ext = ext.unwrap_or_else(|| "rs".to_string());
@@ -714,6 +732,7 @@ impl WikiService {
 		code::list_languages()
 	}
 
+	#[tool(description = "Validate the code index: detect orphans, dangling refs, missing bodies. With fix=true, repair where safe. Args: fix?")]
 	fn code_validate(&self, params: Parameters<CodeValidateParams>) -> String {
 		match code::validate(params.0.fix.unwrap_or(false)) {
 			Ok(s) => s,
@@ -721,10 +740,12 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "Run a learn pass: random-walk sample (weighted by inverse edge degree) → link/dedupe → connect (top-K neighbor edge classify) → optionally raise + answer questions → promote to conclusions. Densifies the graph. Returns report JSON with edges_added, questions_raised/answered, conclusions_promoted, invariant_violated. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
 		let LearnPassParams {
-			limit, purpose, dry_run, qa, force,
-			answer_threshold, support_threshold, qa_max_per_pass, conclusion_merge_threshold,
+			limit, purpose, dry_run, qa, force, raise_questions,
+			answer_threshold, support_threshold, edge_threshold, connect_k,
+			qa_max_per_pass, conclusion_merge_threshold,
 		} = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);
 		let defaults = learn::PassConfig::default();
@@ -733,6 +754,9 @@ impl WikiService {
 			support_threshold: support_threshold.unwrap_or(defaults.support_threshold),
 			qa_max_per_pass: qa_max_per_pass.map(|n| n as usize).unwrap_or(defaults.qa_max_per_pass),
 			conclusion_merge_threshold: conclusion_merge_threshold.unwrap_or(defaults.conclusion_merge_threshold),
+			edge_threshold: edge_threshold.unwrap_or(defaults.edge_threshold),
+			connect_k: connect_k.map(|n| n as usize).unwrap_or(defaults.connect_k),
+			raise_questions: raise_questions.unwrap_or(defaults.raise_questions),
 		};
 		match learn::run_pass(self.root(), limit, purpose.as_deref(), dry_run.unwrap_or(false), qa.unwrap_or(true), force.unwrap_or(false), &cfg).await {
 			Ok(v) => v.to_string(),
@@ -740,6 +764,23 @@ impl WikiService {
 		}
 	}
 
+	#[tool(description = "Delete legacy template-shaped questions (e.g. 'How does X relate to similar concepts?') created before the template-filter was tightened. Skips questions with inbound Answers edges. Idempotent. Args: dry_run?")]
+	fn migrate_templated_questions(&self, params: Parameters<DryRunParams>) -> String {
+		match learn::migrate_templated_questions(self.root(), params.0.dry_run.unwrap_or(false)) {
+			Ok(rep) => to_json(&rep),
+			Err(e) => json_err(e),
+		}
+	}
+
+	#[tool(description = "Recompute node weights (pagerank-style importance) across the vault. Writes `node_size` into doc frontmatter. Run after large ingest batches if scores drift. Args: dry_run? (count without writing).")]
+	fn recompute_weights(&self, params: Parameters<DryRunParams>) -> String {
+		match crate::weight::run_cli(self.root(), params.0.dry_run.unwrap_or(false)) {
+			Ok(n) => serde_json::json!({ "recomputed": n, "dry_run": params.0.dry_run.unwrap_or(false) }).to_string(),
+			Err(e) => json_err(e),
+		}
+	}
+
+	#[tool(description = "Replay accumulated `.wiki/feedback.jsonl` into the graph: per entry, classify picked/dropped candidates and emit edges (Supports/Contradicts/etc.). Args: limit?, dry_run?")]
 	async fn learn_from_feedback(&self, params: Parameters<LearnFeedbackParams>) -> String {
 		let LearnFeedbackParams { limit, dry_run } = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);

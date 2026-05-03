@@ -38,6 +38,13 @@ pub struct PassConfig {
 	pub qa_max_per_pass: usize,
 	/// Merge into existing conclusion if cosine ≥ this.
 	pub conclusion_merge_threshold: f32,
+	/// Connect-step: emit typed edge for any LLM-scored neighbor ≥ this.
+	pub edge_threshold: f32,
+	/// Connect-step: number of semantic neighbors to fetch per doc.
+	pub connect_k: usize,
+	/// Enable LLM question raising during the pass. Off by default so ingest-
+	/// driven passes stay quiet; enable for deliberate `/learn --raise` runs.
+	pub raise_questions: bool,
 }
 
 impl Default for PassConfig {
@@ -47,8 +54,34 @@ impl Default for PassConfig {
 			support_threshold: 0.3,
 			qa_max_per_pass: 50,
 			conclusion_merge_threshold: 0.92,
+			edge_threshold: 0.7,
+			connect_k: 5,
+			raise_questions: false,
 		}
 	}
+}
+
+const DEFAULT_QUESTION_DEDUPE_THRESHOLD: f32 = 0.88;
+
+pub(crate) fn question_dedupe_threshold() -> f32 {
+	std::env::var("WIKI_QUESTION_DEDUPE_THRESHOLD")
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(DEFAULT_QUESTION_DEDUPE_THRESHOLD)
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RaisedQItem {
+	#[serde(default)]
+	pub title: String,
+	#[serde(default)]
+	pub body: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct RaisedQResp {
+	#[serde(default)]
+	pub questions: Vec<RaisedQItem>,
 }
 
 #[derive(Clone)]
@@ -191,6 +224,8 @@ fn pass_cursor_path(root: &Path, key: &str) -> std::path::PathBuf {
 }
 
 /// Read per-purpose pass cursor. Returns Some((doc_type, id)) if present.
+/// Cursor is now diagnostic-only (sampling is random, not sequential).
+#[allow(dead_code)]
 pub(crate) fn read_pass_cursor(root: &Path, key: &str) -> Option<(String, String)> {
 	let raw = std::fs::read_to_string(pass_cursor_path(root, key)).ok()?;
 	let mut lines = raw.lines();

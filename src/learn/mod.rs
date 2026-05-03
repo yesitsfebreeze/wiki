@@ -5,6 +5,7 @@ pub(crate) mod infra;
 pub(crate) mod dedup;
 pub(crate) mod links;
 pub(crate) mod raise;
+pub(crate) mod connect;
 pub(crate) mod qa;
 pub(crate) mod promote;
 pub(crate) mod migrate;

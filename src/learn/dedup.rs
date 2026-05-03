@@ -8,6 +8,29 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Drop candidate embeddings whose cosine to any existing embedding is ≥ `threshold`.
+/// Returns the indices of candidates kept (not duplicates).
+pub fn dedupe_candidates_by_embedding(
+	cand_embs: &[Vec<f32>],
+	existing_embs: &[Vec<f32>],
+	threshold: f32,
+) -> Vec<usize> {
+	let mut kept = Vec::with_capacity(cand_embs.len());
+	for (i, c) in cand_embs.iter().enumerate() {
+		let mut dup = false;
+		for e in existing_embs {
+			if classifier::cosine(c, e) >= threshold {
+				dup = true;
+				break;
+			}
+		}
+		if !dup {
+			kept.push(i);
+		}
+	}
+	kept
+}
+
 pub async fn find_near_duplicate_entity(root: &Path, title: &str, content: &str) -> Result<Option<EntityRef>> {
 	let threshold = alias_threshold();
 	let entities = build_entity_index(root).await?;

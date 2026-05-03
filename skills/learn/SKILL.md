@@ -49,11 +49,13 @@ query → search({query, include:{bodies:true, reasons:true, edges_depth:1}})
 | **health** | periodic | `list_open_questions`, scan ingest responses for `auto_linked` precision. |
 
 Background processes run automatically (no MCP call needed):
-- **Auto-`learn`**: triggers on N=20 ingests OR M=10min idle. Runs link/dedupe + Q&A pass.
+- **Auto-`learn`**: triggers on N=20 ingests OR M=10min idle. Runs link/dedupe + **connect** (top-K neighbor edge classification) + Q&A pass. Question raising is opt-in via `raise_questions: true` (off by default to keep ingest-driven passes quiet).
 - **Auto-`code_index`**: filesystem watcher; lazy reindex on `code_search` if stale.
 - **Auto-conclusion-suggestion**: surfaced inside `search` response, not a separate tool.
 
-Force a learn pass via CLI: `wiki learn --force`. Purpose admin via CLI: `wiki purpose create|delete|list`.
+Force a learn pass via MCP: `learn_pass({force: true, raise_questions: true})`. Purpose admin via MCP: `create_purpose`, `delete_purpose`, `list_purposes`, `reembed_purposes`.
+
+The learn pass is a **random-walk sensemaker** — samples docs weighted by inverse edge degree (orphans first), forges typed edges between semantic neighbors, raises questions, answers questions, promotes resolved questions to conclusions. Densification depends on the connect step, not just the question-answering loop. See `overview.md` step 2 for the full algorithm.
 
 ## Ingest
 
@@ -111,8 +113,8 @@ Cite all walked IDs in answers. If the answer adds durable insight → `ingest({
 - `list_open_questions({purpose?, k?})` — gap-finding entry point.
 - `docs({name?})` — fetch this surface's own documentation.
 
-### Removed (moved to CLI)
-`list`, `list_purposes`, `create_purpose`, `delete_purpose`, `reembed_purposes`, `list_ingest_log`, `code_index`, `code_validate`, `code_list_languages`, `code_list_bodies`, `code_find_large`, `learn_pass`, `learn_from_feedback`. Use `wiki <subcommand>` from a shell.
+### Admin (MCP-exposed; no CLI)
+`list`, `list_purposes`, `create_purpose`, `delete_purpose`, `reembed_purposes`, `code_index`, `code_validate`, `learn_pass`, `learn_from_feedback`, `migrate_templated_questions`, `recompute_weights`, `sanitize`. Everything is on the MCP surface — the `wiki` binary itself only exposes Claude Code hook subprocesses (`hook`, `stop-hook`, `code-read-hook`).
 
 ### Replaced (do not call — stale tool names)
 | Old | New |
@@ -170,4 +172,4 @@ Per-call tunables: `auto_link_threshold` (default `0.82`), `auto_link_cap` (defa
 - Calling `get` after `search` for the body — `search` already returns bodies inline.
 - Calling `mark_question` after `ingest({type:"conclusion"})` — it is auto-marked; check `promoted` in the response.
 - Running freehand `ingest({type:"conclusion"})` without first checking `suggested_conclusions` from `search` → orphan conclusions.
-- Calling `reembed_purposes` / `learn_pass` from MCP — moved to CLI.
+- Calling the `wiki` binary with anything other than `hook|stop-hook|code-read-hook` — all wiki ops are MCP tools now.
