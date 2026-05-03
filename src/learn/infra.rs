@@ -55,7 +55,7 @@ impl Default for PassConfig {
 			qa_max_per_pass: 50,
 			conclusion_merge_threshold: 0.92,
 			edge_threshold: 0.7,
-			connect_k: 5,
+			connect_k: 10,
 			raise_questions: false,
 		}
 	}

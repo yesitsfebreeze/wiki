@@ -339,11 +339,22 @@ pub async fn run_pass(
 		&& !targets.is_empty()
 		&& skipped_recent < targets.len() as u64
 		&& progress == 0;
+	eprintln!(
+		"[learn] pass scanned={} links={} edges={} raised={} answered={} promoted={} merged={}{}",
+		targets.len(),
+		links_added,
+		edges_added,
+		questions_raised,
+		questions_answered,
+		conclusions_promoted,
+		merges_total,
+		if dry_run { " (dry_run)" } else { "" },
+	);
 	if invariant_violated {
 		eprintln!(
-			"learn pass invariant violated: {} docs scanned, 0 links/edges/questions/conclusions added. \
+			"[learn] invariant violated: 0 links/edges/questions/conclusions added. \
 			 Widen N (limit) or lower thresholds (edge_threshold={}, answer_threshold={}).",
-			targets.len(), cfg.edge_threshold, cfg.answer_threshold,
+			cfg.edge_threshold, cfg.answer_threshold,
 		);
 	}
 
