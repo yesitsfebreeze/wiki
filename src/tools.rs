@@ -11,6 +11,80 @@ pub struct WikiService {
 	wiki_path: PathBuf,
 }
 
+/// Outcome of [`retitle_generic_questions`].
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RetitleReport {
+	pub scanned: usize,
+	pub retitled: usize,
+	pub examples: Vec<RetitleExample>,
+	pub dry_run: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RetitleExample {
+	pub id: String,
+	pub from: String,
+	pub to: String,
+}
+
+/// Walk all `questions/*.md`. For any whose stored title is the literal
+/// `"question"` (the legacy hardcoded fallback) or empty, derive a fresh
+/// title from the body via [`derive_title`] and write it back to
+/// frontmatter. Body is unchanged. Idempotent — re-runs find nothing.
+pub fn retitle_generic_questions(root: &Path, dry_run: bool) -> Result<RetitleReport> {
+	let mut rep = RetitleReport { dry_run, ..Default::default() };
+	let questions = store::list_documents(root, "questions").unwrap_or_default();
+	rep.scanned = questions.len();
+	for q in questions {
+		let needs = q.title.trim().is_empty() || q.title == "question";
+		if !needs {
+			continue;
+		}
+		let new_title = derive_title(&q.content, "question");
+		if new_title == q.title {
+			continue;
+		}
+		if !dry_run {
+			store::set_frontmatter_field(
+				root,
+				"questions",
+				&q.id,
+				"title",
+				serde_json::Value::String(new_title.clone()),
+			)?;
+		}
+		rep.retitled += 1;
+		if rep.examples.len() < 5 {
+			rep.examples.push(RetitleExample {
+				id: q.id.clone(),
+				from: q.title.clone(),
+				to: new_title,
+			});
+		}
+	}
+	Ok(rep)
+}
+
+/// If `to_id` resolves to a question doc and the question isn't already
+/// answered/dropped, flip its state to `answered` and move the file. Used
+/// when an `Answers` reason is ingested so callers don't need a separate
+/// `mark_question` round-trip. Returns `true` if a state change happened.
+pub(crate) fn mark_question_answered(root: &Path, to_id: &str) -> Result<bool> {
+	const TERMINAL: &[&str] = &["answered", "dropped"];
+	let mut doc = match store::get_document(root, "questions", to_id) {
+		Ok(d) => d,
+		Err(_) => return Ok(false),
+	};
+	if doc.tags.iter().any(|t| TERMINAL.contains(&t.as_str())) {
+		return Ok(false);
+	}
+	doc.tags.retain(|t| !TERMINAL.contains(&t.as_str()));
+	doc.tags.push("answered".to_string());
+	store::update_document(root, "questions", to_id, None, Some(doc.tags.clone()))?;
+	let _ = learn::move_to_answered(root, to_id);
+	Ok(true)
+}
+
 /// Pull a clean ≤60-char title from a doc body. Strips leading markdown
 /// (`#`, `*`, `-`, `>`), wikilinks (`[[...]]`), and bracketed tags
 /// (`[gap]`, `[established]`). Cuts at first sentence terminator or word
@@ -866,7 +940,11 @@ impl WikiService {
 					Err(e) => json_err(e),
 				}
 			},
-			other => json_err(format!("Unknown action: {} (recompute|sanitize|migrate|feedback)", other)),
+			"retitle_questions" => match retitle_generic_questions(self.root(), dry) {
+				Ok(rep) => to_json(&rep),
+				Err(e) => json_err(e),
+			},
+			other => json_err(format!("Unknown action: {} (recompute|sanitize|migrate|feedback|retitle_questions)", other)),
 		}
 	}
 
@@ -1085,7 +1163,18 @@ impl WikiService {
 					Ok(doc) => {
 						self.try_index_doc(&doc);
 						let _ = store::log_ingest(self.root(), "reasons", &doc.id, &doc.title);
-						serde_json::json!(doc)
+						let auto_marked = if rk == "Answers" {
+							mark_question_answered(self.root(), &to).unwrap_or(false)
+						} else {
+							false
+						};
+						let mut v = serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}));
+						if auto_marked {
+							if let Some(obj) = v.as_object_mut() {
+								obj.insert("auto_marked_answered".into(), serde_json::Value::String(to.clone()));
+							}
+						}
+						v
 					}
 					Err(e) => return json_err(e),
 				}
@@ -1281,6 +1370,69 @@ mod tests {
 		assert_eq!(derive_title("", "fallback"), "fallback");
 		assert_eq!(derive_title("###   \n", "fallback"), "fallback");
 		assert_eq!(derive_title("[[only-wikilink]]", "fallback"), "fallback");
+	}
+
+	#[test]
+	fn retitle_renames_only_generic_titles() {
+		use tempfile::TempDir;
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+		let generic = store::create_document(
+			root, "questions", "question", "Why does the foo system require N+1 retries?",
+			vec!["question".into(), "general".into()], Some("general"), None,
+		).unwrap();
+		let real = store::create_document(
+			root, "questions", "Existing meaningful title", "body content",
+			vec!["question".into(), "general".into()], Some("general"), None,
+		).unwrap();
+		let rep = retitle_generic_questions(root, false).unwrap();
+		assert_eq!(rep.scanned, 2);
+		assert_eq!(rep.retitled, 1);
+		let updated = store::get_document(root, "questions", &generic.id).unwrap();
+		assert_ne!(updated.title, "question");
+		assert!(updated.title.starts_with("Why does"));
+		let untouched = store::get_document(root, "questions", &real.id).unwrap();
+		assert_eq!(untouched.title, "Existing meaningful title");
+	}
+
+	#[test]
+	fn retitle_dry_run_writes_nothing() {
+		use tempfile::TempDir;
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+		let q = store::create_document(
+			root, "questions", "question", "Real question body here.",
+			vec!["question".into(), "general".into()], Some("general"), None,
+		).unwrap();
+		let rep = retitle_generic_questions(root, true).unwrap();
+		assert_eq!(rep.retitled, 1);
+		let after = store::get_document(root, "questions", &q.id).unwrap();
+		assert_eq!(after.title, "question");
+	}
+
+	#[test]
+	fn mark_question_answered_flips_state_and_is_idempotent() {
+		use tempfile::TempDir;
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+		let q = store::create_document(
+			root, "questions", "Will it answer?", "body",
+			vec!["question".into(), "general".into()], Some("general"), None,
+		).unwrap();
+		assert!(mark_question_answered(root, &q.id).unwrap());
+		assert!(!mark_question_answered(root, &q.id).unwrap());
+	}
+
+	#[test]
+	fn mark_question_answered_noop_for_non_question() {
+		use tempfile::TempDir;
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+		assert!(!mark_question_answered(root, "nonexistent-id").unwrap());
 	}
 
 	#[test]
