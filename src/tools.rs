@@ -11,6 +11,67 @@ pub struct WikiService {
 	wiki_path: PathBuf,
 }
 
+/// Pull a clean ≤60-char title from a doc body. Strips leading markdown
+/// (`#`, `*`, `-`, `>`), wikilinks (`[[...]]`), and bracketed tags
+/// (`[gap]`, `[established]`). Cuts at first sentence terminator or word
+/// boundary near the 60-char budget. Returns `fallback` if nothing usable.
+pub(crate) fn derive_title(body: &str, fallback: &str) -> String {
+	const MAX: usize = 60;
+	let mut s = body.trim_start();
+	loop {
+		let prev = s;
+		s = s.trim_start_matches(|c: char| matches!(c, '#' | '*' | '-' | '>' | ' ' | '\t' | '\r' | '\n'));
+		// Strip leading [[wikilink]]
+		if let Some(rest) = s.strip_prefix("[[") {
+			if let Some(end) = rest.find("]]") {
+				s = &rest[end + 2..];
+				s = s.trim_start();
+				continue;
+			}
+		}
+		// Strip leading [bracket-tag] (no nested brackets, no spaces inside).
+		if let Some(rest) = s.strip_prefix('[') {
+			if let Some(end) = rest.find(']') {
+				let inner = &rest[..end];
+				if !inner.contains('[') && inner.len() <= 32 {
+					s = &rest[end + 1..];
+					s = s.trim_start();
+					continue;
+				}
+			}
+		}
+		if s == prev {
+			break;
+		}
+	}
+	let cut = s
+		.find(|c: char| matches!(c, '.' | '?' | '!' | '\n'))
+		.unwrap_or(s.len());
+	let candidate = s[..cut].trim();
+	if candidate.is_empty() {
+		return fallback.to_string();
+	}
+	if candidate.chars().count() <= MAX {
+		return candidate.to_string();
+	}
+	let mut chars: Vec<char> = candidate.chars().take(MAX).collect();
+	while let Some(&last) = chars.last() {
+		if last.is_whitespace() {
+			chars.pop();
+		} else {
+			break;
+		}
+	}
+	if let Some(last_space) = chars.iter().rposition(|c| c.is_whitespace()) {
+		if last_space >= MAX / 2 {
+			chars.truncate(last_space);
+		}
+	}
+	let mut out: String = chars.into_iter().collect();
+	out.push('…');
+	out
+}
+
 // ── Param structs ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
@@ -981,9 +1042,9 @@ impl WikiService {
 	async fn ingest(&self, params: Parameters<IngestParams>) -> String {
 		let IngestParams { kind, title, body, tags: _, refs, purpose_hint, from_id, to_id, reason_kind } = params.0;
 		let title = title.unwrap_or_else(|| match kind.as_str() {
-			"question" => "question".to_string(),
 			"reason" => "reason".to_string(),
-			_ => body.lines().next().unwrap_or("untitled").chars().take(80).collect(),
+			"question" => derive_title(&body, "question"),
+			_ => derive_title(&body, "untitled"),
 		});
 		let ingested = match kind.as_str() {
 			"thought" => self.ingest_chunked("thoughts", &title, &body, "thought", purpose_hint.as_deref()).await,
@@ -1006,7 +1067,7 @@ impl WikiService {
 			"question" => {
 				let purpose = self.classify_or_hint(purpose_hint.as_deref(), &body).await;
 				let tags = vec!["question".to_string(), purpose.clone()];
-				match store::create_document(self.root(), "questions", "question", &body, tags, Some(&purpose), None) {
+				match store::create_document(self.root(), "questions", &title, &body, tags, Some(&purpose), None) {
 					Ok(doc) => {
 						self.try_index_doc(&doc);
 						let _ = store::log_ingest(self.root(), "questions", &doc.id, &doc.title);
@@ -1161,5 +1222,73 @@ impl WikiService {
 		let path = store::wiki_root();
 		store::bootstrap(&path)?;
 		Ok(Self { wiki_path: path })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn derive_title_short_body() {
+		assert_eq!(derive_title("hello world", "untitled"), "hello world");
+	}
+
+	#[test]
+	fn derive_title_strips_markdown_prefix() {
+		assert_eq!(derive_title("## My heading\nbody", "untitled"), "My heading");
+		assert_eq!(derive_title("- bullet item", "untitled"), "bullet item");
+		assert_eq!(derive_title("> quote text", "untitled"), "quote text");
+	}
+
+	#[test]
+	fn derive_title_strips_leading_wikilink() {
+		assert_eq!(
+			derive_title("[[abc-123]] core claim about widgets", "untitled"),
+			"core claim about widgets",
+		);
+	}
+
+	#[test]
+	fn derive_title_strips_bracket_tag() {
+		assert_eq!(derive_title("[gap] need to verify X", "untitled"), "need to verify X");
+		assert_eq!(
+			derive_title("[[abc]] [established] foo bar", "untitled"),
+			"foo bar",
+		);
+	}
+
+	#[test]
+	fn derive_title_cuts_at_sentence_terminator() {
+		assert_eq!(
+			derive_title("First sentence here. Second sentence.", "untitled"),
+			"First sentence here",
+		);
+		assert_eq!(derive_title("A question? Yes.", "untitled"), "A question");
+	}
+
+	#[test]
+	fn derive_title_cuts_at_word_boundary_near_60() {
+		let long = "this is a very long title that exceeds the sixty character budget by a lot indeed";
+		let out = derive_title(long, "untitled");
+		assert!(out.chars().count() <= 61, "got {} chars: {:?}", out.chars().count(), out);
+		assert!(out.ends_with('…'));
+		assert!(!out.contains("budget by a lot indeed"));
+	}
+
+	#[test]
+	fn derive_title_falls_back_when_empty() {
+		assert_eq!(derive_title("", "fallback"), "fallback");
+		assert_eq!(derive_title("###   \n", "fallback"), "fallback");
+		assert_eq!(derive_title("[[only-wikilink]]", "fallback"), "fallback");
+	}
+
+	#[test]
+	fn derive_title_does_not_strip_inline_brackets_with_text() {
+		// Real wiki content like "[gap]" at start strips, but tags inside should stay.
+		assert_eq!(
+			derive_title("real content [aside] here", "untitled"),
+			"real content [aside] here",
+		);
 	}
 }

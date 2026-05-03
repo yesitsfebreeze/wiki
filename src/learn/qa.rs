@@ -272,9 +272,12 @@ pub async fn run_pass(
 						edges_added += added;
 						llm_budget = llm_budget.saturating_sub(used);
 					}
-					Err(e) => details.push(serde_json::json!({
-						"doc_id": id, "connect_error": e.to_string(),
-					})),
+					Err(e) => {
+						eprintln!("[learn] connect-step failed for doc {}: {} — auto-link skipped", id, e);
+						details.push(serde_json::json!({
+							"doc_id": id, "connect_error": e.to_string(),
+						}));
+					}
 				}
 			}
 		}

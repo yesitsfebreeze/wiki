@@ -50,7 +50,7 @@ pub struct PassConfig {
 impl Default for PassConfig {
 	fn default() -> Self {
 		Self {
-			answer_threshold: 0.8,
+			answer_threshold: 0.6,
 			support_threshold: 0.3,
 			qa_max_per_pass: 50,
 			conclusion_merge_threshold: 0.92,
