@@ -1,5 +1,7 @@
 # Wiki Ingest Flow
 
+> This doc describes the conceptual model. For the current tool API and binding protocol, read [`docs/tools/learn.md`](learn.md) and [`docs/tools/ingest.md`](ingest.md).
+
 Read this before using any ingest tools. The wiki is a single Obsidian vault at `.wiki/`. Topical separation is done via **purpose tags**, not separate stores. Each doc gets exactly one type tag + one purpose tag (auto-classified via OpenAI embeddings).
 
 ## The Flow
@@ -129,12 +131,6 @@ suggest_conclusion({entity_id})
 2. Calls appropriate `ingest_*` tools
 3. Deletes source on success
 4. Runs `/learn` (ingest-time mode) on the just-ingested doc IDs to wikilink + dedupe before the batch closes.
-
-# Environment
-
-- `WIKI_PATH` — vault root (default `./.wiki`)
-- `OPENAI_API_KEY` — required for classification (else falls back to `general`)
-- `WIKI_SIMILARITY_THRESHOLD` — cosine threshold (default `0.35`)
 
 # Important
 

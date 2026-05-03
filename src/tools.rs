@@ -508,7 +508,7 @@ impl WikiService {
 
 #[tool_router]
 impl WikiService {
-	#[tool(description = "Fetch full markdown documentation. No arg → list available doc names. With name → return body. Names match `concepts/<topic>` or `tools/<tool_name>`; bare names auto-resolve. Args: name?")]
+	#[tool(description = "Fetch markdown docs. No arg → list available names. With name → body. Resolves tools/<name>.md then concepts/<name>.md. Args: name?.")]
 	fn docs(&self, params: Parameters<DocsParams>) -> String {
 		match params.0.name {
 			None => serde_json::json!({ "docs": crate::docs::list() }).to_string(),
@@ -519,7 +519,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "List all configured purposes (tag, title, description). Zero args.")]
+	#[tool(description = "List all configured purposes. Returns [{tag, title, description}]. Docs: docs(\"list_purposes\"). Zero args.")]
 	fn list_purposes(&self) -> String {
 		match store::list_purposes(self.root()) {
 			Ok(p) => to_json(&p),
@@ -527,7 +527,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Create a new purpose (topic). Args: tag, title, description.")]
+	#[tool(description = "Create a new purpose bucket. description drives embedding classification — write clearly. Docs: docs(\"create_purpose\"). Args: tag, title, description.")]
 	fn create_purpose(&self, params: Parameters<CreatePurposeParams>) -> String {
 		let CreatePurposeParams { tag, title, description } = params.0;
 		match store::create_purpose(self.root(), &tag, &title, &description) {
@@ -536,7 +536,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Delete a purpose by tag (does not delete docs tagged with it). Args: tag.")]
+	#[tool(description = "Delete a purpose by tag. Tagged docs are NOT deleted. Docs: docs(\"delete_purpose\"). Args: tag.")]
 	fn delete_purpose(&self, params: Parameters<PurposeTagParams>) -> String {
 		match store::delete_purpose(self.root(), &params.0.tag) {
 			Ok(_) => format!("Purpose '{}' deleted", params.0.tag),
@@ -544,7 +544,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Re-embed all purpose descriptions (drops cached .vec files first). Run after changing purpose descriptions or upgrading embedding model. Zero args.")]
+	#[tool(description = "Rebuild all purpose .vec embedding files. Run after editing purpose descriptions or upgrading embedding model. Docs: docs(\"reembed_purposes\"). Zero args.")]
 	async fn reembed_purposes(&self) -> String {
 		if let Ok(purposes) = store::list_purposes(self.root()) {
 			for p in &purposes {
@@ -557,7 +557,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "List documents of a given type with optional pagination. Args: doc_type (thoughts|entities|questions|conclusions|reasons), limit?, cursor?")]
+	#[tool(description = "Paginate docs by type. Docs: docs(\"list\"). Args: doc_type (thoughts|entities|questions|conclusions|reasons), limit?, cursor?.")]
 	fn list(&self, params: Parameters<DocTypeParams>) -> String {
 		let DocTypeParams { doc_type, limit, cursor } = params.0;
 		match store::list_documents(self.root(), &doc_type) {
@@ -569,7 +569,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Update a doc. Re-embeds and re-links body if WIKI_AUTO_INVARIANTS is enabled (default on). Docs: docs(\"update\").")]
+	#[tool(description = "Update doc body, title, or tags. Re-embeds + re-links body. Docs: docs(\"update\"). Args: id, doc_type?, body?, title?, tags?, edges?.")]
 	async fn update(&self, params: Parameters<UpdateDocParams>) -> String {
 		let UpdateDocParams { doc_type, id, content, tags } = params.0;
 		match store::update_document(self.root(), &doc_type, &id, content.as_deref(), tags) {
@@ -587,7 +587,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Delete a doc. Docs: docs(\"delete_doc\").")]
+	#[tool(description = "Delete a doc and cascade edge cleanup. Docs: docs(\"delete_doc\"). Args: id, doc_type?.")]
 	fn delete_doc(&self, params: Parameters<DocRefParams>) -> String {
 		let DocRefParams { doc_type, id } = params.0;
 		match store::delete_document(self.root(), &doc_type, &id) {
@@ -613,7 +613,7 @@ impl WikiService {
 		paginate(entries, cursor, limit).to_string()
 	}
 
-	#[tool(description = "List unresolved questions. Docs: docs(\"list_open_questions\").")]
+	#[tool(description = "List unresolved questions. Docs: docs(\"list_open_questions\"). Args: purpose?, limit?, cursor?.")]
 	fn list_open_questions(&self, params: Parameters<ListLogParams>) -> String {
 		let ListLogParams { limit, cursor } = params.0;
 		match store::list_documents(self.root(), "questions") {
@@ -628,7 +628,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Mark question status (resolved/unanswerable/partial_answer). Docs: docs(\"mark_question\").")]
+	#[tool(description = "Manually set question state. Override only — learn_pass auto-marks. Docs: docs(\"mark_question\"). Args: id, state (answered|unanswerable|partial).")]
 	fn mark_question(&self, params: Parameters<MarkQuestionParams>) -> String {
 		let MarkQuestionParams { question_id, status } = params.0;
 		const VALID: &[&str] = &["resolved", "unanswerable", "partial_answer"];
@@ -681,7 +681,7 @@ impl WikiService {
 
 	// ── Code tools ──────────────────────────────────────────────────────────
 
-	#[tool(description = "Index source code under a directory: parse fns/types via tree-sitter, write structure outlines + fn bodies to `.wiki/code/`. Args: src_dir, ext? (default rs).")]
+	#[tool(description = "Index source code via tree-sitter: structure outlines + fn bodies → .wiki/code/. Docs: docs(\"code_index\"). Args: src_dir, ext? (default rs).")]
 	fn code_index(&self, params: Parameters<CodeIndexParams>) -> String {
 		let CodeIndexParams { src_dir, ext } = params.0;
 		let ext = ext.unwrap_or_else(|| "rs".to_string());
@@ -691,7 +691,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Grep across indexed fn bodies/skeletons. Docs: docs(\"code_search\").")]
+	#[tool(description = "Grep indexed fn bodies + skeletons. Symbol|regex|semantic. Docs: docs(\"code_search\"). Args: query, kind?, lang?, k?.")]
 	fn code_search(&self, params: Parameters<CodeSearchParams>) -> String {
 		let CodeSearchParams { query, regex, scope, cursor, limit } = params.0;
 		let scope = scope.unwrap_or_else(|| "body".to_string());
@@ -732,7 +732,7 @@ impl WikiService {
 		code::list_languages()
 	}
 
-	#[tool(description = "Validate the code index: detect orphans, dangling refs, missing bodies. With fix=true, repair where safe. Args: fix?")]
+	#[tool(description = "Validate code index: detect orphans, dangling refs, missing bodies. Docs: docs(\"code_validate\"). Args: fix? (repair safe issues).")]
 	fn code_validate(&self, params: Parameters<CodeValidateParams>) -> String {
 		match code::validate(params.0.fix.unwrap_or(false)) {
 			Ok(s) => s,
@@ -740,7 +740,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Run a learn pass: random-walk sample (weighted by inverse edge degree) → link/dedupe → connect (top-K neighbor edge classify) → optionally raise + answer questions → promote to conclusions. Densifies the graph. Returns report JSON with edges_added, questions_raised/answered, conclusions_promoted, invariant_violated. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?")]
+	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?.")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
 		let LearnPassParams {
 			limit, purpose, dry_run, qa, force, raise_questions,
@@ -764,7 +764,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Delete legacy template-shaped questions (e.g. 'How does X relate to similar concepts?') created before the template-filter was tightened. Skips questions with inbound Answers edges. Idempotent. Args: dry_run?")]
+	#[tool(description = "Delete legacy template-shaped questions (pre-filter era). Skips any with inbound Answers edges. Docs: docs(\"migrate_templated_questions\"). Args: dry_run?.")]
 	fn migrate_templated_questions(&self, params: Parameters<DryRunParams>) -> String {
 		match learn::migrate_templated_questions(self.root(), params.0.dry_run.unwrap_or(false)) {
 			Ok(rep) => to_json(&rep),
@@ -772,7 +772,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Recompute node weights (pagerank-style importance) across the vault. Writes `node_size` into doc frontmatter. Run after large ingest batches if scores drift. Args: dry_run? (count without writing).")]
+	#[tool(description = "Recompute pagerank node weights. Writes node_size to frontmatter. Docs: docs(\"recompute_weights\"). Args: dry_run?.")]
 	fn recompute_weights(&self, params: Parameters<DryRunParams>) -> String {
 		match crate::weight::run_cli(self.root(), params.0.dry_run.unwrap_or(false)) {
 			Ok(n) => serde_json::json!({ "recomputed": n, "dry_run": params.0.dry_run.unwrap_or(false) }).to_string(),
@@ -780,7 +780,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Replay accumulated `.wiki/feedback.jsonl` into the graph: per entry, classify picked/dropped candidates and emit edges (Supports/Contradicts/etc.). Args: limit?, dry_run?")]
+	#[tool(description = "Replay .wiki/feedback.jsonl → emit typed edges from picked/dropped candidates. Docs: docs(\"learn_from_feedback\"). Args: limit?, dry_run?.")]
 	async fn learn_from_feedback(&self, params: Parameters<LearnFeedbackParams>) -> String {
 		let LearnFeedbackParams { limit, dry_run } = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);
@@ -792,7 +792,7 @@ impl WikiService {
 
 	// ── New consolidated tools ──────────────────────────────────────────────
 
-	#[tool(description = "Hybrid knowledge search. mode: smart (default, conclusions-first reranked) | fts (BM25) | tag | qa (question/conclusion only). Hits include full body + reasons + 1-hop edges inline. Args: query, mode?, k?, include_bodies?, include_reasons?, edges_depth?")]
+	#[tool(description = "Read docs(\"search\") first. Hybrid knowledge search. mode: smart (conclusions-first) | fts (BM25) | tag | qa. Returns body + reasons + 1-hop edges inline. Args: query, mode?, k?, include_bodies?, include_reasons?, edges_depth?.")]
 	async fn search(&self, params: Parameters<SearchParams>) -> String {
 		let SearchParams { query, mode, k, include_bodies, include_reasons, edges_depth } = params.0;
 		let mode = mode.unwrap_or_else(|| "smart".to_string());
@@ -901,7 +901,7 @@ impl WikiService {
 		out.to_string()
 	}
 
-	#[tool(description = "Get full doc by id (auto-detects type) with reasons + edges to depth. Args: id, doc_type?, depth? (default 1)")]
+	#[tool(description = "Fetch doc by id with reasons + edges. Auto-detects type. Docs: docs(\"get\"). Args: id, doc_type?, depth? (default 1).")]
 	fn get(&self, params: Parameters<GetParams>) -> String {
 		let GetParams { id, doc_type, depth } = params.0;
 		let depth = depth.unwrap_or(1) as usize;
@@ -942,7 +942,7 @@ impl WikiService {
 		}).to_string()
 	}
 
-	#[tool(description = "Type-dispatched ingest. kind: thought|entity|question|reason|conclusion. Auto-links + auto-marks-answered when WIKI_AUTO_INVARIANTS is on (default). `refs` creates explicit `References` edges from the new doc to each id. Args: kind, body, title?, tags?, refs?, purpose_hint?, from_id?, to_id?, reason_kind?")]
+	#[tool(description = "Read docs(\"ingest\") and docs(\"learn\") first. Write a doc: thought|entity|question|reason|conclusion. Auto-links + auto-marks-answered. refs= creates References edges (NOT Answers). For Answers: reason_kind=Answers or wikilink in body. Args: kind, body, title?, tags?, refs?, purpose_hint?, from_id?, to_id?, reason_kind?.")]
 	async fn ingest(&self, params: Parameters<IngestParams>) -> String {
 		let IngestParams { kind, title, body, tags: _, refs, purpose_hint, from_id, to_id, reason_kind } = params.0;
 		let title = title.unwrap_or_else(|| match kind.as_str() {
@@ -1058,7 +1058,7 @@ impl WikiService {
 		out.to_string()
 	}
 
-	#[tool(description = "Read code. granularity: outline (symbol map) | file (full source via index) | fn (one fn body). Args: path?, symbol?, granularity?")]
+	#[tool(description = "Read indexed code. granularity: outline (symbol map) | file (full source) | fn (one fn body). Docs: docs(\"code_read\"). Args: path?, symbol?, granularity?.")]
 	fn code_read(&self, params: Parameters<CodeReadParams>) -> String {
 		let CodeReadParams { path, symbol, granularity } = params.0;
 		let g = granularity.unwrap_or_else(|| "outline".to_string());
@@ -1081,7 +1081,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Sanitize vault filenames: rename any doc whose stem contains characters Obsidian can't wikilink, then rewrite all `[[wikilinks]]` and relative `.md` links across the vault to point at the new names. Idempotent. Zero args.")]
+	#[tool(description = "Sanitize vault filenames + rewrite [[wikilinks]] + .md links vault-wide. Idempotent. Docs: docs(\"sanitize\"). Zero args.")]
 	fn sanitize(&self) -> String {
 		match sanitize::sanitize_vault(self.root(), false) {
 			Ok(report) => to_json(&report),
@@ -1089,7 +1089,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Walk code reference graph. `symbol` accepts a bare fn name (resolved via the code index), a body-file path, or a structure-file path. direction: in (callers of body) | out (callees of structure) | both (default). Optional depth>1 walks the call tree. Args: symbol, direction?, depth?")]
+	#[tool(description = "Walk code reference graph. symbol: bare fn name, body path, or structure path. Docs: docs(\"code_refs\"). Args: symbol, direction? (in|out|both), depth?.")]
 	fn code_refs(&self, params: Parameters<CodeRefsParams>) -> String {
 		let CodeRefsParams { symbol, direction, depth } = params.0;
 		let dir = direction.unwrap_or_else(|| "both".to_string());
