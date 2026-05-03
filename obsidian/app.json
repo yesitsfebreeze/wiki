@@ -1,1 +1,5 @@
-{}
+{
+  "userIgnoreFilters": [
+    "ingest_log/"
+  ]
+}

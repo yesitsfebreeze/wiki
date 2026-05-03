@@ -2,7 +2,7 @@
 
 openai_api_key = "sk-..."
 
-# Model used for smart_search reranking (default gpt-4o-mini)
+# Model used for query reranking (default gpt-4o-mini)
 # wiki_rerank_model = "gpt-4o-mini"
 
 # Cosine similarity threshold for purpose classification (default 0.35)

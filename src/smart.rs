@@ -116,17 +116,11 @@ struct Candidate<'a> {
 	cosine: f32,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 struct RankedItem {
 	id: String,
 	score: f32,
-	#[serde(default)]
-	reason: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct RankedResp {
-	ranked: Vec<RankedItem>,
+	snippet: String,
 }
 
 /// Pick the most query-relevant paragraph as a snippet — falls back to
@@ -215,21 +209,6 @@ fn blend(a: &[f32], b: &[f32], w_a: f32) -> Vec<f32> {
 	out
 }
 
-async fn rerank_via_openai(question: &str, cands: &[Candidate<'_>]) -> Result<Vec<RankedItem>> {
-	let cands_json = serde_json::to_string(cands)?;
-	let sys = "You rerank candidate wiki documents for relevance to a user's question. \
-		Return JSON: {\"ranked\":[{\"id\":\"...\",\"score\":0.0-1.0,\"reason\":\"why this matches or not\"}]}. \
-		Score 1.0 = direct answer, 0.0 = irrelevant. Include all candidate ids exactly once. \
-		Reasons must be one short sentence. Use doc_type, tags, and purpose to disambiguate.";
-	let user = format!(
-		"Question: {}\n\nCandidates (JSON array, includes BM25 score, cosine, doc_type, tags, purpose):\n{}",
-		question, cands_json
-	);
-	let content = http::chat_json(sys, &user).await?;
-	let parsed: RankedResp = serde_json::from_str(&content)
-		.map_err(|e| anyhow!("rerank parse: {} body: {}", e, content))?;
-	Ok(parsed.ranked)
-}
 
 fn append_feedback(root: &Path, entry: &serde_json::Value) -> Result<()> {
 	use std::io::Write;
@@ -888,14 +867,24 @@ pub async fn query_with_qemb_opts(
 		}))
 		.collect();
 
-	let ranked = match rerank_via_openai(question, &cands).await {
-		Ok(r) => r,
-		Err(e) => hits.iter().map(|(d, s)| RankedItem {
-			id: d.id.clone(),
-			score: *s,
-			reason: format!("BM25 fallback ({})", e),
-		}).collect(),
-	};
+	// RRF + MMR already produced the best ordering; use cosine as the final
+	// score and the pre-computed best_snippet as the reason (most relevant
+	// paragraph for the query terms — no LLM needed).
+	let snippet_by_id: HashMap<&str, &str> =
+		cands.iter().map(|c| (c.id, c.snippet.as_str())).collect();
+	let ranked: Vec<RankedItem> = mmr_ids
+		.iter()
+		.map(|id| {
+			let score = cos_by_id.get(id.as_str()).copied().unwrap_or(0.0);
+			let reason = snippet_by_id
+				.get(id.as_str())
+				.copied()
+				.filter(|s| !s.is_empty())
+				.map(|s| s.to_string())
+				.unwrap_or_default();
+			RankedItem { id: id.clone(), score, snippet: reason }
+		})
+		.collect();
 
 	let mut indexed: HashMap<&str, &Document> = hits.iter().map(|(d, _)| (d.id.as_str(), d)).collect();
 	let mut sorted = ranked;
@@ -931,7 +920,7 @@ pub async fn query_with_qemb_opts(
 				"tags": d.tags,
 				"purpose": d.purpose,
 				"score": r.score,
-				"reason": r.reason,
+				"snippet": r.snippet,
 				"content": d.content,
 				"contradictions": contradictions_to_json(&contradictions),
 			}));
@@ -944,7 +933,7 @@ pub async fn query_with_qemb_opts(
 		"question": question,
 		"tag_filter": tag_filter,
 		"picked": sorted.iter().map(|r| &r.id).collect::<Vec<_>>(),
-		"reasons": sorted.iter().map(|r| (&r.id, &r.reason)).collect::<Vec<_>>(),
+		"reasons": sorted.iter().map(|r| (&r.id, &r.snippet)).collect::<Vec<_>>(),
 	}));
 
 	Ok(serde_json::json!({

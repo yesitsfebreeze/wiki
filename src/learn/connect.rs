@@ -1,43 +1,14 @@
 //! Connect-step: graph densification independent of the question loop.
-//! For a sampled doc, query top-K semantic neighbors across the vault, ask the
-//! LLM to classify each candidate edge by kind, and `create_reason` for any
-//! edge ≥ `cfg.edge_threshold` that does not already exist between the pair.
+//! For a sampled doc, query top-K semantic neighbors, classify each edge kind
+//! deterministically from cosine similarity and purpose overlap, and create a
+//! reason for any edge above `cfg.edge_threshold` that does not already exist.
 
 use super::infra::{allowed_kind, PassConfig};
 use crate::cache;
-use crate::{http, smart, store};
+use crate::{smart, store};
 use anyhow::Result;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-
-#[derive(Deserialize, Debug)]
-struct ConnectCand {
-	picked_id: String,
-	#[serde(default)]
-	score: f32,
-	#[serde(default)]
-	kind: String,
-	#[serde(default)]
-	body: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct ConnectResp {
-	#[serde(default)]
-	scored: Vec<ConnectCand>,
-}
-
-const CONNECT_KINDS: &[&str] = &[
-	"Supports",
-	"Contradicts",
-	"Extends",
-	"Requires",
-	"References",
-	"Derives",
-	"Instances",
-	"PartOf",
-];
 
 /// Returns the set of doc-ids that already have an outbound reason from `from_id`.
 fn existing_outbound_targets(root: &Path, from_id: &str) -> HashSet<String> {
@@ -53,6 +24,20 @@ fn existing_outbound_targets(root: &Path, from_id: &str) -> HashSet<String> {
 	out
 }
 
+/// Pick an edge kind from cosine + purpose overlap — no LLM needed.
+///
+/// Same purpose: high cosine → content is very similar → `Supports`.
+///               lower cosine → one elaborates/extends the other → `Extends`.
+/// Cross-purpose: any cosine → cross-domain pointer → `References`.
+fn classify_kind(src_purpose: Option<&str>, tgt_purpose: Option<&str>, cosine: f32) -> &'static str {
+	let same = matches!((src_purpose, tgt_purpose), (Some(a), Some(b)) if a == b);
+	if same {
+		if cosine >= 0.85 { "Supports" } else { "Extends" }
+	} else {
+		"References"
+	}
+}
+
 /// Densify the graph around `doc`. Returns `(edges_added, llm_calls_used)`.
 pub async fn connect_doc(
 	root: &Path,
@@ -66,71 +51,42 @@ pub async fn connect_doc(
 	}
 
 	let already = existing_outbound_targets(root, &doc.id);
-	let mut id_to_dt: HashMap<String, String> = HashMap::new();
-	let mut filtered = Vec::new();
+
+	// id → (doc_type, purpose) for candidates that exist in the store
+	let mut id_to_meta: HashMap<String, (String, Option<String>)> = HashMap::new();
 	for r in &results {
 		let Some(id) = r.get("id").and_then(|v| v.as_str()) else { continue };
 		if id == doc.id || already.contains(id) {
 			continue;
 		}
-		let mut found = false;
 		for dt in &["entities", "thoughts", "conclusions", "questions"] {
-			if store::get_document(root, dt, id).is_ok() {
-				id_to_dt.insert(id.to_string(), (*dt).to_string());
-				found = true;
+			if let Ok(d) = store::get_document(root, dt, id) {
+				id_to_meta.insert(id.to_string(), ((*dt).to_string(), d.purpose));
 				break;
 			}
 		}
-		if found {
-			filtered.push(r.clone());
-		}
 	}
-	if filtered.is_empty() {
+	if id_to_meta.is_empty() {
 		return Ok((0, 0));
 	}
 
-	let cand_json = serde_json::to_string(&filtered)?;
-	let kinds_csv = CONNECT_KINDS.join("|");
-	let sys = format!(
-		"You score typed graph edges between a source doc and candidate docs. \
-		For each candidate, pick the strongest edge kind from {kinds_csv} and \
-		score 0..1 for confidence that the edge is real. Be conservative: \
-		score < 0.5 if the relation is weak, hypothetical, or only topical. \
-		`body` is one short sentence WHY the edge holds. Return JSON \
-		{{\"scored\":[{{\"picked_id\":string,\"score\":number,\"kind\":string,\"body\":string}}]}}. \
-		Include every candidate id."
-	);
-	let user = format!(
-		"Source doc title: {}\nSource doc body:\n{}\n\nCandidates:\n{}",
-		doc.title, doc.content, cand_json
-	);
-	let raw = http::chat_json(&sys, &user).await?;
-	let parsed: ConnectResp = serde_json::from_str(&raw)
-		.map_err(|e| anyhow::anyhow!("connect parse: {} body: {}", e, raw))?;
-
 	let mut added = 0u64;
-	for c in parsed.scored {
-		if c.score < cfg.edge_threshold {
+	for r in &results {
+		let Some(id) = r.get("id").and_then(|v| v.as_str()) else { continue };
+		let Some((_, tgt_purpose)) = id_to_meta.get(id) else { continue };
+		let cosine = r.get("cosine").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+		if cosine < cfg.edge_threshold {
 			continue;
 		}
-		if !id_to_dt.contains_key(&c.picked_id) {
-			continue;
-		}
-		if already.contains(&c.picked_id) {
-			continue;
-		}
-		let kind = allowed_kind(&c.kind);
-		let body = if c.body.trim().is_empty() {
-			format!("connect: {} (score {:.2})", kind, c.score)
-		} else {
-			c.body
-		};
-		if store::create_reason(root, &doc.id, &c.picked_id, kind, &body, doc.purpose.as_deref()).is_ok() {
+		let raw_kind = classify_kind(doc.purpose.as_deref(), tgt_purpose.as_deref(), cosine);
+		let kind = allowed_kind(raw_kind);
+		let body = format!("Semantically related (cosine: {cosine:.2})");
+		if store::create_reason(root, &doc.id, id, kind, &body, doc.purpose.as_deref()).is_ok() {
 			added += 1;
 		}
 	}
 
-	Ok((added, 1))
+	Ok((added, 0))
 }
 
 #[cfg(test)]
@@ -151,5 +107,22 @@ mod tests {
 		let out = existing_outbound_targets(root, &a.id);
 		assert!(out.contains(&b.id));
 		assert!(!out.contains(&c.id));
+	}
+
+	#[test]
+	fn classify_kind_same_purpose_high_cosine() {
+		assert_eq!(classify_kind(Some("rust"), Some("rust"), 0.90), "Supports");
+	}
+
+	#[test]
+	fn classify_kind_same_purpose_lower_cosine() {
+		assert_eq!(classify_kind(Some("rust"), Some("rust"), 0.75), "Extends");
+	}
+
+	#[test]
+	fn classify_kind_cross_purpose() {
+		assert_eq!(classify_kind(Some("rust"), Some("python"), 0.95), "References");
+		assert_eq!(classify_kind(Some("rust"), None, 0.90), "References");
+		assert_eq!(classify_kind(None, None, 0.90), "References");
 	}
 }

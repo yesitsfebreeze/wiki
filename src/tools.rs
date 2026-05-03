@@ -811,7 +811,7 @@ impl WikiService {
 
 	// ── New consolidated tools ──────────────────────────────────────────────
 
-	#[tool(description = "Read docs(\"search\") first. Hybrid knowledge search + doc listing. mode: smart (conclusions-first) | fts (BM25) | tag | qa | list (paginate by doc_type). Returns body + reasons + 1-hop edges inline. Args: query, mode?, k?, include_bodies?, include_reasons?, edges_depth?, doc_type?.")]
+	#[tool(description = "Read docs(\"search\") first. Hybrid knowledge search + doc listing. mode: smart (conclusions-first, returns top-10 ranked hits with per-hit snippet + full body + edges — use these 10 hits to synthesize a conclusion) | fts (BM25) | tag | qa | list (paginate by doc_type). Args: query, mode?, k? (default 10), include_bodies?, include_reasons?, edges_depth?, doc_type?.")]
 	async fn search(&self, params: Parameters<SearchParams>) -> String {
 		let SearchParams { query, mode, k, include_bodies, include_reasons, edges_depth, doc_type } = params.0;
 		let mode = mode.unwrap_or_else(|| "smart".to_string());
@@ -828,12 +828,13 @@ impl WikiService {
 			};
 		}
 
-		let k = k.map(|n| n as usize).unwrap_or(5);
+		let k = k.map(|n| n as usize).unwrap_or(10);
 		let want_bodies = include_bodies.unwrap_or(true);
 		let want_reasons = include_reasons.unwrap_or(true);
 		let depth = edges_depth.unwrap_or(1) as usize;
 
-		let raw_hits: Vec<(String, String, String, f64)> = match mode.as_str() {
+		// (id, doc_type, title, score, snippet)
+		let raw_hits: Vec<(String, String, String, f64, String)> = match mode.as_str() {
 			"smart" | "qa" => {
 				let opts = smart::QueryOpts::default();
 				let v = match smart::query_with_opts(self.root(), &query, None, k.max(20), k, &opts).await {
@@ -850,8 +851,9 @@ impl WikiService {
 							.map(doc_type_from_base_tag)
 							.unwrap_or_else(|| "thoughts".to_string());
 						let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+						let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("").to_string();
 						if mode == "qa" && dt != "questions" && dt != "conclusions" { return None; }
-						Some((id, dt, title, score))
+						Some((id, dt, title, score, snippet))
 					}).collect()
 			}
 			"fts" => {
@@ -862,7 +864,7 @@ impl WikiService {
 				match search::search_topk(&index, &query, None, k) {
 					Ok(hits) => hits.into_iter().map(|(d, s)| {
 						let dt = d.tags.first().map(|t| doc_type_from_base_tag(t)).unwrap_or_else(|| "thoughts".to_string());
-						(d.id, dt, d.title, s as f64)
+						(d.id, dt, d.title, s as f64, String::new())
 					}).collect(),
 					Err(e) => return json_err(e),
 				}
@@ -871,7 +873,7 @@ impl WikiService {
 				match store::search_by_tag(self.root(), &query) {
 					Ok(docs) => docs.into_iter().take(k).map(|d| {
 						let dt = d.tags.first().map(|t| doc_type_from_base_tag(t)).unwrap_or_else(|| "thoughts".to_string());
-						(d.id, dt, d.title, 0.0)
+						(d.id, dt, d.title, 0.0, String::new())
 					}).collect(),
 					Err(e) => return json_err(e),
 				}
@@ -881,9 +883,10 @@ impl WikiService {
 
 		let mut hits = Vec::new();
 		let mut suggested = Vec::new();
-		for (id, dt, title, score) in &raw_hits {
+		for (id, dt, title, score, snippet) in &raw_hits {
 			let mut hit = serde_json::json!({
 				"id": id, "type": dt, "title": title, "score": score,
+				"snippet": snippet,
 			});
 			if want_bodies {
 				if let Ok(doc) = store::get_document(self.root(), dt, id) {
