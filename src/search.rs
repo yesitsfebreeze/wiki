@@ -105,7 +105,8 @@ pub fn search_topk(
 		&index.index,
 		vec![title_field, content_field, tags_field],
 	);
-	let parsed: Box<dyn Query> = query_parser.parse_query(query_str)?;
+	let sanitized = sanitize_query(query_str);
+	let parsed: Box<dyn Query> = query_parser.parse_query(&sanitized)?;
 
 	let query: Box<dyn Query> = if let Some(tag) = tag_filter {
 		let term = Term::from_field_text(tags_field, tag);
@@ -147,4 +148,47 @@ pub fn search_topk(
 	}
 
 	Ok(results)
+}
+
+/// Strip Tantivy QueryParser DSL chars so doc titles/bodies can be used as
+/// raw queries without `Syntax Error` from punctuation like `+`, `(`, `:`.
+/// Replaces every reserved char with a space; whitespace-collapses the result.
+pub fn sanitize_query(q: &str) -> String {
+	let mut out = String::with_capacity(q.len());
+	for c in q.chars() {
+		match c {
+			'+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
+			| '^' | '"' | '~' | '*' | '?' | ':' | '\\' | '/'
+			| '&' | '|' => out.push(' '),
+			_ => out.push(c),
+		}
+	}
+	out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn sanitize_strips_tantivy_specials() {
+		assert_eq!(sanitize_query("Wiki protocol gotchas + fixes (2026-05-03)"),
+			"Wiki protocol gotchas fixes 2026 05 03");
+	}
+
+	#[test]
+	fn sanitize_strips_field_prefix_colon() {
+		assert_eq!(sanitize_query("3-tier order: conclusions"),
+			"3 tier order conclusions");
+	}
+
+	#[test]
+	fn sanitize_preserves_plain_text() {
+		assert_eq!(sanitize_query("hello world"), "hello world");
+	}
+
+	#[test]
+	fn sanitize_collapses_whitespace() {
+		assert_eq!(sanitize_query("a   b\t\nc"), "a b c");
+	}
 }
