@@ -48,24 +48,18 @@ source doc  →  ingest_thought / ingest_entity
 
 | Tool | What it does |
 |---|---|
-| `ingest_thought` | 📥 Ingest an atomic fact |
-| `ingest_entity` | 📥 Ingest a recurring concept |
-| `ingest_reason` | 🔗 Add a directed edge between nodes |
-| `ingest_question` | ❓ Log an open question |
-| `ingest_conclusion` | ✅ Record synthesized knowledge |
-| `search_fulltext` | 🔍 Tantivy full-text search across all docs |
-| `search_by_tag` | 🏷️ Filter by type, purpose, or sub-tag |
-| `search_reasons_for` | 🕸️ Traverse edges from/to a node |
-| `query` | 🧠 Embedding + fulltext hybrid search |
-| `get` / `list` | 📖 Read individual docs or list by type |
-| `link_doc` | 🔗 Wikilink entity mentions in a doc |
-| `learn_pass` | 🔁 Batch link + dedupe across the vault |
-| `suggest_conclusion` | 💡 Gate synthesis on graph signals |
-| `find_answers` | 🔎 Find candidates for an open question |
-| `code_open` | 📂 Open a source file → function map |
-| `code_search` | 🔍 Grep across all indexed functions |
-| `code_read_body` | 📄 Load one function body |
-| `list_languages` | 🌐 List installed code grammar extensions |
+| `ingest` | 📥 Write doc — `kind`: thought \| entity \| question \| reason \| conclusion. Auto-links + auto-marks-answered |
+| `search` | 🔍 Hybrid search — `mode`: smart (conclusions-first) \| fts (BM25) \| tag \| qa \| list |
+| `get` | 📖 Fetch doc by id with reasons + edges (depth configurable) |
+| `update` | ✏️ Update body / title / tags. Re-embeds + re-links |
+| `delete_doc` | 🗑️ Delete a doc; cascades edge cleanup |
+| `learn_pass` | 🔁 Sensemaker — link/dedupe → connect → raise/answer → promote conclusions |
+| `list_open_questions` | ❓ Paginate unresolved questions, filter by purpose |
+| `mark_question` | ✅ Manually set question state (answered \| dropped) |
+| `purpose` | 🏷️ Manage purposes — `action`: list \| create \| delete \| reembed |
+| `admin` | 🧹 Vault maintenance — `action`: recompute \| sanitize \| migrate \| feedback |
+| `code` | 💻 Code index ops — `action`: index \| search \| read \| refs \| validate |
+| `docs` | 📚 Fetch tool / concept markdown docs (no arg → list) |
 
 ## 💿 Install
 

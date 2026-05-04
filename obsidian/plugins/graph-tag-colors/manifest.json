@@ -1,0 +1,9 @@
+{
+  "id": "graph-tag-colors",
+  "name": "Graph Tag Colors",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Colors tag nodes in graph view to match graph.json color groups at half brightness. Default dark gray.",
+  "author": "wiki",
+  "isDesktopOnly": false
+}

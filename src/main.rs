@@ -221,13 +221,25 @@ async fn run_hook() -> anyhow::Result<()> {
         }
     }
 
+    let mut sys_msg = format!(
+        "wiki: {} hit{}{}",
+        hits.len(),
+        if hits.len() == 1 { "" } else { "s" },
+        if linked.is_empty() { String::new() } else { format!(", {} linked", linked.len()) },
+    );
+    for (score, r) in hits.iter().take(5) {
+        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let tags: Vec<String> = r.get("tags").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let title_short = take_chars(title, 60);
+        sys_msg.push_str(&format!("\n  • {:.2} [{}] {}", score, tags.join(","), title_short));
+    }
+    if hits.len() > 5 {
+        sys_msg.push_str(&format!("\n  … +{} more", hits.len() - 5));
+    }
     let out = serde_json::json!({
-        "systemMessage": format!(
-            "wiki: {} hit{}{}",
-            hits.len(),
-            if hits.len() == 1 { "" } else { "s" },
-            if linked.is_empty() { String::new() } else { format!(", {} linked", linked.len()) },
-        ),
+        "systemMessage": sys_msg,
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": md,

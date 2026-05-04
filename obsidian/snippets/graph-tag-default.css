@@ -1,0 +1,5 @@
+/* Default tag node color in graph view = dark gray.
+   Per-tag overrides applied at runtime by graph-tag-colors plugin. */
+body {
+  --graph-node-tag: #25516333;
+}
