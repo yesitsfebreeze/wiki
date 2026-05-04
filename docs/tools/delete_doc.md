@@ -1,26 +1,45 @@
 # delete_doc
 
-Remove a doc and cascade-clean its edges.
+Remove one or many docs of the same `doc_type`.
 
 ## Params
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `id` | string | (required) | Doc id to delete. |
+| `doc_type` | string | (required) | One of `thoughts`, `entities`, `conclusions`, `questions`, `reasons`. |
+| `id` | string | — | Single doc id. Provide this OR `ids`. |
+| `ids` | string[] | — | Batch list of doc ids. Provide this OR `id`. |
+
+At least one of `id` / `ids` is required. Both may be provided; they are merged.
 
 ## Returns
 
 ```json
-{ "id": "...", "deleted": true, "edges_removed": 4 }
+{
+  "doc_type": "reasons",
+  "deleted": 197,
+  "failed": 0,
+  "results": [
+    { "id": "abc...", "deleted": true },
+    { "id": "missing-id", "deleted": false, "error": "..." }
+  ]
+}
 ```
 
 ## Examples
 
+Single delete:
 ```json
-{ "id": "thoughts/learning/abc" }
+{ "doc_type": "thoughts", "id": "abc-123" }
+```
+
+Batch delete:
+```json
+{ "doc_type": "reasons", "ids": ["a", "b", "c"] }
 ```
 
 ## Notes
 
-- Cascades: all reasons referencing this doc are removed.
-- Use to retract a hallucinated or wrong ingest. To keep the doc but rewrite, use `update`.
+- Per-id failures do not abort the batch. Each result reports its own outcome.
+- Index and cache are updated after each delete.
+- Use `update` to keep a doc but rewrite its body.

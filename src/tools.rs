@@ -157,7 +157,12 @@ struct DocsParams {
 #[derive(Deserialize, JsonSchema)]
 struct DocRefParams {
 	doc_type: String,
-	id: String,
+	/// Single doc id. Provide this OR `ids`.
+	#[serde(default)]
+	id: Option<String>,
+	/// Batch list of doc ids. Provide this OR `id`.
+	#[serde(default)]
+	ids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -694,13 +699,37 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Delete a doc and cascade edge cleanup. Docs: docs(\"delete_doc\"). Args: id, doc_type?.")]
+	#[tool(description = "Delete one or many docs of a given doc_type. Docs: docs(\"delete_doc\"). Args: doc_type, id? | ids?.")]
 	fn delete_doc(&self, params: Parameters<DocRefParams>) -> String {
-		let DocRefParams { doc_type, id } = params.0;
-		match store::delete_document(self.root(), &doc_type, &id) {
-			Ok(_) => format!("Deleted {} '{}'", doc_type, id),
-			Err(e) => json_err(e),
+		let DocRefParams { doc_type, id, ids } = params.0;
+		let mut targets: Vec<String> = Vec::new();
+		if let Some(s) = id { targets.push(s); }
+		if let Some(v) = ids { targets.extend(v); }
+		if targets.is_empty() {
+			return json_err("delete_doc requires `id` or `ids`");
 		}
+
+		let mut results = Vec::with_capacity(targets.len());
+		let mut deleted = 0u64;
+		let mut failed = 0u64;
+		for tid in &targets {
+			match store::delete_document(self.root(), &doc_type, tid) {
+				Ok(_) => {
+					deleted += 1;
+					results.push(serde_json::json!({ "id": tid, "deleted": true }));
+				}
+				Err(e) => {
+					failed += 1;
+					results.push(serde_json::json!({ "id": tid, "deleted": false, "error": e.to_string() }));
+				}
+			}
+		}
+		serde_json::json!({
+			"doc_type": doc_type,
+			"deleted": deleted,
+			"failed": failed,
+			"results": results,
+		}).to_string()
 	}
 
 	fn list_ingest_log(&self, params: Parameters<ListLogParams>) -> String {
