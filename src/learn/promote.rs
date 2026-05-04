@@ -170,6 +170,7 @@ async fn cross_topic_emit_and_promote(
 ) -> Result<usize> {
 	let strong = cfg.answer_threshold;
 	let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
+	let mut support_edges: Vec<AnswerCandidate> = Vec::new();
 	let mut got_answer = false;
 	for c in candidates {
 		let kind = if c.score >= strong { "Answers" } else { "Supports" };
@@ -177,21 +178,33 @@ async fn cross_topic_emit_and_promote(
 		let _ = store::create_reason(
 			root, question_id, &c.doc_id, kind, &c.body, question_purpose,
 		);
-		if c.score >= strong { strong_edges.push(c.clone()); }
+		if c.score >= strong {
+			strong_edges.push(c.clone());
+		} else if c.score >= cfg.support_threshold {
+			support_edges.push(c.clone());
+		}
 	}
-	if !got_answer {
+
+	let promotion_edges: &[AnswerCandidate] = if got_answer {
+		strong_edges.as_slice()
+	} else if support_edges.len() >= cfg.support_promote_floor {
+		support_edges.as_slice()
+	} else {
 		return Ok(0);
-	}
+	};
 
 	if let Ok(mut q) = store::get_document(root, "questions", question_id) {
 		if !q.tags.iter().any(|t| t == "answered") {
 			q.tags.push("answered".to_string());
+			if !got_answer && !q.tags.iter().any(|t| t == "synthesized") {
+				q.tags.push("synthesized".to_string());
+			}
 			let _ = store::update_document(root, "questions", question_id, None, Some(q.tags));
 		}
 	}
 
 	let mut bridges: HashSet<String> = HashSet::new();
-	for c in &strong_edges {
+	for c in promotion_edges {
 		for p in candidate_support_purposes(root, &c.doc_id) {
 			if Some(p.as_str()) != question_purpose {
 				bridges.insert(p);
@@ -209,11 +222,11 @@ async fn cross_topic_emit_and_promote(
 		}
 	}
 
-	let cid = promote_to_conclusion(root, question_id, &strong_edges, cfg).await?;
+	let cid = promote_to_conclusion(root, question_id, promotion_edges, cfg).await?;
 	if let Some(cid) = cid.as_ref() {
 		let _ = tag_conclusion_with_bridges(root, cid, &bridges);
 	}
-	Ok(strong_edges.len())
+	Ok(promotion_edges.len())
 }
 
 pub async fn cross_topic_pass(root: &Path, question_id: &str, cfg: &PassConfig) -> Result<usize> {
@@ -313,11 +326,11 @@ pub async fn promote_to_conclusion(
 	)?;
 
 	let _ = store::create_reason(root, question_id, &cdoc.id, "Derives", "promoted from resolved question", purpose.as_deref());
-	let strong = cfg.answer_threshold;
+	// Emit a `References` edge from the conclusion to every passed candidate.
+	// Callers already filter to the right cohort (Answers-only when an
+	// `answer_threshold` candidate exists, else the synthesis cohort).
 	for e in edges {
-		if e.score >= strong {
-			let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", &e.body, purpose.as_deref());
-		}
+		let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", &e.body, purpose.as_deref());
 	}
 	Ok(Some(cdoc.id))
 }
@@ -411,6 +424,71 @@ mod tests {
 		assert!(find_similar_conclusion(root, &probe, "general", 0.92).is_some());
 
 		cache::pool_remove(root, &cdoc.id);
+	}
+
+	#[tokio::test]
+	async fn synthesis_promotes_when_supports_floor_met() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let qtitle = "What converges from many partial supports?";
+		let qhash = fnv_question_id(qtitle);
+		let qtags = vec!["question".to_string(), "general".to_string(), qhash.clone()];
+		let qdoc = store::create_document(root, "questions", qtitle, "qbody", qtags, Some("general"), None).unwrap();
+
+		// Pre-existing conclusion with matching hash → promote_to_conclusion
+		// returns early without an LLM call.
+		let ctags = vec!["conclusion".to_string(), "general".to_string(), qhash.clone()];
+		let cdoc = store::create_document(root, "conclusions", qtitle, "existing", ctags, Some("general"), None).unwrap();
+
+		let s1 = store::create_document(root, "thoughts", "s1", "x",
+			vec!["thought".to_string(), "general".to_string()], Some("general"), None).unwrap();
+		let s2 = store::create_document(root, "thoughts", "s2", "y",
+			vec!["thought".to_string(), "general".to_string()], Some("general"), None).unwrap();
+
+		// All candidates below answer_threshold (0.6) but ≥ support_threshold (0.3).
+		let cands = vec![
+			AnswerCandidate { doc_id: s1.id.clone(), doc_type: "thoughts".into(), score: 0.4, kind: "Supports".into(), body: "partial".into() },
+			AnswerCandidate { doc_id: s2.id.clone(), doc_type: "thoughts".into(), score: 0.45, kind: "Supports".into(), body: "partial".into() },
+		];
+
+		let cfg = PassConfig { support_promote_floor: 2, ..PassConfig::default() };
+		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("general"), &cands, &cfg).await.unwrap();
+		assert_eq!(n, 2, "expected promote with 2 support edges");
+
+		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
+		assert!(q.tags.iter().any(|t| t == "answered"));
+		assert!(q.tags.iter().any(|t| t == "synthesized"));
+
+		// Conclusion was reused, not duplicated.
+		let concs = store::list_documents(root, "conclusions").unwrap();
+		assert_eq!(concs.len(), 1);
+		assert_eq!(concs[0].id, cdoc.id);
+	}
+
+	#[tokio::test]
+	async fn synthesis_skipped_when_supports_below_floor() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let qtitle = "Not enough support yet?";
+		let qhash = fnv_question_id(qtitle);
+		let qtags = vec!["question".to_string(), "general".to_string(), qhash];
+		let qdoc = store::create_document(root, "questions", qtitle, "qbody", qtags, Some("general"), None).unwrap();
+
+		let s1 = store::create_document(root, "thoughts", "only", "z",
+			vec!["thought".to_string(), "general".to_string()], Some("general"), None).unwrap();
+
+		let cands = vec![
+			AnswerCandidate { doc_id: s1.id.clone(), doc_type: "thoughts".into(), score: 0.4, kind: "Supports".into(), body: "partial".into() },
+		];
+		let cfg = PassConfig { support_promote_floor: 3, ..PassConfig::default() };
+		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("general"), &cands, &cfg).await.unwrap();
+		assert_eq!(n, 0, "below floor must not promote");
+		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
+		assert!(!q.tags.iter().any(|t| t == "answered"));
 	}
 
 	#[tokio::test]

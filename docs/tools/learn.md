@@ -54,7 +54,17 @@ Reports edges added, questions raised, conclusions promoted. The pass samples we
 
 ## Environment
 
-Per-call tunables: `auto_link_threshold` (default `0.82`), `auto_link_cap` (default `5`), `answer_threshold` (default `0.8`).
+Per-call tunables: `auto_link_threshold` (default `0.82`), `auto_link_cap` (default `5`), `answer_threshold` (default `0.6`), `support_threshold` (default `0.3`), `support_promote_floor` (default `3`, synthesis-floor — promote conclusion when N supports accumulate without a strong answer), `edge_threshold` (default `0.7`), `connect_k` (default `10`), `qa_max_per_pass` (default `50`), `conclusion_merge_threshold` (default `0.92`).
+
+### Wikilink → References edges
+
+`link_doc_internal` (run automatically by `learn_pass` and `ingest`) scans every `[[...]]` wikilink in a doc body and mints a `References` reason edge from the source doc to the target. Resolves three target forms:
+
+- `[[<uuid>]]` — raw id, searched across all doc types.
+- `[[<doc_type>/<id>]]` — direct lookup (e.g. `[[questions/<id>]]`).
+- `[[entities/<purpose>/<slug>]]` — entity index slug lookup.
+
+Edges inside fenced or inline code blocks are skipped. Re-running is idempotent: existing `References` edges from the source are not duplicated.
 
 ## Common mistakes
 

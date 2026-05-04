@@ -94,7 +94,7 @@ pub(crate) fn derive_title(body: &str, fallback: &str) -> String {
 	let mut s = body.trim_start();
 	loop {
 		let prev = s;
-		s = s.trim_start_matches(|c: char| matches!(c, '#' | '*' | '-' | '>' | ' ' | '\t' | '\r' | '\n'));
+		s = s.trim_start_matches(['#', '*', '-', '>', ' ', '\t', '\r', '\n']);
 		// Strip leading [[wikilink]]
 		if let Some(rest) = s.strip_prefix("[[") {
 			if let Some(end) = rest.find("]]") {
@@ -119,7 +119,7 @@ pub(crate) fn derive_title(body: &str, fallback: &str) -> String {
 		}
 	}
 	let cut = s
-		.find(|c: char| matches!(c, '.' | '?' | '!' | '\n'))
+		.find(['.', '?', '!', '\n'])
 		.unwrap_or(s.len());
 	let candidate = s[..cut].trim();
 	if candidate.is_empty() {
@@ -264,6 +264,9 @@ struct LearnPassParams {
 	qa_max_per_pass: Option<u64>,
 	/// Merge into existing conclusion if cosine ≥ this. Default `0.92`.
 	conclusion_merge_threshold: Option<f32>,
+	/// Synthesis-floor: minimum `Supports` candidates required to promote a
+	/// conclusion when no candidate clears `answer_threshold`. Default `3`.
+	support_promote_floor: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -892,12 +895,12 @@ impl WikiService {
 	}
 
 
-	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?.")]
+	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?, support_promote_floor?.")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
 		let LearnPassParams {
 			limit, purpose, dry_run, qa, force, raise_questions,
 			answer_threshold, support_threshold, edge_threshold, connect_k,
-			qa_max_per_pass, conclusion_merge_threshold,
+			qa_max_per_pass, conclusion_merge_threshold, support_promote_floor,
 		} = params.0;
 		let limit = limit.map(|n| n as usize).unwrap_or(25);
 		let defaults = learn::PassConfig::default();
@@ -909,6 +912,9 @@ impl WikiService {
 			edge_threshold: edge_threshold.unwrap_or(defaults.edge_threshold),
 			connect_k: connect_k.map(|n| n as usize).unwrap_or(defaults.connect_k),
 			raise_questions: raise_questions.unwrap_or(defaults.raise_questions),
+			support_promote_floor: support_promote_floor
+				.map(|n| n as usize)
+				.unwrap_or(defaults.support_promote_floor),
 		};
 		match learn::run_pass(self.root(), limit, purpose.as_deref(), dry_run.unwrap_or(false), qa.unwrap_or(true), force.unwrap_or(false), &cfg).await {
 			Ok(v) => v.to_string(),

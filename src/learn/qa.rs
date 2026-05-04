@@ -145,6 +145,7 @@ async fn qa_for_doc(
 			Err(_) => continue,
 		};
 		let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
+		let mut support_edges: Vec<AnswerCandidate> = Vec::new();
 		let mut got_answer = false;
 		let mut max_score: f32 = 0.0;
 		for c in &cands {
@@ -152,7 +153,11 @@ async fn qa_for_doc(
 			let kind = if c.score >= strong { "Answers" } else { "Supports" };
 			if c.score >= strong { got_answer = true; }
 			let _ = store::create_reason(root, &qid, &c.doc_id, kind, &c.body, qpurpose.as_deref());
-			if c.score >= strong { strong_edges.push(c.clone()); }
+			if c.score >= strong {
+				strong_edges.push(c.clone());
+			} else if c.score >= cfg.support_threshold {
+				support_edges.push(c.clone());
+			}
 		}
 		if got_answer {
 			answered += 1;
@@ -167,6 +172,23 @@ async fn qa_for_doc(
 			*llm_budget = llm_budget.saturating_sub(1);
 			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &strong_edges, cfg).await {
 				promoted += 1;
+			}
+		} else if support_edges.len() >= cfg.support_promote_floor {
+			// Synthesis path: no single strong answer, but enough Supports
+			// accumulated to crystallize a conclusion.
+			if *llm_budget == 0 { continue; }
+			*llm_budget = llm_budget.saturating_sub(1);
+			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &support_edges, cfg).await {
+				answered += 1;
+				promoted += 1;
+				if let Ok(mut q) = store::get_document(root, "questions", &qid) {
+					if !q.tags.iter().any(|t| t == "answered") {
+						q.tags.push("answered".to_string());
+						q.tags.push("synthesized".to_string());
+						let _ = store::update_document(root, "questions", &qid, None, Some(q.tags));
+						let _ = super::links::move_to_answered(root, &qid);
+					}
+				}
 			}
 		} else if max_score >= cfg.support_threshold && *llm_budget >= 2 {
 			*llm_budget = llm_budget.saturating_sub(2);

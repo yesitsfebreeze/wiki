@@ -25,6 +25,27 @@ pub(crate) fn protected_re() -> &'static [Regex] {
 	})
 }
 
+fn code_protected_re() -> &'static [Regex] {
+	static RE: OnceLock<Vec<Regex>> = OnceLock::new();
+	RE.get_or_init(|| {
+		[r"(?ms)^```.*?^```", r"`[^`\n]+`"]
+			.iter()
+			.filter_map(|p| Regex::new(p).ok())
+			.collect()
+	})
+}
+
+fn code_protected_ranges(text: &str) -> Vec<(usize, usize)> {
+	let mut ranges = Vec::new();
+	for re in code_protected_re() {
+		for m in re.find_iter(text) {
+			ranges.push((m.start(), m.end()));
+		}
+	}
+	ranges.sort();
+	ranges
+}
+
 pub(crate) fn link_target_re() -> &'static Regex {
 	static RE: OnceLock<Regex> = OnceLock::new();
 	RE.get_or_init(|| Regex::new(r"\[\[([^\]|#]+?)(?:[#|][^\]]*)?\]\]").unwrap())
@@ -121,6 +142,94 @@ fn collect_link_purposes(root: &Path, body: &str) -> HashSet<String> {
 		}
 	}
 	out
+}
+
+const DOC_TYPES: &[&str] = &["thoughts", "entities", "conclusions", "reasons", "questions"];
+
+/// Resolve a wikilink target string to `(doc_type, id)` if it points at an
+/// existing doc. Accepts:
+/// - 1-part: raw uuid — searched across all doc types.
+/// - 2-part `<doc_type>/<id>`: direct lookup.
+/// - 3-part `entities/<purpose>/<slug>`: slug→id via entity index.
+fn resolve_wikilink_target(
+	root: &Path,
+	target: &str,
+	entities: &[EntityRef],
+) -> Option<(&'static str, String)> {
+	let parts: Vec<&str> = target.split('/').filter(|p| !p.is_empty()).collect();
+	match parts.len() {
+		1 => {
+			let id = parts[0];
+			for dt in DOC_TYPES {
+				if store::get_document(root, dt, id).is_ok() {
+					return Some((dt, id.to_string()));
+				}
+			}
+			None
+		}
+		2 => {
+			let dt_in = parts[0];
+			let dt = DOC_TYPES.iter().find(|d| **d == dt_in)?;
+			if let Ok(d) = store::get_document(root, dt, parts[1]) {
+				return Some((dt, d.id));
+			}
+			None
+		}
+		3 => {
+			if parts[0] != "entities" { return None; }
+			let slug = parts[2];
+			let e = entities.iter().find(|e| e.slug == slug)?;
+			Some(("entities", e.id.clone()))
+		}
+		_ => None,
+	}
+}
+
+/// Scan body for `[[...]]` wikilinks (skipping those inside code blocks) and
+/// mint a `References` reason edge from `self_id` → each resolved target.
+/// Idempotent: skips targets that already have a `References` edge from `self_id`.
+/// Returns the number of new edges created.
+fn emit_wikilink_references(
+	root: &Path,
+	self_doc_type: &str,
+	self_id: &str,
+	body: &str,
+	purpose: Option<&str>,
+	entities: &[EntityRef],
+) -> usize {
+	let code_ranges = code_protected_ranges(body);
+	let in_code = |pos: usize| code_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
+
+	let existing_targets: HashSet<String> = match store::search_reasons_for(root, self_id, "from") {
+		Ok(reasons) => reasons
+			.into_iter()
+			.filter_map(|r| {
+				let (_from, to, kind, _p) = super::infra::read_reason_meta(root, &r.id)?;
+				if kind == "References" { Some(to) } else { None }
+			})
+			.collect(),
+		Err(_) => HashSet::new(),
+	};
+
+	let mut seen_this_pass: HashSet<String> = HashSet::new();
+	let mut emitted = 0usize;
+	for cap in link_target_re().captures_iter(body) {
+		let m = match cap.get(0) { Some(m) => m, None => continue };
+		if in_code(m.start()) { continue; }
+		let target = match cap.get(1).map(|m| m.as_str().trim()) {
+			Some(t) if !t.is_empty() => t,
+			_ => continue,
+		};
+		let Some((target_dt, target_id)) = resolve_wikilink_target(root, target, entities) else { continue };
+		if target_id == self_id { continue; }
+		if existing_targets.contains(&target_id) { continue; }
+		if !seen_this_pass.insert(target_id.clone()) { continue; }
+		let body_msg = format!("wikilink {}->{}", self_doc_type, target_dt);
+		if store::create_reason(root, self_id, &target_id, "References", &body_msg, purpose).is_ok() {
+			emitted += 1;
+		}
+	}
+	emitted
 }
 
 fn rewrite_inbound_links(root: &Path, old_target: &str, new_target: &str) -> Result<()> {
@@ -277,6 +386,18 @@ pub(crate) async fn link_doc_internal(
 		}
 	}
 
+	let mut references_added = 0usize;
+	if !dry_run {
+		references_added = emit_wikilink_references(
+			root,
+			doc_type,
+			id,
+			&deduped,
+			doc.purpose.as_deref(),
+			entities,
+		);
+	}
+
 	let mut moved_to_crosstopic = false;
 	if !dry_run {
 		let mut purposes = collect_link_purposes(root, &deduped);
@@ -298,6 +419,7 @@ pub(crate) async fn link_doc_internal(
 		"links_added": link_count,
 		"aliases_added": aliases_added,
 		"paragraphs_merged": merges.len(),
+		"references_added": references_added,
 		"modified": !dry_run && modified,
 		"moved_to_crosstopic": moved_to_crosstopic,
 		"dry_run": dry_run,
@@ -312,11 +434,124 @@ pub async fn link_doc(root: &Path, doc_type: &str, id: &str, dry_run: bool) -> R
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use tempfile::TempDir;
 
 	#[test]
 	fn protected_ranges_skip_code() {
 		let text = "hello `code` world\n\n```\nfoo bar\n```\n\ntail";
 		let r = protected_ranges(text);
 		assert!(r.iter().any(|(s, _)| text[*s..].starts_with('`')));
+	}
+
+	#[test]
+	fn code_ranges_exclude_wikilinks() {
+		let text = "see `[[a]]` and [[b]]";
+		let r = code_protected_ranges(text);
+		// wikilink [[b]] is not in any code range
+		let b_pos = text.find("[[b]]").unwrap();
+		assert!(!r.iter().any(|(s, e)| b_pos >= *s && b_pos < *e));
+		// inline-code wikilink is in a code range
+		let a_pos = text.find("[[a]]").unwrap();
+		assert!(r.iter().any(|(s, e)| a_pos >= *s && a_pos < *e));
+	}
+
+	#[tokio::test]
+	async fn wikilink_emits_reference_edge() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let target = store::create_document(
+			root, "thoughts", "Target", "target body",
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		let body = format!("see [[{}]] for context.", target.id);
+		let src = store::create_document(
+			root, "thoughts", "Source", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let res = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+		assert_eq!(res["references_added"].as_u64(), Some(1));
+
+		let from_src = store::search_reasons_for(root, &src.id, "from").unwrap();
+		assert!(
+			from_src.iter().any(|r| r.title.contains("-[References]->") && r.title.ends_with(&target.id)),
+			"expected References edge src→target, got {:?}",
+			from_src.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+		);
+	}
+
+	#[tokio::test]
+	async fn wikilink_idempotent() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let target = store::create_document(
+			root, "thoughts", "T", "tbody",
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		let body = format!("ref [[{}]]", target.id);
+		let src = store::create_document(
+			root, "thoughts", "S", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let r1 = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+		let r2 = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+		assert_eq!(r1["references_added"].as_u64(), Some(1));
+		assert_eq!(r2["references_added"].as_u64(), Some(0), "second run must not duplicate");
+	}
+
+	#[tokio::test]
+	async fn wikilink_skips_inside_code_block() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let target = store::create_document(
+			root, "thoughts", "T2", "x",
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		// Wikilink only appears inside inline code → must not mint an edge.
+		let body = format!("example: `[[{}]]`", target.id);
+		let src = store::create_document(
+			root, "thoughts", "S2", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let res = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+		assert_eq!(res["references_added"].as_u64(), Some(0));
+	}
+
+	#[tokio::test]
+	async fn wikilink_resolves_two_part_form() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let target = store::create_document(
+			root, "questions", "Q?", "qbody",
+			vec!["question".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		let body = format!("see [[questions/{}]]", target.id);
+		let src = store::create_document(
+			root, "thoughts", "S3", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let res = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+		assert_eq!(res["references_added"].as_u64(), Some(1));
+		let from_src = store::search_reasons_for(root, &src.id, "from").unwrap();
+		assert!(from_src.iter().any(|r| r.title.ends_with(&target.id)));
 	}
 }

@@ -45,6 +45,10 @@ pub struct PassConfig {
 	/// Enable LLM question raising during the pass. Off by default so ingest-
 	/// driven passes stay quiet; enable for deliberate `/learn --raise` runs.
 	pub raise_questions: bool,
+	/// Minimum number of `Supports` candidates that triggers conclusion
+	/// promotion when no candidate reaches `answer_threshold`. Lets gradual
+	/// support accumulation crystallize without a single strong answer.
+	pub support_promote_floor: usize,
 }
 
 impl Default for PassConfig {
@@ -57,6 +61,7 @@ impl Default for PassConfig {
 			edge_threshold: 0.7,
 			connect_k: 10,
 			raise_questions: false,
+			support_promote_floor: 3,
 		}
 	}
 }
