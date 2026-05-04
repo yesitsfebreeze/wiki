@@ -100,7 +100,7 @@ mod tests {
 			let tags = vec!["question".to_string(), "phyons".to_string(), hash];
 			let q = store::create_document(root, "questions", t, "b", tags, Some("phyons"), None).unwrap();
 			if i == 0 {
-				store::create_reason(root, &anchor.id, &q.id, "Answers", "answers it", Some("phyons")).unwrap();
+				store::create_reason(root, &anchor.id, &q.id, "Answers", Some("answers it"), Some("phyons")).unwrap();
 			}
 			q_ids.push(q.id);
 		}

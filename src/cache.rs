@@ -468,7 +468,7 @@ mod tests {
 		store::bootstrap(root).unwrap();
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
-		let r = store::create_reason(root, &a.id, &b.id, "Answers", "because", None).unwrap();
+		let r = store::create_reason(root, &a.id, &b.id, "Answers", Some("because"), None).unwrap();
 		let from_a = reason_index_lookup(root, &a.id);
 		let to_b = reason_index_lookup(root, &b.id);
 		assert!(from_a.from.contains(&r.id), "expected from-edge on A");

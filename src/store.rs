@@ -434,14 +434,44 @@ pub fn parse_frontmatter(content: &str) -> anyhow::Result<(serde_json::Value, St
 	Ok((value, body.trim().to_string()))
 }
 
+/// Drop pipeline-metadata strings that leak into the `body` slot.
+/// `body` must mean "human-readable WHY this edge holds" — never provenance,
+/// lifecycle markers, hashes, or topic restatements. Drift sources observed:
+/// audit of 2026-05-04 found 197 meaningless reason bodies across 7 callsites.
+pub(crate) fn sanitize_reason_body(body: Option<&str>) -> Option<String> {
+	let s = body?.trim();
+	if s.is_empty() {
+		return None;
+	}
+	let lower = s.to_lowercase();
+	const META_PREFIXES: &[&str] = &[
+		"this document discusses",
+		"this document",
+		"conclusion synthesizes",
+		"raised by",
+		"explicit ref",
+		"absorbed paragraph",
+		"promoted from",
+		"wikilink ",
+		"auto-linked",
+		"chunk ",
+		"merged into existing",
+	];
+	if META_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+		return None;
+	}
+	Some(s.to_string())
+}
+
 pub fn create_reason(
 	root: &Path,
 	from_id: &str,
 	to_id: &str,
 	kind: &str,
-	body: &str,
+	body: Option<&str>,
 	purpose: Option<&str>,
 ) -> anyhow::Result<Document> {
+	let body = sanitize_reason_body(body);
 	let id = Uuid::new_v4().to_string();
 	let now = Utc::now().to_rfc3339();
 	let title = format!("{} -[{}]-> {}", from_id, kind, to_id);
@@ -470,7 +500,8 @@ pub fn create_reason(
 	let dir = root.join("reasons").join(purpose_dir);
 	std::fs::create_dir_all(&dir)?;
 	let file_path = unique_path(&dir, &slug);
-	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, body))?;
+	let body_str = body.as_deref().unwrap_or("");
+	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, body_str))?;
 	let _ = update_link_index(root);
 	cache::on_doc_changed(root, &id, "reasons");
 
@@ -487,7 +518,7 @@ pub fn create_reason(
 		source_doc_id: None,
 		created_at: now.clone(),
 		updated_at: now,
-		content: body.to_string(),
+		content: body.unwrap_or_default(),
 	})
 }
 
@@ -581,5 +612,39 @@ mod tests {
 		create_purpose(root, "x", "X", "desc").unwrap();
 		delete_purpose(root, "x").unwrap();
 		assert!(list_purposes(root).unwrap().is_empty());
+	}
+
+	#[test]
+	fn sanitize_reason_body_drops_pipeline_metadata() {
+		let cases = [
+			"raised by",
+			"explicit ref provided at ingest",
+			"absorbed paragraph hash:abc123",
+			"promoted from resolved question",
+			"wikilink thoughts->questions",
+			"auto-linked from ingest invariant",
+			"Chunk 2 of 'Foo' (purpose: bar)",
+			"merged into existing conclusion via embedding similarity",
+			"This document discusses memory pooling.",
+			"Conclusion synthesizes the key facts about X.",
+		];
+		for c in cases {
+			assert_eq!(sanitize_reason_body(Some(c)), None, "should drop: {c}");
+		}
+	}
+
+	#[test]
+	fn sanitize_reason_body_drops_empty_and_whitespace() {
+		assert_eq!(sanitize_reason_body(None), None);
+		assert_eq!(sanitize_reason_body(Some("")), None);
+		assert_eq!(sanitize_reason_body(Some("   \t\n  ")), None);
+	}
+
+	#[test]
+	fn sanitize_reason_body_keeps_real_reasons() {
+		let s = sanitize_reason_body(Some("token expiry check uses < instead of <="));
+		assert_eq!(s.as_deref(), Some("token expiry check uses < instead of <="));
+		let s = sanitize_reason_body(Some("  causal claim with surrounding ws  "));
+		assert_eq!(s.as_deref(), Some("causal claim with surrounding ws"));
 	}
 }

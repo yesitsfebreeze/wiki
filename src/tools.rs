@@ -603,7 +603,7 @@ impl WikiService {
 					&child.id,
 					&parent.id,
 					"PartOf",
-					&format!("Chunk {} of '{}' (purpose: {})", i + 1, title, chunk.purpose),
+					None,
 					Some(&chunk.purpose),
 				);
 				children.push(serde_json::json!({
@@ -1165,7 +1165,7 @@ impl WikiService {
 				let to = match to_id { Some(s) => s, None => return json_err("reason requires to_id") };
 				let rk = reason_kind.unwrap_or_else(|| "References".to_string());
 				let purpose = self.classify_or_hint(purpose_hint.as_deref(), &body).await;
-				match store::create_reason(self.root(), &from, &to, &rk, &body, Some(&purpose)) {
+				match store::create_reason(self.root(), &from, &to, &rk, Some(&body), Some(&purpose)) {
 					Ok(doc) => {
 						self.try_index_doc(&doc);
 						let _ = store::log_ingest(self.root(), "reasons", &doc.id, &doc.title);
@@ -1205,7 +1205,7 @@ impl WikiService {
 					src_id,
 					rid,
 					"References",
-					"explicit ref provided at ingest",
+					None,
 					purpose.as_deref(),
 				) {
 					Ok(edge) => {
@@ -1278,7 +1278,7 @@ impl WikiService {
 			tags_opt = Some(q.tags);
 		}
 		let _ = store::update_document(self.root(), "questions", &qid, None, tags_opt);
-		let _ = store::create_reason(self.root(), conclusion_id, &qid, "Answers", "auto-linked from ingest invariant", None);
+		let _ = store::create_reason(self.root(), conclusion_id, &qid, "Answers", None, None);
 		Some(serde_json::json!({"question_id": qid, "score": score, "marked": "answered"}))
 	}
 
@@ -1304,7 +1304,7 @@ impl WikiService {
 			tags_opt = Some(q.tags);
 		}
 		let _ = store::update_document(self.root(), "questions", question_id, None, tags_opt);
-		let _ = store::create_reason(self.root(), &cid, question_id, "Answers", "auto-linked from ingest invariant", None);
+		let _ = store::create_reason(self.root(), &cid, question_id, "Answers", None, None);
 		Some(serde_json::json!({"conclusion_id": cid, "score": score, "marked": "answered"}))
 	}
 }

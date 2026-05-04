@@ -81,7 +81,7 @@ pub async fn connect_doc(
 		let raw_kind = classify_kind(doc.purpose.as_deref(), tgt_purpose.as_deref(), cosine);
 		let kind = allowed_kind(raw_kind);
 		let body = format!("Semantically related (cosine: {cosine:.2})");
-		if store::create_reason(root, &doc.id, id, kind, &body, doc.purpose.as_deref()).is_ok() {
+		if store::create_reason(root, &doc.id, id, kind, Some(&body), doc.purpose.as_deref()).is_ok() {
 			added += 1;
 		}
 	}
@@ -102,7 +102,7 @@ mod tests {
 		let a = store::create_document(root, "thoughts", "A", "a", vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
 		let b = store::create_document(root, "thoughts", "B", "b", vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
 		let c = store::create_document(root, "thoughts", "C", "c", vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
-		store::create_reason(root, &a.id, &b.id, "Supports", "x", Some("general")).unwrap();
+		store::create_reason(root, &a.id, &b.id, "Supports", Some("x"), Some("general")).unwrap();
 		cache::invalidate_indexes(root);
 		let out = existing_outbound_targets(root, &a.id);
 		assert!(out.contains(&b.id));

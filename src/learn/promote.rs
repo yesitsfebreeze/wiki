@@ -55,7 +55,11 @@ pub(crate) async fn cross_reference_question(
 	let sys = "Given a question and these candidate docs, score each 0..1 for how well it \
 		answers, and pick a kind from Answers|Supports|Contradicts|Extends|References. \
 		Return JSON {\"scored\":[{\"picked_id\":string,\"score\":number,\"kind\":string,\"body\":string}]}. \
-		`body` is one short sentence on WHY. Include every candidate id.";
+		`body` MUST state WHY this candidate answers (causal/logical claim, <=20 words). \
+		NOT a topic description. NOT 'this document discusses X'. \
+		If you cannot state a why concisely, return body: \"\". \
+		Empty body is preferred over topic restatement. \
+		Include every candidate id.";
 	let user = format!("Question: {}\n\nCandidates:\n{}", question, cand_json);
 	let raw = http::chat_json(sys, &user).await?;
 	let parsed: ScoredResp = serde_json::from_str(&raw)
@@ -176,7 +180,7 @@ async fn cross_topic_emit_and_promote(
 		let kind = if c.score >= strong { "Answers" } else { "Supports" };
 		if c.score >= strong { got_answer = true; }
 		let _ = store::create_reason(
-			root, question_id, &c.doc_id, kind, &c.body, question_purpose,
+			root, question_id, &c.doc_id, kind, Some(&c.body), question_purpose,
 		);
 		if c.score >= strong {
 			strong_edges.push(c.clone());
@@ -312,7 +316,7 @@ pub async fn promote_to_conclusion(
 				question_id,
 				&existing_id,
 				"Consolidates",
-				"merged into existing conclusion via embedding similarity",
+				None,
 				purpose.as_deref(),
 			);
 			eprintln!("merged into existing conclusion {}", existing_id);
@@ -325,12 +329,12 @@ pub async fn promote_to_conclusion(
 		root, "conclusions", &question.title, &parsed.body, tags, Some(&purpose_tag), None,
 	)?;
 
-	let _ = store::create_reason(root, question_id, &cdoc.id, "Derives", "promoted from resolved question", purpose.as_deref());
+	let _ = store::create_reason(root, question_id, &cdoc.id, "Derives", None, purpose.as_deref());
 	// Emit a `References` edge from the conclusion to every passed candidate.
 	// Callers already filter to the right cohort (Answers-only when an
 	// `answer_threshold` candidate exists, else the synthesis cohort).
 	for e in edges {
-		let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", &e.body, purpose.as_deref());
+		let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", Some(&e.body), purpose.as_deref());
 	}
 	Ok(Some(cdoc.id))
 }
@@ -594,9 +598,9 @@ mod tests {
 			Some("forward-plus"), None,
 		).unwrap();
 
-		store::create_reason(root, &same_purpose_src.id, &cand_a.id, "Supports", "z", Some("phyons")).unwrap();
-		store::create_reason(root, &other_purpose_src.id, &cand_a.id, "Supports", "z", Some("forward-plus")).unwrap();
-		store::create_reason(root, &same_purpose_src.id, &cand_b.id, "Supports", "z", Some("phyons")).unwrap();
+		store::create_reason(root, &same_purpose_src.id, &cand_a.id, "Supports", Some("z"), Some("phyons")).unwrap();
+		store::create_reason(root, &other_purpose_src.id, &cand_a.id, "Supports", Some("z"), Some("forward-plus")).unwrap();
+		store::create_reason(root, &same_purpose_src.id, &cand_b.id, "Supports", Some("z"), Some("phyons")).unwrap();
 
 		cache::invalidate_indexes(root);
 
@@ -637,11 +641,11 @@ mod tests {
 			Some("forward-plus"), None,
 		).unwrap();
 
-		store::create_reason(root, &src_a.id, &qdoc.id, "Supports", "z", Some("phyons")).unwrap();
+		store::create_reason(root, &src_a.id, &qdoc.id, "Supports", Some("z"), Some("phyons")).unwrap();
 		cache::invalidate_indexes(root);
 		assert!(!should_invoke_cross_topic(root, &qdoc.id));
 
-		store::create_reason(root, &src_b.id, &qdoc.id, "Supports", "z", Some("forward-plus")).unwrap();
+		store::create_reason(root, &src_b.id, &qdoc.id, "Supports", Some("z"), Some("forward-plus")).unwrap();
 		cache::invalidate_indexes(root);
 		assert!(should_invoke_cross_topic(root, &qdoc.id));
 		let purposes = question_support_purposes(root, &qdoc.id);

@@ -191,7 +191,7 @@ mod tests {
 				root, "questions", &format!("Q{}", i), "q", vec![], None, None,
 			)
 			.unwrap();
-			store::create_reason(root, &q.id, &c1.id, "Answers", "ans", None).unwrap();
+			store::create_reason(root, &q.id, &c1.id, "Answers", Some("ans"), None).unwrap();
 		}
 		cache::invalidate_indexes(root);
 		let r1 = compute_weight(root, &c1.id, "conclusions");
@@ -206,7 +206,7 @@ mod tests {
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
 		let baseline = compute_weight(root, &a.id, "entities");
-		store::create_reason(root, &b.id, &a.id, "Contradicts", "x", None).unwrap();
+		store::create_reason(root, &b.id, &a.id, "Contradicts", Some("x"), None).unwrap();
 		cache::invalidate_indexes(root);
 		let after = compute_weight(root, &a.id, "entities");
 		assert!(after < baseline, "contradicts must reduce weight ({} >= {})", after, baseline);
@@ -218,7 +218,7 @@ mod tests {
 		let root = dir.path();
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
-		store::create_reason(root, &a.id, &b.id, "Supports", "s", None).unwrap();
+		store::create_reason(root, &a.id, &b.id, "Supports", Some("s"), None).unwrap();
 		cache::invalidate_indexes(root);
 		let n = recompute_all(root).unwrap();
 		assert_eq!(n, 2);
@@ -237,7 +237,7 @@ mod tests {
 		let root = dir.path();
 		let a = store::create_document(root, "thoughts", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "conclusions", "B", "b", vec![], None, None).unwrap();
-		store::create_reason(root, &a.id, &b.id, "Derives", "d", None).unwrap();
+		store::create_reason(root, &a.id, &b.id, "Derives", Some("d"), None).unwrap();
 		cache::invalidate_indexes(root);
 		recompute_all(root).unwrap();
 		let read_ns = |dt: &str, id: &str| -> u64 {
@@ -262,7 +262,7 @@ mod tests {
 		let root = dir.path();
 		let a = store::create_document(root, "entities", "A", "a", vec![], None, None).unwrap();
 		let b = store::create_document(root, "entities", "B", "b", vec![], None, None).unwrap();
-		let r = store::create_reason(root, &a.id, &b.id, "Supports", "s", None).unwrap();
+		let r = store::create_reason(root, &a.id, &b.id, "Supports", Some("s"), None).unwrap();
 		cache::invalidate_indexes(root);
 		recompute_all(root).unwrap();
 		let p = store::find_document_path_by_id(&root.join("reasons"), &r.id).unwrap();

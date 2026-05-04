@@ -152,7 +152,7 @@ async fn qa_for_doc(
 			if c.score > max_score { max_score = c.score; }
 			let kind = if c.score >= strong { "Answers" } else { "Supports" };
 			if c.score >= strong { got_answer = true; }
-			let _ = store::create_reason(root, &qid, &c.doc_id, kind, &c.body, qpurpose.as_deref());
+			let _ = store::create_reason(root, &qid, &c.doc_id, kind, Some(&c.body), qpurpose.as_deref());
 			if c.score >= strong {
 				strong_edges.push(c.clone());
 			} else if c.score >= cfg.support_threshold {
@@ -457,7 +457,7 @@ mod tests {
 		// Saturate the hub with many outbound reasons → high degree, low weight.
 		for i in 0..20 {
 			let leaf = mk_thought(root, &format!("leaf{}", i), "p1");
-			store::create_reason(root, &hub, &leaf, "References", "x", Some("p1")).unwrap();
+			store::create_reason(root, &hub, &leaf, "References", Some("x"), Some("p1")).unwrap();
 		}
 		cache::invalidate_indexes(root);
 

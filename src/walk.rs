@@ -336,7 +336,7 @@ mod tests {
 			root, "thoughts", "Target B", "b body", vec!["thought".into()],
 			None, None,
 		).unwrap();
-		create_reason(root, &a.id, &b.id, "Answers", "a answers b", None).unwrap();
+		create_reason(root, &a.id, &b.id, "Answers", Some("a answers b"), None).unwrap();
 
 		let opts = WalkOpts { depth: 1, fanout: 8, kinds: None, types: None, k: 20 };
 		let hits = tag_walk(root, "topicx", opts).unwrap();
@@ -360,7 +360,7 @@ mod tests {
 			root, "thoughts", "B", "body b", vec!["thought".into()],
 			None, None,
 		).unwrap();
-		create_reason(root, &a.id, &b.id, "References", "ref only", None).unwrap();
+		create_reason(root, &a.id, &b.id, "References", Some("ref only"), None).unwrap();
 
 		// Default kinds exclude References.
 		let hits = tag_walk(root, "tkx", WalkOpts::default()).unwrap();
@@ -396,14 +396,14 @@ mod tests {
 				root, "thoughts", &format!("ans-target-{}", i), "x",
 				vec!["thought".into()], None, None,
 			).unwrap();
-			create_reason(root, &answers_seed.id, &t.id, "Answers", "a", None).unwrap();
+			create_reason(root, &answers_seed.id, &t.id, "Answers", Some("a"), None).unwrap();
 		}
 		for i in 0..3 {
 			let t = create_document(
 				root, "thoughts", &format!("ref-target-{}", i), "x",
 				vec!["thought".into()], None, None,
 			).unwrap();
-			create_reason(root, &refs_seed.id, &t.id, "References", "r", None).unwrap();
+			create_reason(root, &refs_seed.id, &t.id, "References", Some("r"), None).unwrap();
 		}
 
 		let opts = WalkOpts {

@@ -191,7 +191,6 @@ fn resolve_wikilink_target(
 /// Returns the number of new edges created.
 fn emit_wikilink_references(
 	root: &Path,
-	self_doc_type: &str,
 	self_id: &str,
 	body: &str,
 	purpose: Option<&str>,
@@ -220,12 +219,11 @@ fn emit_wikilink_references(
 			Some(t) if !t.is_empty() => t,
 			_ => continue,
 		};
-		let Some((target_dt, target_id)) = resolve_wikilink_target(root, target, entities) else { continue };
+		let Some((_target_dt, target_id)) = resolve_wikilink_target(root, target, entities) else { continue };
 		if target_id == self_id { continue; }
 		if existing_targets.contains(&target_id) { continue; }
 		if !seen_this_pass.insert(target_id.clone()) { continue; }
-		let body_msg = format!("wikilink {}->{}", self_doc_type, target_dt);
-		if store::create_reason(root, self_id, &target_id, "References", &body_msg, purpose).is_ok() {
+		if store::create_reason(root, self_id, &target_id, "References", None, purpose).is_ok() {
 			emitted += 1;
 		}
 	}
@@ -368,13 +366,13 @@ pub(crate) async fn link_doc_internal(
 	if !dry_run {
 		if modified {
 			store::update_document(root, doc_type, id, Some(&deduped), None)?;
-			for (entity_id, hash) in &merges {
+			for (entity_id, _hash) in &merges {
 				let _ = store::create_reason(
 					root,
 					entity_id,
 					id,
 					"Consolidates",
-					&format!("absorbed paragraph hash:{}", hash),
+					None,
 					doc.purpose.as_deref(),
 				);
 			}
@@ -390,7 +388,6 @@ pub(crate) async fn link_doc_internal(
 	if !dry_run {
 		references_added = emit_wikilink_references(
 			root,
-			doc_type,
 			id,
 			&deduped,
 			doc.purpose.as_deref(),

@@ -161,7 +161,7 @@ pub async fn raise_questions_for_doc(
 		let qdoc = store::create_document(
 			root, "questions", &title, &body, tags, Some(&purpose_tag), None,
 		)?;
-		let _ = store::create_reason(root, &qdoc.id, &doc.id, "References", "raised by", purpose.as_deref());
+		let _ = store::create_reason(root, &qdoc.id, &doc.id, "References", None, purpose.as_deref());
 		out.push(RaisedQuestion {
 			question_id: qdoc.id,
 			title,

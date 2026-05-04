@@ -144,7 +144,7 @@ async fn process_entry(
 					qid,
 					&edge.picked_id,
 					kind,
-					&edge.body,
+					Some(&edge.body),
 					decision.purpose.as_deref(),
 				)
 				.is_ok()

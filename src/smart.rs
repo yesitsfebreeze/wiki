@@ -978,8 +978,8 @@ mod tests {
 			root, "thoughts", "EPR paradox", "EPR body",
 			vec!["thought".into()], None, None,
 		).unwrap();
-		create_reason(root, &conc.id, &t1.id, "References", "see bell", None).unwrap();
-		create_reason(root, &conc.id, &t2.id, "References", "see epr", None).unwrap();
+		create_reason(root, &conc.id, &t1.id, "References", Some("see bell"), None).unwrap();
+		create_reason(root, &conc.id, &t2.id, "References", Some("see epr"), None).unwrap();
 
 		let v = conclusions_first(root, "quantum entanglement", None, 10)
 			.unwrap()
@@ -1020,7 +1020,7 @@ mod tests {
 		for i in 0..5 {
 			let q = create_document(root, "questions", &format!("q{}", i),
 				"qbody", vec!["question".into()], None, None).unwrap();
-			create_reason(root, &q.id, &a.id, "Answers", "ans", None).unwrap();
+			create_reason(root, &q.id, &a.id, "Answers", Some("ans"), None).unwrap();
 		}
 		let qterms = lowercase_terms("alpha topic");
 		let sa = score_conclusion(root, &a, &qterms);
@@ -1039,7 +1039,7 @@ mod tests {
 			"beta topic body", vec!["conclusion".into()], None, None).unwrap();
 		let src = create_document(root, "thoughts", "src", "src body",
 			vec!["thought".into()], None, None).unwrap();
-		create_reason(root, &src.id, &a.id, "Contradicts", "no", None).unwrap();
+		create_reason(root, &src.id, &a.id, "Contradicts", Some("no"), None).unwrap();
 		let qterms = lowercase_terms("beta topic");
 		let sa = score_conclusion(root, &a, &qterms);
 		let sb = score_conclusion(root, &b, &qterms);
@@ -1091,7 +1091,7 @@ mod tests {
 			"beta body refuting alpha",
 			vec!["conclusion".into()], None, None,
 		).unwrap();
-		create_reason(root, &a.id, &b.id, "Contradicts", "they disagree", None).unwrap();
+		create_reason(root, &a.id, &b.id, "Contradicts", Some("they disagree"), None).unwrap();
 
 		let v = conclusions_first(root, "alpha causal claim", None, 10)
 			.unwrap()
@@ -1120,7 +1120,7 @@ mod tests {
 			root, "conclusions", "Beta unique-term-bbb",
 			"body bbb", vec!["conclusion".into()], None, None,
 		).unwrap();
-		create_reason(root, &a.id, &b.id, "Contradicts", "x", None).unwrap();
+		create_reason(root, &a.id, &b.id, "Contradicts", Some("x"), None).unwrap();
 
 		let va = conclusions_first(root, "unique-term-aaa", None, 10)
 			.unwrap()
@@ -1160,7 +1160,7 @@ mod tests {
 			root, "conclusions", "Beta retort orthogonal",
 			"beta body", vec!["conclusion".into()], None, None,
 		).unwrap();
-		create_reason(root, &a.id, &b.id, "Contradicts", "x", None).unwrap();
+		create_reason(root, &a.id, &b.id, "Contradicts", Some("x"), None).unwrap();
 
 		let v = conclusions_first(root, "widgetzzz", None, 10).unwrap().expect("hit");
 		assert!(v["results"].as_array().unwrap().is_empty());
