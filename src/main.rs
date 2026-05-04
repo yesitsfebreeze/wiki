@@ -222,6 +222,12 @@ async fn run_hook() -> anyhow::Result<()> {
     }
 
     let out = serde_json::json!({
+        "systemMessage": format!(
+            "wiki: {} hit{}{}",
+            hits.len(),
+            if hits.len() == 1 { "" } else { "s" },
+            if linked.is_empty() { String::new() } else { format!(", {} linked", linked.len()) },
+        ),
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": md,
