@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
@@ -35,6 +35,40 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn write_atomic_str(path: &Path, s: &str) -> Result<()> {
 	write_atomic(path, s.as_bytes())
+}
+
+/// Append a single JSON line (no embedded newlines) to `path`. When the file
+/// already holds `max_lines` lines, rotate it to `<stem>-<ts>.<ext>` first,
+/// then start a fresh file. Creates the parent dir if missing.
+pub fn append_jsonl_rotating(path: &Path, line: &str, max_lines: usize) -> Result<()> {
+	let parent = path
+		.parent()
+		.ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+	if !parent.as_os_str().is_empty() {
+		std::fs::create_dir_all(parent)?;
+	}
+	if path.exists() {
+		let bytes = std::fs::read(path)?;
+		let count = bytes.iter().filter(|&&b| b == b'\n').count();
+		if count >= max_lines {
+			let stem = path
+				.file_stem()
+				.and_then(|s| s.to_str())
+				.unwrap_or("log");
+			let ext = path
+				.extension()
+				.and_then(|s| s.to_str())
+				.unwrap_or("jsonl");
+			let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+			let rotated = parent.join(format!("{}-{}.{}", stem, ts, ext));
+			std::fs::rename(path, &rotated)?;
+		}
+	}
+	let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+	f.write_all(line.as_bytes())?;
+	f.write_all(b"\n")?;
+	f.sync_all()?;
+	Ok(())
 }
 
 /// Serialize an `[f32]` slice as little-endian bytes via atomic write.

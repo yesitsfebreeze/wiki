@@ -334,12 +334,24 @@ pub(crate) fn read_reason_meta(root: &Path, reason_id: &str) -> Option<(String, 
 }
 
 pub(crate) fn write_pass_log(root: &Path, kind: &str, report: &serde_json::Value) -> Result<()> {
-	let log_dir = root.join("ingest_log");
-	std::fs::create_dir_all(&log_dir)?;
-	let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-	let json = serde_json::to_string_pretty(report)?;
-	crate::io::write_atomic_str(&log_dir.join(format!("{}-{}.json", kind, ts)), &json)?;
-	Ok(())
+	let mut entry = serde_json::Map::new();
+	entry.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+	entry.insert(
+		"timestamp".to_string(),
+		serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+	);
+	if let serde_json::Value::Object(map) = report {
+		for (k, v) in map {
+			if k != "kind" && k != "timestamp" {
+				entry.insert(k.clone(), v.clone());
+			}
+		}
+	} else {
+		entry.insert("report".to_string(), report.clone());
+	}
+	let line = serde_json::to_string(&serde_json::Value::Object(entry))?;
+	let path = root.join("ingest_log").join("ingest.jsonl");
+	crate::io::append_jsonl_rotating(&path, &line, crate::store::INGEST_LOG_ROTATE_AT)
 }
 
 #[cfg(test)]

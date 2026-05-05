@@ -535,22 +535,18 @@ pub fn delete_document(root: &Path, doc_type: &str, id: &str) -> anyhow::Result<
 }
 
 pub fn log_ingest(root: &Path, doc_type: &str, doc_id: &str, title: &str) -> anyhow::Result<()> {
-	let now = Utc::now().to_rfc3339();
-	let log_id = Uuid::new_v4().to_string();
 	let entry = serde_json::json!({
-		"id": log_id,
-		"timestamp": now,
+		"kind": "ingest",
+		"timestamp": Utc::now().to_rfc3339(),
 		"doc_type": doc_type,
 		"doc_id": doc_id,
 		"title": title,
 	});
-	let log_dir = root.join("ingest_log");
-	std::fs::create_dir_all(&log_dir)?;
-	write_atomic_str(
-		&log_dir.join(format!("{}.json", log_id)),
-		&serde_json::to_string_pretty(&entry)?,
-	)
+	let path = root.join("ingest_log").join("ingest.jsonl");
+	crate::io::append_jsonl_rotating(&path, &serde_json::to_string(&entry)?, INGEST_LOG_ROTATE_AT)
 }
+
+pub const INGEST_LOG_ROTATE_AT: usize = 265;
 
 pub fn search_by_tag(root: &Path, tag: &str) -> anyhow::Result<Vec<Document>> {
 	let refs = cache::tag_index_lookup(root, tag);

@@ -936,14 +936,25 @@ impl WikiService {
 		if !log_dir.exists() {
 			return paginate::<serde_json::Value>(vec![], cursor, limit).to_string();
 		}
-		let entries: Vec<serde_json::Value> = std::fs::read_dir(&log_dir)
+		let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
 			.into_iter()
 			.flatten()
 			.filter_map(|e| e.ok())
-			.filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
-			.filter_map(|e| std::fs::read_to_string(e.path()).ok())
-			.filter_map(|s| serde_json::from_str(&s).ok())
+			.map(|e| e.path())
+			.filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
 			.collect();
+		files.sort();
+		let mut entries: Vec<serde_json::Value> = Vec::new();
+		for path in files {
+			if let Ok(content) = std::fs::read_to_string(&path) {
+				for line in content.lines() {
+					if line.trim().is_empty() { continue; }
+					if let Ok(v) = serde_json::from_str(line) {
+						entries.push(v);
+					}
+				}
+			}
+		}
 		paginate(entries, cursor, limit).to_string()
 	}
 
