@@ -74,7 +74,7 @@ Inbox: `.wiki/ingest/` — `/ingest` drains it, then triggers learn pass on new 
 
 **Invariant:** every run must add ≥1 new edge OR new question OR conclusion. Zero-progress passes log a warning (`invariant_violated: true` in report) — widen N or lower threshold.
 
-Run on every ingest batch and on demand. Iterative — each pass densifies more. Output dump: `.wiki/ingest_log/learn-<ts>.json` (sampled IDs, edges added, Qs raised, Qs resolved, conclusions promoted, invariant flag).
+Run on every ingest batch and on demand. Iterative — each pass densifies more. Each pass appends one JSON line to `.wiki/ingest_log/ingest.jsonl` (kind=`learn`/`learn-feedback`, sampled IDs, edges added, Qs raised/resolved, conclusions promoted, invariant flag). File rotates to `ingest-<ts>.jsonl` at 265 lines.
 
 ### Question-raising paths
 

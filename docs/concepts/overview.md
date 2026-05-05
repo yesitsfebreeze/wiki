@@ -28,7 +28,7 @@ Random-walk sensemaker. Sample N docs (weighted by inverse edge degree — orpha
 
 **Invariant:** every run adds ≥1 edge or question or conclusion, else logs `invariant_violated: true`.
 
-Output dump: `.wiki/ingest_log/learn-<ts>.json`.
+Each pass appends one JSON line to `.wiki/ingest_log/ingest.jsonl` (kind=`learn`/`learn-feedback`). Rotates to `ingest-<ts>.jsonl` at 265 lines.
 
 ### PassConfig knobs
 

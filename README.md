@@ -36,7 +36,7 @@ source doc  →  ingest_thought / ingest_entity
   reasons/    — directed edges between nodes
   questions/  — open questions
   conclusions/— synthesized knowledge
-  ingest_log/ — audit trail
+  ingest_log/ — append-only JSONL audit trail (ingest.jsonl, rotates at 265 lines)
   .search/    — Tantivy full-text index
 ```
 
