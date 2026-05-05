@@ -55,10 +55,16 @@ pub(crate) async fn cross_reference_question(
 	let sys = "Given a question and these candidate docs, score each 0..1 for how well it \
 		answers, and pick a kind from Answers|Supports|Contradicts|Extends|References. \
 		Return JSON {\"scored\":[{\"picked_id\":string,\"score\":number,\"kind\":string,\"body\":string}]}. \
-		`body` MUST state WHY this candidate answers (causal/logical claim, <=20 words). \
-		NOT a topic description. NOT 'this document discusses X'. \
-		If you cannot state a why concisely, return body: \"\". \
-		Empty body is preferred over topic restatement. \
+		\
+		`body` rules — the rule is HARD, violations get the body dropped server-side: \
+		- Body must state the CAUSAL or LOGICAL link to the question, in <=18 words. \
+		- Body must read as a self-contained claim a reader can verify against the candidate. \
+		- BANNED openings: 'discusses', 'describes', 'explains', 'covers', 'talks about', \
+		  'mentions', 'is about', 'relates to', 'concerns', 'addresses'. \
+		- BANNED shape: anything that just restates the candidate's topic. \
+		- If you can't write a real causal/logical body in 18 words, return body: \"\". \
+		  Empty body is strongly preferred over topic restatement. \
+		\
 		Include every candidate id.";
 	let user = format!("Question: {}\n\nCandidates:\n{}", question, cand_json);
 	let raw = http::chat_json(sys, &user).await?;
@@ -72,10 +78,30 @@ pub(crate) async fn cross_reference_question(
 			doc_id: c.picked_id,
 			score: c.score,
 			kind: allowed_kind(&c.kind).to_string(),
-			body: c.body,
+			body: sanitize_edge_body(&c.body),
 		})
 		.collect();
 	Ok(out)
+}
+
+/// Drop topic-restatement edge bodies the LLM emits despite the prompt's hard
+/// rules. Prefer an empty body over noise like "Discusses gossip transport…" —
+/// the edge kind + cosine score already encode the relationship.
+pub(crate) fn sanitize_edge_body(raw: &str) -> String {
+	let trimmed = raw.trim();
+	if trimmed.is_empty() {
+		return String::new();
+	}
+	let lc = trimmed.to_lowercase();
+	const BANNED_PREFIX: &[&str] = &[
+		"discusses ", "describes ", "explains ", "covers ", "talks about ",
+		"mentions ", "is about ", "relates to ", "concerns ", "addresses ",
+		"this document ", "this doc ", "the document ", "this candidate ",
+	];
+	if BANNED_PREFIX.iter().any(|p| lc.starts_with(p)) {
+		return String::new();
+	}
+	trimmed.to_string()
 }
 
 const BRIDGING_BONUS: f32 = 1.5;
@@ -473,6 +499,20 @@ mod tests {
 		let concs = store::list_documents(root, "conclusions").unwrap();
 		assert_eq!(concs.len(), 1);
 		assert_eq!(concs[0].id, cdoc.id);
+	}
+
+	#[test]
+	fn sanitize_edge_body_drops_topic_restatement() {
+		assert_eq!(sanitize_edge_body("Discusses gossip transport in Relay."), "");
+		assert_eq!(sanitize_edge_body("describes the storage layout"), "");
+		assert_eq!(sanitize_edge_body("This document covers retries."), "");
+		// Real causal body survives.
+		assert_eq!(
+			sanitize_edge_body("Quorum=N/2+1 prevents split-brain under partition."),
+			"Quorum=N/2+1 prevents split-brain under partition.",
+		);
+		// Empty stays empty.
+		assert_eq!(sanitize_edge_body("   "), "");
 	}
 
 	#[tokio::test]

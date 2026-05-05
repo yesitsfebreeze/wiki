@@ -151,6 +151,27 @@ pub(crate) fn derive_title(body: &str, fallback: &str) -> String {
 	};
 	let candidate = candidate_owned.as_str();
 	if candidate.is_empty() {
+		// Last-resort fallback chain before yielding the generic placeholder:
+		// reuse the raw body trimmed (without the markdown/wikilink/bracket
+		// strip), so a body like `[[only-link]]` that strips to empty still
+		// produces a real title from the link surface or raw text. Prevents
+		// fresh ingests landing as `title: "question"`.
+		if let Some(s) = stripped_link_surface.as_ref() {
+			if !s.is_empty() {
+				return s.chars().take(MAX).collect();
+			}
+		}
+		let raw = body.trim();
+		if !raw.is_empty() {
+			let cut_raw = raw.find(['.', '?', '!', '\n']).unwrap_or(raw.len());
+			let raw_first_sentence = raw[..cut_raw].trim();
+			// Skip pure-punctuation fallbacks like `###` — same intent as the
+			// strip loop above, just applied to the raw window.
+			let has_alnum = raw_first_sentence.chars().any(|c| c.is_alphanumeric());
+			if !raw_first_sentence.is_empty() && has_alnum {
+				return raw_first_sentence.chars().take(MAX).collect();
+			}
+		}
 		return fallback.to_string();
 	}
 	if candidate.chars().count() <= MAX {
@@ -1411,6 +1432,20 @@ impl WikiService {
 			"question" => derive_title(&body, "question"),
 			_ => derive_title(&body, "untitled"),
 		});
+		// Hard reject placeholder/garbage titles for question ingest. The
+		// derive_title fallback chain only yields the literal "question" when
+		// every fallback (link surface, raw body) was also empty — that means
+		// the caller passed an empty/whitespace body. Fail loudly instead of
+		// minting `title: "question"` with `content: "question"` ghost docs.
+		if kind == "question" {
+			let t = title.trim();
+			if t.is_empty() || t.eq_ignore_ascii_case("question") || t.chars().count() < 5 {
+				return json_err(format!(
+					"question ingest rejected: derived title is empty/placeholder ({:?}). Provide a non-empty body or an explicit `title`.",
+					t,
+				));
+			}
+		}
 		let ingested = match kind.as_str() {
 			"thought" => self.ingest_chunked("thoughts", &title, &body, "thought", purpose_hint.as_deref()).await,
 			"entity" => {
@@ -1670,9 +1705,13 @@ mod tests {
 
 	#[test]
 	fn derive_title_falls_back_when_empty() {
+		// Truly empty / only markdown punctuation → fallback.
 		assert_eq!(derive_title("", "fallback"), "fallback");
 		assert_eq!(derive_title("###   \n", "fallback"), "fallback");
-		assert_eq!(derive_title("[[only-wikilink]]", "fallback"), "fallback");
+		// Body that's only a wikilink → recover the link surface so the title
+		// isn't the literal placeholder. Catches ingests that would otherwise
+		// land as `title: "question"`.
+		assert_eq!(derive_title("[[only-wikilink]]", "fallback"), "only-wikilink");
 	}
 
 	#[test]
