@@ -269,6 +269,11 @@ struct LearnPassParams {
 	dry_run: Option<bool>,
 	qa: Option<bool>,
 	force: Option<bool>,
+	/// Page offset for deterministic pagination. When set, the universe is
+	/// sorted by (doc_type, id) and the slice `[start, start+limit)` is
+	/// processed. The response includes `next_start` (None when exhausted).
+	/// Omit (default) to use weighted-random sampling biased toward orphans.
+	start: Option<u64>,
 	/// Enable LLM question raising during the pass. Default `false`.
 	raise_questions: Option<bool>,
 	/// Cosine ≥ this → `Answers` edge + mark question resolved. Default `0.8`.
@@ -1120,13 +1125,14 @@ impl WikiService {
 	}
 
 
-	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON. Args: limit?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?, support_promote_floor?.")]
+	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON with `next_start` for pagination. Args: limit?, start?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?, support_promote_floor?.")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
 		let LearnPassParams {
-			limit, purpose, dry_run, qa, force, raise_questions,
+			limit, start, purpose, dry_run, qa, force, raise_questions,
 			answer_threshold, support_threshold, edge_threshold, connect_k,
 			qa_max_per_pass, conclusion_merge_threshold, support_promote_floor,
 		} = params.0;
+		let start = start.map(|n| n as usize);
 		// `limit: 0` → unlimited (scan whole vault). `None` → default 25.
 		let limit = match limit {
 			Some(0) => usize::MAX,
@@ -1146,7 +1152,7 @@ impl WikiService {
 				.map(|n| n as usize)
 				.unwrap_or(defaults.support_promote_floor),
 		};
-		match learn::run_pass(self.root(), limit, purpose.as_deref(), dry_run.unwrap_or(false), qa.unwrap_or(true), force.unwrap_or(false), &cfg).await {
+		match learn::run_pass(self.root(), limit, purpose.as_deref(), dry_run.unwrap_or(false), qa.unwrap_or(true), force.unwrap_or(false), &cfg, start).await {
 			Ok(v) => v.to_string(),
 			Err(e) => json_err(e),
 		}

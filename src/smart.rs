@@ -488,7 +488,7 @@ pub async fn query_with_opts(
 	top_n: usize,
 	opts: &QueryOpts,
 ) -> Result<serde_json::Value> {
-	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts)? {
+	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts, None)? {
 		return Ok(tree);
 	}
 	if let Some(walk) = tag_walk_tier(root, question, tag_filter, k) {
@@ -569,12 +569,23 @@ fn node_weight_factor(root: &Path, doc_id: &str, doc_type: &str) -> f64 {
 }
 
 /// Final conclusions-first score: `(term + edge) × weight_factor`.
-fn score_conclusion(root: &Path, doc: &Document, qterms: &[String]) -> f64 {
+fn score_conclusion(root: &Path, doc: &Document, qterms: &[String], q_emb: Option<&[f32]>) -> f64 {
 	let term = term_score(doc, qterms) as f64;
 	if term <= 0.0 { return 0.0; }
 	let edge = edge_score_for(root, &doc.id);
 	let factor = node_weight_factor(root, &doc.id, "conclusions");
-	(term + edge) * factor
+	let mut score = (term + edge) * factor;
+	// Semantic relevance: if a query embedding is supplied and the conclusion
+	// has a pooled embedding, multiply by `(1 + cosine)`. Pulls semantically
+	// off-topic conclusions (high term-overlap by chance, no real meaning
+	// match) below conclusions whose body actually relates to the query.
+	if let Some(q) = q_emb {
+		if let Some(entry) = cache::pool_get(root, &doc.id) {
+			let cos = classifier::cosine(q, &entry.vec).max(0.0) as f64;
+			score *= 1.0 + cos;
+		}
+	}
+	score
 }
 
 /// Conclusions-first stage: if the query hits any conclusion, return its
@@ -587,7 +598,7 @@ pub(crate) fn conclusions_first(
 	tag_filter: Option<&str>,
 	k: usize,
 ) -> Result<Option<serde_json::Value>> {
-	conclusions_first_with_opts(root, query, tag_filter, k, &QueryOpts::default())
+	conclusions_first_with_opts(root, query, tag_filter, k, &QueryOpts::default(), None)
 }
 
 pub(crate) fn conclusions_first_with_opts(
@@ -596,6 +607,7 @@ pub(crate) fn conclusions_first_with_opts(
 	tag_filter: Option<&str>,
 	_k: usize,
 	opts: &QueryOpts,
+	q_emb: Option<&[f32]>,
 ) -> Result<Option<serde_json::Value>> {
 	let qterms = lowercase_terms(query);
 	if qterms.is_empty() { return Ok(None); }
@@ -609,7 +621,7 @@ pub(crate) fn conclusions_first_with_opts(
 		.into_iter()
 		.filter(|d| tag_filter.map(|t| d.tags.iter().any(|x| x == t)).unwrap_or(true))
 		.filter_map(|d| {
-			let s = score_conclusion(root, &d, &qterms);
+			let s = score_conclusion(root, &d, &qterms, q_emb);
 			if s > 0.0 { Some((s, d)) } else { None }
 		})
 		.collect();
@@ -756,7 +768,7 @@ pub async fn query_with_qemb_opts(
 	q_emb: &[f32],
 	opts: &QueryOpts,
 ) -> Result<serde_json::Value> {
-	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts)? {
+	if let Some(tree) = conclusions_first_with_opts(root, question, tag_filter, k, opts, Some(q_emb))? {
 		return Ok(tree);
 	}
 	if let Some(walk) = tag_walk_tier(root, question, tag_filter, k) {
@@ -1044,8 +1056,8 @@ mod tests {
 			create_reason(root, &q.id, &a.id, "Answers", Some("ans"), None).unwrap();
 		}
 		let qterms = lowercase_terms("alpha topic");
-		let sa = score_conclusion(root, &a, &qterms);
-		let sb = score_conclusion(root, &b, &qterms);
+		let sa = score_conclusion(root, &a, &qterms, None);
+		let sb = score_conclusion(root, &b, &qterms, None);
 		assert!(sa > sb, "A({}) should beat B({})", sa, sb);
 	}
 
@@ -1062,8 +1074,8 @@ mod tests {
 			vec!["thought".into()], None, None).unwrap();
 		create_reason(root, &src.id, &a.id, "Contradicts", Some("no"), None).unwrap();
 		let qterms = lowercase_terms("beta topic");
-		let sa = score_conclusion(root, &a, &qterms);
-		let sb = score_conclusion(root, &b, &qterms);
+		let sa = score_conclusion(root, &a, &qterms, None);
+		let sb = score_conclusion(root, &b, &qterms, None);
 		assert!(sa < sb, "Contradicts should reduce A({}) below B({})", sa, sb);
 	}
 
@@ -1079,8 +1091,8 @@ mod tests {
 		set_node_size(root, "conclusions", &big.id, 100);
 		set_node_size(root, "conclusions", &small.id, 6);
 		let qterms = lowercase_terms("gamma topic");
-		let s_big = score_conclusion(root, &big, &qterms);
-		let s_small = score_conclusion(root, &small, &qterms);
+		let s_big = score_conclusion(root, &big, &qterms, None);
+		let s_small = score_conclusion(root, &small, &qterms, None);
 		assert!(s_big > s_small * 5.0,
 			"node_size=100 should heavily amplify vs 6: big={} small={}", s_big, s_small);
 		assert!((node_weight_factor(root, &big.id, "conclusions") - 2.0).abs() < 1e-6);
@@ -1192,7 +1204,7 @@ mod tests {
 
 		// With include_contradiction_docs: results = matched conclusion + contradiction doc.
 		let opts = QueryOpts { include_contradiction_docs: true, hyde: false };
-		let v2 = conclusions_first_with_opts(root, "widgetzzz", None, 10, &opts)
+		let v2 = conclusions_first_with_opts(root, "widgetzzz", None, 10, &opts, None)
 			.unwrap()
 			.expect("hit");
 		let results = v2["results"].as_array().unwrap();

@@ -210,6 +210,7 @@ pub async fn run_pass(
 	qa: bool,
 	force: bool,
 	cfg: &PassConfig,
+	start: Option<usize>,
 ) -> Result<serde_json::Value> {
 	let entities = super::infra::build_entity_index(root).await?;
 
@@ -229,10 +230,23 @@ pub async fn run_pass(
 
 	let cursor_key = purpose.unwrap_or("<global>");
 
-	// Weighted-random sample: weight(doc) = 1 / (1 + edge_degree(doc)).
-	// Orphans (degree 0) get weight 1; heavily-linked nodes get small weight.
-	// Sampling is without replacement up to `limit`.
-	let targets: Vec<(String, String)> = sample_weighted_by_inverse_degree(root, &sequence, limit);
+	// Sampling: when `start` is set the caller wants deterministic pagination
+	// (`start:0,limit:25 → 25,25 → ...` until empty). Sort by (doc_type, id)
+	// and slice. Otherwise keep the weighted-random sampling that prefers
+	// orphans for ad-hoc passes.
+	let total_universe = sequence.len();
+	let targets: Vec<(String, String)> = match start {
+		Some(s) => {
+			let mut ordered = sequence.clone();
+			ordered.sort();
+			ordered.into_iter().skip(s).take(limit).collect()
+		}
+		None => sample_weighted_by_inverse_degree(root, &sequence, limit),
+	};
+	let next_start: Option<usize> = start.and_then(|s| {
+		let consumed = s + targets.len();
+		if consumed < total_universe { Some(consumed) } else { None }
+	});
 
 	let mut docs_modified = 0u64;
 	let mut links_added = 0u64;
@@ -404,6 +418,9 @@ pub async fn run_pass(
 		"crosstopic_invoked": crosstopic_invoked,
 		"invariant_violated": invariant_violated,
 		"invariant_reason": invariant_reason,
+		"start": start,
+		"next_start": next_start,
+		"total_universe": total_universe,
 		"sampling": "weighted_inverse_degree",
 		"cursor": last_processed.as_ref().map(|(dt, id)| format!("{}/{}", dt, id)),
 		"details": details,
@@ -445,7 +462,7 @@ mod tests {
 		let mut ids = Vec::new();
 		for i in 0..5 { ids.push(mk_thought(root, &format!("t{}", i), "p1")); }
 
-		let _ = run_pass(root, 2, Some("p1"), false, false, false, &PassConfig::default()).await.unwrap();
+		let _ = run_pass(root, 2, Some("p1"), false, false, false, &PassConfig::default(), None).await.unwrap();
 		let cur = super::super::infra::read_pass_cursor(root, "p1").expect("cursor written");
 		assert_eq!(cur.0, "thoughts");
 		assert!(ids.contains(&cur.1), "cursor must reference one of the seeded docs");
