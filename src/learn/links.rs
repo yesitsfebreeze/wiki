@@ -186,10 +186,21 @@ fn resolve_wikilink_target(
 }
 
 /// Scan body for `[[...]]` wikilinks (skipping those inside code blocks) and
-/// mint a `References` reason edge from `self_id` → each resolved target.
-/// Idempotent: skips targets that already have a `References` edge from `self_id`.
-/// Returns the number of new edges created.
-fn emit_wikilink_references(
+/// mint a reason edge from `self_id` → each resolved target. Edge kind is
+/// classified by the link's position and the relationship between source and
+/// target docs:
+///
+/// - **Body-start** wikilink (first non-whitespace token in `body`) targeting a
+///   doc under `questions/` → `Answers` edge, and the target question is
+///   moved to `questions/answered/...` with the `answered` tag set.
+/// - **Body-start** wikilink targeting a non-question doc whose purpose
+///   matches `purpose` (the source doc's purpose) → `Supports`.
+/// - All other resolved wikilinks (mid-body, cross-purpose, or unknown
+///   purpose) → `References`.
+///
+/// Idempotent: skips emission if an edge of the desired kind already exists
+/// from `self_id` → target. Returns the number of new edges created.
+fn emit_wikilink_edges(
 	root: &Path,
 	self_id: &str,
 	body: &str,
@@ -199,18 +210,28 @@ fn emit_wikilink_references(
 	let code_ranges = code_protected_ranges(body);
 	let in_code = |pos: usize| code_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
 
-	let existing_targets: HashSet<String> = match store::search_reasons_for(root, self_id, "from") {
+	// Offset of the first non-whitespace byte in `body`. A wikilink whose
+	// match start equals this offset is "body-start".
+	let body_start_offset: Option<usize> = body
+		.char_indices()
+		.find(|(_, c)| !c.is_whitespace())
+		.map(|(i, _)| i);
+
+	// Existing edges keyed by (target_id, kind) — supports per-kind dedupe so
+	// a later `Supports`/`Answers` upgrade is allowed even if `References`
+	// was minted earlier (and vice versa: same kind never duplicates).
+	let existing: HashSet<(String, String)> = match store::search_reasons_for(root, self_id, "from") {
 		Ok(reasons) => reasons
 			.into_iter()
 			.filter_map(|r| {
 				let (_from, to, kind, _p) = super::infra::read_reason_meta(root, &r.id)?;
-				if kind == "References" { Some(to) } else { None }
+				Some((to, kind))
 			})
 			.collect(),
 		Err(_) => HashSet::new(),
 	};
 
-	let mut seen_this_pass: HashSet<String> = HashSet::new();
+	let mut seen_this_pass: HashSet<(String, String)> = HashSet::new();
 	let mut emitted = 0usize;
 	for cap in link_target_re().captures_iter(body) {
 		let m = match cap.get(0) { Some(m) => m, None => continue };
@@ -219,15 +240,51 @@ fn emit_wikilink_references(
 			Some(t) if !t.is_empty() => t,
 			_ => continue,
 		};
-		let Some((_target_dt, target_id)) = resolve_wikilink_target(root, target, entities) else { continue };
+		let Some((target_dt, target_id)) = resolve_wikilink_target(root, target, entities) else { continue };
 		if target_id == self_id { continue; }
-		if existing_targets.contains(&target_id) { continue; }
-		if !seen_this_pass.insert(target_id.clone()) { continue; }
-		if store::create_reason(root, self_id, &target_id, "References", None, purpose).is_ok() {
+
+		let is_body_start = body_start_offset == Some(m.start());
+		let kind = classify_edge_kind(root, is_body_start, target_dt, &target_id, purpose);
+
+		let key = (target_id.clone(), kind.to_string());
+		if existing.contains(&key) { continue; }
+		if !seen_this_pass.insert(key) { continue; }
+
+		if store::create_reason(root, self_id, &target_id, kind, None, purpose).is_ok() {
 			emitted += 1;
 		}
 	}
 	emitted
+}
+
+/// Classify the edge kind for a single resolved wikilink. See
+/// [`emit_wikilink_edges`] for the rules.
+fn classify_edge_kind(
+	root: &Path,
+	is_body_start: bool,
+	target_dt: &'static str,
+	target_id: &str,
+	self_purpose: Option<&str>,
+) -> &'static str {
+	if is_body_start && target_dt == "questions" {
+		// Body-start link to a question is *evidence*, not a final answer.
+		// Mint `Supports` so multiple thoughts can accumulate; learn_pass
+		// promotes a conclusion + flips the question to answered once the
+		// support floor is met or one candidate clears `answer_threshold`.
+		// Use explicit `ingest({kind:"reason", reason_kind:"Answers"})` for
+		// a direct answer.
+		return "Supports";
+	}
+	if is_body_start && target_dt != "questions" {
+		if let Some(sp) = self_purpose {
+			if let Ok(target_doc) = store::get_document(root, target_dt, target_id) {
+				if target_doc.purpose.as_deref() == Some(sp) {
+					return "Supports";
+				}
+			}
+		}
+	}
+	"References"
 }
 
 fn rewrite_inbound_links(root: &Path, old_target: &str, new_target: &str) -> Result<()> {
@@ -386,7 +443,7 @@ pub(crate) async fn link_doc_internal(
 
 	let mut references_added = 0usize;
 	if !dry_run {
-		references_added = emit_wikilink_references(
+		references_added = emit_wikilink_edges(
 			root,
 			id,
 			&deduped,
@@ -453,7 +510,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn wikilink_emits_reference_edge() {
+	async fn mid_body_wikilink_emits_references_for_thought_target() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
 		store::bootstrap(root).unwrap();
@@ -463,6 +520,7 @@ mod tests {
 			vec!["thought".to_string(), "general".to_string()],
 			Some("general"), None,
 		).unwrap();
+		// Mid-body link: leading "see " ensures wikilink is not body-start.
 		let body = format!("see [[{}]] for context.", target.id);
 		let src = store::create_document(
 			root, "thoughts", "Source", &body,
@@ -478,6 +536,141 @@ mod tests {
 			from_src.iter().any(|r| r.title.contains("-[References]->") && r.title.ends_with(&target.id)),
 			"expected References edge src→target, got {:?}",
 			from_src.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+		);
+	}
+
+	#[tokio::test]
+	async fn body_start_wikilink_to_question_emits_supports_no_automark() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let q = store::create_document(
+			root, "questions", "Why?", "question body",
+			vec!["question".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		// Body starts with the wikilink. Should mint Supports (evidence),
+		// not Answers — synthesis path is owned by learn_pass.
+		let body = format!("[[{}]] because the answer is foo.", q.id);
+		let src = store::create_document(
+			root, "thoughts", "Answer", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let res = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+		assert_eq!(res["references_added"].as_u64(), Some(1));
+
+		let from_src = store::search_reasons_for(root, &src.id, "from").unwrap();
+		assert!(
+			from_src.iter().any(|r| r.title.contains("-[Supports]->") && r.title.ends_with(&q.id)),
+			"expected Supports edge src→question, got {:?}",
+			from_src.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+		);
+		assert!(
+			!from_src.iter().any(|r| r.title.contains("-[Answers]->")),
+			"body-start wikilink must NOT mint Answers — that's reserved for learn_pass synthesis or explicit reason ingest"
+		);
+
+		let q_after = store::get_document(root, "questions", &q.id).unwrap();
+		assert!(
+			!q_after.tags.iter().any(|t| t == "answered"),
+			"question must NOT be auto-marked answered by a single supporting wikilink"
+		);
+	}
+
+	#[tokio::test]
+	async fn body_start_wikilink_same_purpose_emits_supports() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let target = store::create_document(
+			root, "thoughts", "Tgt", "tbody",
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		let body = format!("[[{}]] reinforces the prior claim.", target.id);
+		let src = store::create_document(
+			root, "thoughts", "Src", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let _ = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+
+		let from_src = store::search_reasons_for(root, &src.id, "from").unwrap();
+		assert!(
+			from_src.iter().any(|r| r.title.contains("-[Supports]->") && r.title.ends_with(&target.id)),
+			"expected Supports edge src→target, got {:?}",
+			from_src.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+		);
+	}
+
+	#[tokio::test]
+	async fn body_start_wikilink_cross_purpose_emits_references() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let target = store::create_document(
+			root, "thoughts", "Tgt", "tbody",
+			vec!["thought".to_string(), "alpha".to_string()],
+			Some("alpha"), None,
+		).unwrap();
+		let body = format!("[[{}]] mentioned in cross-purpose context.", target.id);
+		let src = store::create_document(
+			root, "thoughts", "Src", &body,
+			vec!["thought".to_string(), "beta".to_string()],
+			Some("beta"), None,
+		).unwrap();
+
+		let _ = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+
+		let from_src = store::search_reasons_for(root, &src.id, "from").unwrap();
+		assert!(
+			from_src.iter().any(|r| r.title.contains("-[References]->") && r.title.ends_with(&target.id)),
+			"expected References edge src→target, got {:?}",
+			from_src.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+		);
+	}
+
+	#[tokio::test]
+	async fn mid_body_wikilink_emits_references_even_for_question() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let q = store::create_document(
+			root, "questions", "Q?", "qbody",
+			vec!["question".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+		// Wikilink appears mid-body; must NOT promote to Answers.
+		let body = format!("a thought referencing [[{}]] casually.", q.id);
+		let src = store::create_document(
+			root, "thoughts", "S", &body,
+			vec!["thought".to_string(), "general".to_string()],
+			Some("general"), None,
+		).unwrap();
+
+		let _ = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
+
+		let from_src = store::search_reasons_for(root, &src.id, "from").unwrap();
+		assert!(
+			from_src.iter().any(|r| r.title.contains("-[References]->") && r.title.ends_with(&q.id)),
+			"expected References edge for mid-body link to question"
+		);
+		assert!(
+			!from_src.iter().any(|r| r.title.contains("-[Answers]->")),
+			"mid-body link must not mint an Answers edge"
+		);
+
+		let q_after = store::get_document(root, "questions", &q.id).unwrap();
+		assert!(
+			!q_after.tags.iter().any(|t| t == "answered"),
+			"question must NOT be marked answered for a mid-body reference"
 		);
 	}
 

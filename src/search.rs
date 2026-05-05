@@ -106,7 +106,30 @@ pub fn search_topk(
 		vec![title_field, content_field, tags_field],
 	);
 	let sanitized = sanitize_query(query_str);
-	let parsed: Box<dyn Query> = query_parser.parse_query(&sanitized)?;
+	// Robust parse: fall back to a hand-built BooleanQuery of TermQueries when
+	// QueryParser errors. Tantivy's DSL still trips on edge tokens (e.g. lone
+	// `TO`, leftover wildcards) even after sanitize_query strips its reserved
+	// chars. The fallback never errors and degrades gracefully to OR-of-terms.
+	let parsed: Box<dyn Query> = match query_parser.parse_query(&sanitized) {
+		Ok(q) => q,
+		Err(_) => {
+			let terms: Vec<(Occur, Box<dyn Query>)> = sanitized
+				.split_whitespace()
+				.flat_map(|tok| {
+					let lc = tok.to_lowercase();
+					[title_field, content_field, tags_field].into_iter().map(move |f| {
+						let t = Term::from_field_text(f, &lc);
+						let q: Box<dyn Query> = Box::new(TermQuery::new(t, IndexRecordOption::Basic));
+						(Occur::Should, q)
+					})
+				})
+				.collect();
+			if terms.is_empty() {
+				return Ok(Vec::new());
+			}
+			Box::new(BooleanQuery::new(terms))
+		}
+	};
 
 	let query: Box<dyn Query> = if let Some(tag) = tag_filter {
 		let term = Term::from_field_text(tags_field, tag);
@@ -159,7 +182,7 @@ pub fn sanitize_query(q: &str) -> String {
 		match c {
 			'+' | '-' | '!' | '(' | ')' | '{' | '}' | '[' | ']'
 			| '^' | '"' | '~' | '*' | '?' | ':' | '\\' | '/'
-			| '&' | '|' => out.push(' '),
+			| '&' | '|' | '`' | '<' | '>' | '=' => out.push(' '),
 			_ => out.push(c),
 		}
 	}

@@ -12,35 +12,44 @@ Read this **before** ingesting, querying, or driving Q&A. Single Obsidian vault 
 | `question` | Open question. Resolves when an `Answers` edge to a conclusion exists or `mark_question` is called. |
 | `conclusion` | Synthesized answer. Primary query entry point. **Server-promoted from supporting thoughts**, not freehand. |
 
+**All multi-doc tools (`ingest`, `mark_question`, `search`, `get`, `update`) are batch-only. Wrap every payload in `{items: [...]}`, even for one record.** Bundle related writes/reads into a single call to avoid N+1 round-trips — wikilink resolution is sequential within a batch, so prior items are visible to later ones.
+
 ## The lifecycle
 
 ```
 raw source
-  → ingest({type:"thought", body}) per atomic claim     [auto: classify, embed, auto-link]
+  → ingest({items: [{kind:"thought", body}, ...]}) per atomic claim   [auto: classify, embed, auto-link]
   → (questions surface during background learn pass when raise_questions:true)
-  → search({mode:"qa"})  [returns suggested_conclusions banner — server-bound matches]
+  → search({items: [{query, mode:"qa"}]})  [returns suggested_conclusions banner — server-bound matches]
   → if no banner: research → more thoughts (with [[question_id]] wikilink in body)
   → learn_pass({force:true})  [server promotes conclusion + marks question resolved]
 ```
 
 ## Binding rules (must follow)
 
-1. **Never** `ingest({type:"conclusion"})` freehand. Conclusions are output of `learn_pass` over supporting thoughts. Direct ingest creates orphan synthesis with no evidence trail.
+1. **Never** `ingest({items:[{kind:"conclusion", ...}]})` freehand. Conclusions are output of `learn_pass` over supporting thoughts. Direct ingest creates orphan synthesis with no evidence trail.
 2. `refs` parameter creates **`References`** edges, **not `Answers`**. Do not use `refs` to "answer" a question.
-3. To bind a thought to a question, put `[[<question_id>]]` (or the question's title) at the start of the thought body. Server resolves wikilinks → creates Supports/References edges.
-4. Before answering an open question, **always** `search({query: question_body, mode: "qa", include: {bodies:true, reasons:true, edges_depth:1}})` first. Read the `suggested_conclusions` field — if non-empty, use the bound conclusion; skip new ingest.
-5. Answer threshold for auto-mark is cosine ≥ 0.8 between conclusion and question bodies. Below that, the conclusion stays standalone with `References` edges. Manual fallback: `mark_question({id, state:"answered"})`.
+3. To bind a thought to a question, put `[[<question_id>]]` (or the question's title) at the **start** of the thought body. Body-start wikilink to a question → `Supports` edge (evidence; multiple thoughts can stack). Body-start same-purpose non-question → `Supports`. Mid-body or cross-purpose → `References`. **No auto-mark** — `learn_pass` decides when accumulated `Supports` clear the floor and promotes a conclusion + marks the question answered. To force an immediate answer, ingest a reason explicitly: `ingest({items:[{kind:"reason", from_id:<thought>, to_id:<qid>, reason_kind:"Answers", body:"..."}]})`.
+4. Before answering an open question, **always** `search({items:[{query: question_body, mode: "qa", include_bodies:true, include_reasons:true, edges_depth:1}]})` first. Read the `suggested_conclusions` field — if non-empty, use the bound conclusion; skip new ingest.
+5. Answer threshold for auto-mark is cosine ≥ 0.8 between conclusion and question bodies. Below that, the conclusion stays standalone with `References` edges. Manual fallback: `mark_question({items:[{question_id, status:"answered"}]})`.
 
 ## Q&A flow (driven by /learn or agent-led research)
 
 For each open question:
 
-1. `search({query: question_body, mode:"qa", include:{bodies:true, reasons:true, edges_depth:1}})`. Check `suggested_conclusions`.
+1. `search({items:[{query: question_body, mode:"qa", include_bodies:true, include_reasons:true, edges_depth:1}]})`. Check `suggested_conclusions`.
 2. If banner has a strong match → cite + stop.
 3. Else: research the topic (web search, sources). Extract atomic claims.
-4. For each claim: `ingest({type:"thought", body: "[[<question_id>]] ...claim text..."})`. Wikilink at start → server creates Supports edge thought → question.
+4. Bundle all claims into one ingest:
+   ```
+   ingest({items: [
+     {kind:"thought", body: "[[<question_id>]] ...claim 1..."},
+     {kind:"thought", body: "[[<question_id>]] ...claim 2..."}
+   ]})
+   ```
+   Body-start wikilink to the question → server creates `Supports` edge thought → question. Multiple `Supports` accumulate; `learn_pass` synthesizes once `support_promote_floor` (default 3) is met or one candidate clears `answer_threshold` (default 0.6).
 5. After **all** thoughts ingested: `learn_pass({force:true, raise_questions:false})`. Server scans questions with supporting thoughts, synthesizes a conclusion via LLM over the supporting bodies, creates the conclusion doc, emits `Derives` edge question → conclusion + `Answers` edges, and tags the question `resolved`.
-6. Verify: `get({id: question_id, depth:1})`. If still open after the pass: `mark_question({id, state:"answered"})` as final fallback.
+6. Verify: `get({items:[{id: question_id, depth:1}]})`. If still open after the pass: `mark_question({items:[{question_id, status:"answered"}]})` as final fallback.
 
 ## Densify-only flow
 
@@ -51,6 +60,10 @@ learn_pass({force:true, raise_questions:true})
 ```
 
 Reports edges added, questions raised, conclusions promoted. The pass samples weighted by inverse edge degree (orphans first), forges typed edges between semantic neighbors, raises questions on linkable docs, runs cross-reference + cross-topic synthesis on open questions with supporting evidence.
+
+`limit` controls how many docs the pass scans. **Pass `limit: 0` to scan the whole vault** (no cap). Default is `25`. The pass is bounded further by `qa_max_per_pass` LLM-call budget.
+
+If the pass returns `invariant_violated: true`, read the `invariant_reason` field — it lists the active thresholds and skipped-recent count, the most common reason a real-looking pass produced no progress.
 
 ## Environment
 
@@ -69,7 +82,10 @@ Edges inside fenced or inline code blocks are skipped. Re-running is idempotent:
 ## Common mistakes
 
 - Calling old tool names (`ingest_thought`, `find_answers`, `search_fulltext`, `link_doc`) — gone. Use `ingest`, `search`.
-- `ingest({type:"conclusion"})` before ingesting supporting thoughts → orphan conclusion.
-- Using `refs:[question_id]` expecting an Answers edge → only creates `References`.
+- Calling tools with the **old singleton shape** (`ingest({kind, body, ...})`) — gone. All multi-doc tools require `{items: [...]}`.
+- `ingest({items:[{kind:"conclusion", ...}]})` before ingesting supporting thoughts → orphan conclusion.
+- Using `refs:[question_id]` expecting an Answers edge → only creates `References`. Use a body-start `[[<question_id>]]` instead.
 - Skipping the `mode:"qa"` pre-step → agent re-derives an answer the server already has.
-- Forgetting the wikilink in thought bodies → no Supports edge to the question → learn_pass cannot promote.
+- Forgetting the body-start wikilink in thought bodies → no `Supports` edge → learn_pass cannot promote.
+- Putting the wikilink **mid-body** instead of at the start → only `References`, never `Supports`.
+- Expecting one body-start wikilink to mark a question answered. It mints `Supports` only; promotion requires `learn_pass` to run.

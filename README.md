@@ -48,16 +48,21 @@ source doc  →  ingest_thought / ingest_entity
 
 | Tool | What it does |
 |---|---|
-| `ingest` | 📥 Write doc — `kind`: thought \| entity \| question \| reason \| conclusion. Auto-links + auto-marks-answered |
-| `search` | 🔍 Hybrid search — `mode`: smart (conclusions-first) \| fts (BM25) \| tag \| qa \| list |
-| `get` | 📖 Fetch doc by id with reasons + edges (depth configurable) |
-| `update` | ✏️ Update body / title / tags. Re-embeds + re-links |
-| `delete_doc` | 🗑️ Delete a doc; cascades edge cleanup |
-| `learn_pass` | 🔁 Sensemaker — link/dedupe → connect → raise/answer → promote conclusions |
+All multi-doc tools are **batch-only** — wrap every payload in `{items: [...]}`, even for one record.
+
+| Tool | What it does |
+|---|---|
+| `ingest` | 📥 Batch-write docs — `kind`: thought \| entity \| question \| reason \| conclusion. Auto-links, body-start `[[<qid>]]` → `Supports` (synthesis-fed), explicit `reason_kind:"Answers"` for direct answers |
+| `search` | 🔍 Batch hybrid search — `mode`: smart (conclusions-first) \| fts (BM25) \| tag \| qa \| list. `raise_on_miss` opt-in |
+| `get` | 📖 Batch-fetch docs with split `inbound`/`outbound` reasons + edge walk |
+| `update` | ✏️ Batch-update content/tags. Re-embeds + re-links on body change |
+| `retag` | 🏷️ Bulk add/remove tags + bulk-purpose-move without touching content |
+| `delete_doc` | 🗑️ Batch-delete by `id`/`ids`; cascades edge cleanup |
+| `learn_pass` | 🔁 Sensemaker — link/dedupe → connect → raise/answer → promote conclusions. `limit:0` = scan whole vault. Returns `invariant_reason` when no progress |
 | `list_open_questions` | ❓ Paginate unresolved questions, filter by purpose |
-| `mark_question` | ✅ Manually set question state (answered \| dropped) |
+| `mark_question` | ✅ Batch-set question status (answered \| dropped) |
 | `purpose` | 🏷️ Manage purposes — `action`: list \| create \| delete \| reembed |
-| `admin` | 🧹 Vault maintenance — `action`: recompute \| sanitize \| migrate \| feedback |
+| `admin` | 🧹 Vault maintenance — `action`: recompute \| sanitize \| migrate \| feedback \| retitle_questions |
 | `code` | 💻 Code index ops — `action`: index \| search \| read \| refs \| validate |
 | `docs` | 📚 Fetch tool / concept markdown docs (no arg → list) |
 
@@ -88,6 +93,28 @@ cargo install --git https://github.com/yesitsfebreeze/wiki
 ```
 
 Installs `wiki` (or `wiki.exe`) into `~/.cargo/bin/`.
+
+### Local install from a checkout
+
+```bash
+git clone https://github.com/yesitsfebreeze/wiki
+cd wiki
+cargo install --path . --force
+```
+
+### One-command rebuild + reinstall (`just update`)
+
+If you have [`just`](https://github.com/casey/just) installed, the bundled `Justfile` ships an end-to-end refresh recipe — kills running `wiki.exe` instances, rebuilds, reinstalls into `~/.cargo/bin`, and best-effort refreshes the Claude plugin:
+
+```bash
+just update          # kill → build → install → claude plugin update
+just kill            # just kill running wiki.exe
+just install         # build release + cargo install --path . --force
+just update-plugin   # claude plugin update wiki@yesitsfebreeze
+just test            # cargo test --test-threads=1
+```
+
+Restart any MCP clients (Claude Code / Cursor / etc.) after `just update` so they pick up the new binary.
 
 ## ⚙️ Config
 

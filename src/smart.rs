@@ -670,11 +670,32 @@ pub(crate) fn conclusions_first_with_opts(
 		}));
 	}
 
+	// Promote `tree` conclusions to `results` so callers using the standard
+	// `{id, title, tags, score, snippet}` hit shape (e.g. `tools::search_one`)
+	// see the matches. Without this, smart-mode silently returns 0 hits when
+	// the conclusions tier fires, since `results` previously only held
+	// contradiction extras.
+	let mut results: Vec<serde_json::Value> = scored
+		.iter()
+		.map(|(score, conc)| {
+			serde_json::json!({
+				"id": conc.id,
+				"title": conc.title,
+				"tags": conc.tags,
+				"purpose": conc.purpose,
+				"score": score,
+				"snippet": wiki_io::truncate_chars(&conc.content, 600),
+			})
+		})
+		.collect();
+	results.extend(extra_hits.iter().cloned());
+
 	Ok(Some(serde_json::json!({
 		"question": query,
 		"entry_kind": "conclusions",
 		"tree": tree,
-		"results": extra_hits,
+		"results": results,
+		"extras": extra_hits,
 	})))
 }
 
@@ -1162,17 +1183,24 @@ mod tests {
 		).unwrap();
 		create_reason(root, &a.id, &b.id, "Contradicts", Some("x"), None).unwrap();
 
+		// Default: results carries the matching conclusion(s); `extras` empty.
 		let v = conclusions_first(root, "widgetzzz", None, 10).unwrap().expect("hit");
-		assert!(v["results"].as_array().unwrap().is_empty());
+		let results = v["results"].as_array().unwrap();
+		assert_eq!(results.len(), 1, "matched conclusion must be in results");
+		assert_eq!(results[0]["id"], a.id);
+		assert!(v["extras"].as_array().unwrap().is_empty());
 
+		// With include_contradiction_docs: results = matched conclusion + contradiction doc.
 		let opts = QueryOpts { include_contradiction_docs: true, hyde: false };
 		let v2 = conclusions_first_with_opts(root, "widgetzzz", None, 10, &opts)
 			.unwrap()
 			.expect("hit");
 		let results = v2["results"].as_array().unwrap();
-		assert_eq!(results.len(), 1, "should include B as a separate hit");
-		assert_eq!(results[0]["id"], b.id);
-		assert_eq!(results[0]["contradicts"], a.id);
+		assert_eq!(results.len(), 2, "matched conclusion + contradiction expansion");
+		let extras = v2["extras"].as_array().unwrap();
+		assert_eq!(extras.len(), 1);
+		assert_eq!(extras[0]["id"], b.id);
+		assert_eq!(extras[0]["contradicts"], a.id);
 	}
 
 	#[test]

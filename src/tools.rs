@@ -92,12 +92,23 @@ pub(crate) fn mark_question_answered(root: &Path, to_id: &str) -> Result<bool> {
 pub(crate) fn derive_title(body: &str, fallback: &str) -> String {
 	const MAX: usize = 60;
 	let mut s = body.trim_start();
+	let mut stripped_link_surface: Option<String> = None;
 	loop {
 		let prev = s;
 		s = s.trim_start_matches(['#', '*', '-', '>', ' ', '\t', '\r', '\n']);
-		// Strip leading [[wikilink]]
+		// Strip leading [[wikilink]] but remember the link's surface text so we
+		// can re-attach it if what's left dangles (possessive `'s`, leading
+		// punctuation, or too short to stand alone).
 		if let Some(rest) = s.strip_prefix("[[") {
 			if let Some(end) = rest.find("]]") {
+				let inner = &rest[..end];
+				// Pipe-aliased: `[[target|alias]]` → use alias; else last `/` segment.
+				let surface = inner.split('|').nth(1).unwrap_or_else(|| {
+					inner.rsplit('/').next().unwrap_or(inner)
+				}).trim().to_string();
+				if !surface.is_empty() {
+					stripped_link_surface = Some(surface);
+				}
 				s = &rest[end + 2..];
 				s = s.trim_start();
 				continue;
@@ -122,6 +133,23 @@ pub(crate) fn derive_title(body: &str, fallback: &str) -> String {
 		.find(['.', '?', '!', '\n'])
 		.unwrap_or(s.len());
 	let candidate = s[..cut].trim();
+	// If stripping the leading wikilink left a dangling possessive/punct
+	// fragment (`'s repo layout`, `: foo bar`, `, the X`), or anything too
+	// short to be informative, prepend the link surface text. Looks like
+	// `Acme's repo layout` instead of `'s repo layout`.
+	let dangling = candidate
+		.chars()
+		.next()
+		.map(|c| matches!(c, '\'' | ',' | ':' | ';' | ')' | ']' | '!' | '?'))
+		.unwrap_or(false);
+	let candidate_owned: String = match (&stripped_link_surface, dangling) {
+		(Some(surface), true) if !surface.is_empty() && !candidate.is_empty() => {
+			// Glue tightly for possessive/punct prefixes (`'s`, `:`, `,`).
+			format!("{}{}", surface, candidate)
+		}
+		_ => candidate.to_string(),
+	};
+	let candidate = candidate_owned.as_str();
 	if candidate.is_empty() {
 		return fallback.to_string();
 	}
@@ -169,20 +197,6 @@ struct DocRefParams {
 struct ListLogParams {
 	limit: Option<u64>,
 	cursor: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct UpdateDocParams {
-	doc_type: String,
-	id: String,
-	content: Option<String>,
-	tags: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct MarkQuestionParams {
-	question_id: String,
-	status: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -274,28 +288,9 @@ struct LearnPassParams {
 	support_promote_floor: Option<u64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
-struct SearchParams {
-	query: String,
-	/// smart | fts | tag | qa | list
-	mode: Option<String>,
-	k: Option<u64>,
-	include_bodies: Option<bool>,
-	include_reasons: Option<bool>,
-	edges_depth: Option<u64>,
-	/// Required when mode="list". One of: thoughts|entities|questions|conclusions|reasons.
-	doc_type: Option<String>,
-}
 
 #[derive(Deserialize, JsonSchema)]
-struct GetParams {
-	id: String,
-	doc_type: Option<String>,
-	depth: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct IngestParams {
+struct IngestItem {
 	kind: String,
 	title: Option<String>,
 	body: String,
@@ -305,6 +300,91 @@ struct IngestParams {
 	from_id: Option<String>,
 	to_id: Option<String>,
 	reason_kind: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct IngestParams {
+	/// One ingest payload per element. Processed sequentially; per-item
+	/// failures are reported without aborting the batch.
+	items: Vec<IngestItem>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MarkQuestionItem {
+	question_id: String,
+	/// `answered` | `dropped`.
+	status: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MarkQuestionParams {
+	items: Vec<MarkQuestionItem>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SearchItem {
+	query: String,
+	/// smart | fts | tag | qa | list
+	mode: Option<String>,
+	k: Option<u64>,
+	include_bodies: Option<bool>,
+	include_reasons: Option<bool>,
+	edges_depth: Option<u64>,
+	/// Required when mode="list".
+	doc_type: Option<String>,
+	/// When `smart`/`qa` returns 0 hits, raise the query as an open question.
+	/// Default `false`.
+	raise_on_miss: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SearchParams {
+	items: Vec<SearchItem>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetItem {
+	id: String,
+	doc_type: Option<String>,
+	depth: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetParams {
+	items: Vec<GetItem>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpdateItem {
+	doc_type: String,
+	id: String,
+	content: Option<String>,
+	tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RetagItem {
+	id: String,
+	/// Auto-detect when omitted.
+	doc_type: Option<String>,
+	/// Tags to append (idempotent — duplicates skipped).
+	add_tags: Option<Vec<String>>,
+	/// Tags to strip (case-sensitive exact match).
+	remove_tags: Option<Vec<String>>,
+	/// New purpose tag. Replaces any existing purpose tag in `tags` and the
+	/// frontmatter `purpose` field. Pass to migrate a doc between purposes
+	/// without touching `content`.
+	purpose: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RetagParams {
+	items: Vec<RetagItem>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpdateDocParams {
+	items: Vec<UpdateItem>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -416,6 +496,30 @@ fn json_err(e: impl std::fmt::Display) -> String {
 
 fn to_json<T: serde::Serialize>(v: &T) -> String {
 	serde_json::to_string(v).unwrap_or_else(json_err)
+}
+
+/// Build a per-item entry for batch tool responses. Parses the inner tool's
+/// String response into JSON; treats `{"error": ...}` as failure.
+fn batch_entry(index: usize, raw: String) -> serde_json::Value {
+	let value = serde_json::from_str::<serde_json::Value>(&raw)
+		.unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+	let ok = value.get("error").is_none();
+	serde_json::json!({ "index": index, "ok": ok, "value": value })
+}
+
+/// Wrap a vector of `batch_entry` results in the standard envelope:
+/// `{ count, ok, errors, results }`.
+fn batch_wrap(results: Vec<serde_json::Value>) -> String {
+	let ok = results.iter()
+		.filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
+		.count();
+	let errors = results.len() - ok;
+	serde_json::json!({
+		"count": results.len(),
+		"ok": ok,
+		"errors": errors,
+		"results": results,
+	}).to_string()
 }
 
 /// Render a doc as a paginated-list entry: snippet, not full content.
@@ -681,9 +785,19 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Update doc body, title, or tags. Re-embeds + re-links body. Docs: docs(\"update\"). Args: id, doc_type?, body?, title?, tags?, edges?.")]
+	#[tool(description = "Update many docs in one call (batch-only). Re-embeds + re-links on body change. Docs: docs(\"update\"). Args: items ([{doc_type, id, content?, tags?}]).")]
 	async fn update(&self, params: Parameters<UpdateDocParams>) -> String {
-		let UpdateDocParams { doc_type, id, content, tags } = params.0;
+		let UpdateDocParams { items } = params.0;
+		let mut results = Vec::with_capacity(items.len());
+		for (index, item) in items.into_iter().enumerate() {
+			let raw = self.update_one(item).await;
+			results.push(batch_entry(index, raw));
+		}
+		batch_wrap(results)
+	}
+
+	async fn update_one(&self, item: UpdateItem) -> String {
+		let UpdateItem { doc_type, id, content, tags } = item;
 		match store::update_document(self.root(), &doc_type, &id, content.as_deref(), tags) {
 			Ok(doc) => {
 				self.try_index_doc(&doc);
@@ -697,6 +811,78 @@ impl WikiService {
 			}
 			Err(e) => json_err(e),
 		}
+	}
+
+	#[tool(description = "Bulk-retag and bulk-purpose-move docs (batch-only). Adds, removes, or moves purpose tags without rewriting content. Docs: docs(\"retag\"). Args: items ([{id, doc_type?, add_tags?, remove_tags?, purpose?}]).")]
+	fn retag(&self, params: Parameters<RetagParams>) -> String {
+		let RetagParams { items } = params.0;
+		let mut results = Vec::with_capacity(items.len());
+		// Cache known purposes once for purpose-move validation.
+		let known_purposes: std::collections::HashSet<String> = store::list_purposes(self.root())
+			.unwrap_or_default()
+			.into_iter()
+			.map(|p| p.tag)
+			.collect();
+		for (index, item) in items.into_iter().enumerate() {
+			let raw = self.retag_one(item, &known_purposes);
+			results.push(batch_entry(index, raw));
+		}
+		batch_wrap(results)
+	}
+
+	fn retag_one(&self, item: RetagItem, known_purposes: &std::collections::HashSet<String>) -> String {
+		let RetagItem { id, doc_type, add_tags, remove_tags, purpose } = item;
+		let dt = match self.resolve_doc_type(doc_type.as_deref(), &id) {
+			Some(d) => d,
+			None => return json_err(format!("Doc not found: {}", id)),
+		};
+		let mut doc = match store::get_document(self.root(), &dt, &id) {
+			Ok(d) => d,
+			Err(e) => return json_err(e),
+		};
+		let before = doc.tags.clone();
+
+		if let Some(rm) = remove_tags {
+			doc.tags.retain(|t| !rm.iter().any(|r| r == t));
+		}
+		if let Some(new_purpose) = purpose.as_deref() {
+			if !known_purposes.contains(new_purpose) {
+				return json_err(format!(
+					"Unknown purpose tag: {}. Use `purpose({{action:\"create\"}})` first or `purpose({{action:\"list\"}})` to see options.",
+					new_purpose,
+				));
+			}
+			// Strip the old purpose tag (any tag matching a known purpose) and
+			// the doc's current `purpose` field, then append the new purpose.
+			doc.tags.retain(|t| !known_purposes.contains(t) && Some(t.as_str()) != doc.purpose.as_deref());
+			doc.tags.push(new_purpose.to_string());
+		}
+		if let Some(adds) = add_tags {
+			for t in adds {
+				if !doc.tags.iter().any(|x| x == &t) {
+					doc.tags.push(t);
+				}
+			}
+		}
+
+		if let Err(e) = store::update_document(self.root(), &dt, &id, None, Some(doc.tags.clone())) {
+			return json_err(e);
+		}
+		// Sync frontmatter `purpose` field for purpose moves so downstream
+		// readers (smart, walk, classifier) see the new bucket.
+		if let Some(new_purpose) = purpose.as_deref() {
+			let _ = store::set_frontmatter_field(
+				self.root(), &dt, &id, "purpose",
+				serde_json::Value::String(new_purpose.to_string()),
+			);
+		}
+		serde_json::json!({
+			"id": id,
+			"doc_type": dt,
+			"tags_before": before,
+			"tags_after": doc.tags,
+			"purpose": purpose,
+		}).to_string()
 	}
 
 	#[tool(description = "Delete one or many docs of a given doc_type. Docs: docs(\"delete_doc\"). Args: doc_type, id? | ids?.")]
@@ -764,9 +950,19 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Manually set question state. Override only — learn_pass auto-marks. Docs: docs(\"mark_question\"). Args: id, state (answered|dropped).")]
+	#[tool(description = "Set status on many questions in one call (batch-only). Override only — learn_pass auto-marks. Docs: docs(\"mark_question\"). Args: items ([{question_id, status}]). status: answered|dropped.")]
 	fn mark_question(&self, params: Parameters<MarkQuestionParams>) -> String {
-		let MarkQuestionParams { question_id, status } = params.0;
+		let MarkQuestionParams { items } = params.0;
+		let mut results = Vec::with_capacity(items.len());
+		for (index, item) in items.into_iter().enumerate() {
+			let raw = self.mark_question_one(item);
+			results.push(batch_entry(index, raw));
+		}
+		batch_wrap(results)
+	}
+
+	fn mark_question_one(&self, item: MarkQuestionItem) -> String {
+		let MarkQuestionItem { question_id, status } = item;
 		const VALID: &[&str] = &["answered", "dropped"];
 		if !VALID.contains(&status.as_str()) {
 			return json_err(format!("Invalid status: {}", status));
@@ -931,7 +1127,12 @@ impl WikiService {
 			answer_threshold, support_threshold, edge_threshold, connect_k,
 			qa_max_per_pass, conclusion_merge_threshold, support_promote_floor,
 		} = params.0;
-		let limit = limit.map(|n| n as usize).unwrap_or(25);
+		// `limit: 0` → unlimited (scan whole vault). `None` → default 25.
+		let limit = match limit {
+			Some(0) => usize::MAX,
+			Some(n) => n as usize,
+			None => 25,
+		};
 		let defaults = learn::PassConfig::default();
 		let cfg = learn::PassConfig {
 			answer_threshold: answer_threshold.unwrap_or(defaults.answer_threshold),
@@ -985,9 +1186,19 @@ impl WikiService {
 
 	// ── New consolidated tools ──────────────────────────────────────────────
 
-	#[tool(description = "Read docs(\"search\") first. Hybrid knowledge search + doc listing. mode: smart (conclusions-first, returns top-10 ranked hits with per-hit snippet + full body + edges — use these 10 hits to synthesize a conclusion) | fts (BM25) | tag | qa | list (paginate by doc_type). Args: query, mode?, k? (default 10), include_bodies?, include_reasons?, edges_depth?, doc_type?.")]
+	#[tool(description = "Run many search queries in one call (batch-only). Read docs(\"search\") first. Per-item: mode smart (conclusions-first, top-k ranked hits w/ snippet+body+edges) | fts (BM25) | tag | qa | list (paginate by doc_type). Docs: docs(\"search\"). Args: items ([{query, mode?, k?, include_bodies?, include_reasons?, edges_depth?, doc_type?, raise_on_miss?}]).")]
 	async fn search(&self, params: Parameters<SearchParams>) -> String {
-		let SearchParams { query, mode, k, include_bodies, include_reasons, edges_depth, doc_type } = params.0;
+		let SearchParams { items } = params.0;
+		let mut results = Vec::with_capacity(items.len());
+		for (index, item) in items.into_iter().enumerate() {
+			let raw = self.search_one(item).await;
+			results.push(batch_entry(index, raw));
+		}
+		batch_wrap(results)
+	}
+
+	async fn search_one(&self, item: SearchItem) -> String {
+		let SearchItem { query, mode, k, include_bodies, include_reasons, edges_depth, doc_type, raise_on_miss } = item;
 		let mode = mode.unwrap_or_else(|| "smart".to_string());
 
 		// mode="list" — paginate all docs of a given type, no search needed
@@ -1099,10 +1310,13 @@ impl WikiService {
 		if !suggested.is_empty() {
 			out["suggested_conclusions"] = serde_json::json!(suggested);
 		}
-		// Knowledge-gap question raise: if a smart/qa search found nothing,
-		// the agent is seeking info we don't have — raise it as an open
-		// question. Idempotent (deduped by query hash).
-		if raw_hits.is_empty() && (mode == "smart" || mode == "qa") {
+		// Knowledge-gap question raise: opt-in via `raise_on_miss=true`.
+		// Off by default to avoid polluting the question pool with search
+		// artifacts. Idempotent (deduped by query hash) when enabled.
+		if raise_on_miss.unwrap_or(false)
+			&& raw_hits.is_empty()
+			&& (mode == "smart" || mode == "qa")
+		{
 			if let Some(qid) = learn::raise_question_from_search_miss(self.root(), &query, None).await {
 				out["raised_question_id"] = serde_json::json!(qid);
 			}
@@ -1110,9 +1324,19 @@ impl WikiService {
 		out.to_string()
 	}
 
-	#[tool(description = "Fetch doc by id with reasons + edges. Auto-detects type. Docs: docs(\"get\"). Args: id, doc_type?, depth? (default 1).")]
+	#[tool(description = "Fetch many docs in one call (batch-only). Each item returns doc + reasons + edges (auto-detects type). Docs: docs(\"get\"). Args: items ([{id, doc_type?, depth?}]).")]
 	fn get(&self, params: Parameters<GetParams>) -> String {
-		let GetParams { id, doc_type, depth } = params.0;
+		let GetParams { items } = params.0;
+		let mut results = Vec::with_capacity(items.len());
+		for (index, item) in items.into_iter().enumerate() {
+			let raw = self.get_one(item);
+			results.push(batch_entry(index, raw));
+		}
+		batch_wrap(results)
+	}
+
+	fn get_one(&self, item: GetItem) -> String {
+		let GetItem { id, doc_type, depth } = item;
 		let depth = depth.unwrap_or(1) as usize;
 		let dt = match self.resolve_doc_type(doc_type.as_deref(), &id) {
 			Some(d) => d,
@@ -1123,6 +1347,16 @@ impl WikiService {
 			Err(e) => return json_err(e),
 		};
 		let reasons = store::search_reasons_for(self.root(), &id, "both").unwrap_or_default();
+		// Split reasons into inbound/outbound so callers can answer
+		// "what wikilinks INTO X?" without parsing the reason title format.
+		// Title encoding is `<from_id>-[Kind]->-<to_id>`; outbound = starts with `<id>-`,
+		// inbound = ends with `-<id>`.
+		let from_prefix = format!("{}-", id);
+		let to_suffix = format!("-{}", id);
+		let (outbound, inbound): (Vec<_>, Vec<_>) = reasons
+			.iter()
+			.partition(|r| r.title.starts_with(&from_prefix));
+		let inbound: Vec<_> = inbound.into_iter().filter(|r| r.title.ends_with(&to_suffix)).collect();
 		let mut edges_by_depth = serde_json::Map::new();
 		let mut frontier: Vec<String> = vec![id.clone()];
 		let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1147,13 +1381,25 @@ impl WikiService {
 		serde_json::json!({
 			"doc": doc,
 			"reasons": reasons.iter().map(doc_preview).collect::<Vec<_>>(),
+			"inbound": inbound.iter().map(|r| doc_preview(r)).collect::<Vec<_>>(),
+			"outbound": outbound.iter().map(|r| doc_preview(r)).collect::<Vec<_>>(),
 			"edges_by_depth": edges_by_depth,
 		}).to_string()
 	}
 
-	#[tool(description = "Read docs(\"ingest\") and docs(\"learn\") first. Write a doc: thought|entity|question|reason|conclusion. Auto-links + auto-marks-answered. refs= creates References edges (NOT Answers). For Answers: reason_kind=Answers or wikilink in body. Args: kind, body, title?, tags?, refs?, purpose_hint?, from_id?, to_id?, reason_kind?.")]
+	#[tool(description = "Write many docs in one call (batch-only). Each item is one of thought|entity|question|reason|conclusion. Auto-links + auto-marks-answered per item. refs= creates References edges (NOT Answers). For Answers: reason_kind=Answers or body-start wikilink. Docs: docs(\"ingest\") + docs(\"learn\"). Args: items ([{kind, body, title?, tags?, refs?, purpose_hint?, from_id?, to_id?, reason_kind?}]).")]
 	async fn ingest(&self, params: Parameters<IngestParams>) -> String {
-		let IngestParams { kind, title, body, tags: _, refs, purpose_hint, from_id, to_id, reason_kind } = params.0;
+		let IngestParams { items } = params.0;
+		let mut results = Vec::with_capacity(items.len());
+		for (index, item) in items.into_iter().enumerate() {
+			let raw = self.ingest_one(item).await;
+			results.push(batch_entry(index, raw));
+		}
+		batch_wrap(results)
+	}
+
+	async fn ingest_one(&self, item: IngestItem) -> String {
+		let IngestItem { kind, title, body, tags: _, refs, purpose_hint, from_id, to_id, reason_kind } = item;
 		let title = title.unwrap_or_else(|| match kind.as_str() {
 			"reason" => "reason".to_string(),
 			"question" => derive_title(&body, "question"),
@@ -1167,12 +1413,28 @@ impl WikiService {
 						let added = if existing.title.to_lowercase() != title.to_lowercase() {
 							store::add_alias_to_entity(self.root(), &existing.id, &title).unwrap_or(false)
 						} else { false };
-						serde_json::json!({
-							"merged_into": existing.id,
-							"existing_title": existing.title,
-							"alias_added": if added { Some(title.as_str()) } else { None },
-							"note": "near-duplicate found — merged as alias, no new doc created"
-						})
+						// Normalized shape: same top-level `id`/`title`/`tags`/`purpose`
+						// as a fresh doc so callers don't branch on merge vs new.
+						// Hydrate from the persisted entity doc (EntityRef alone
+						// lacks tags/content). Merge metadata under `merged`.
+						let mut v = match store::get_document(self.root(), "entities", &existing.id) {
+							Ok(d) => serde_json::to_value(&d).unwrap_or_else(|_| {
+								serde_json::json!({"id": existing.id, "title": existing.title})
+							}),
+							Err(_) => serde_json::json!({
+								"id": existing.id,
+								"title": existing.title,
+							}),
+						};
+						if let Some(obj) = v.as_object_mut() {
+							obj.insert("merged".into(), serde_json::json!({
+								"merged_into": existing.id,
+								"existing_title": existing.title,
+								"alias_added": if added { Some(title.as_str()) } else { None },
+								"note": "near-duplicate found — merged as alias, no new doc created",
+							}));
+						}
+						v
 					}
 					_ => self.ingest_chunked("entities", &title, &body, "entity", purpose_hint.as_deref()).await,
 				}
@@ -1468,6 +1730,69 @@ mod tests {
 		let root = dir.path();
 		store::bootstrap(root).unwrap();
 		assert!(!mark_question_answered(root, "nonexistent-id").unwrap());
+	}
+
+	#[test]
+	fn derive_title_reattaches_link_surface_on_dangling_possessive() {
+		// Body like `[[acme]]'s repo layout: foo` previously yielded
+		// `'s repo layout: foo` — subject lost. Now re-attach the link surface.
+		assert_eq!(
+			derive_title("[[acme]]'s repo layout: foo", "untitled"),
+			"acme's repo layout: foo",
+		);
+		assert_eq!(
+			derive_title("[[entities/general/acme|Acme]]: ships v2", "untitled"),
+			"Acme: ships v2",
+		);
+		assert_eq!(
+			derive_title("[[questions/abc-123]], why?", "untitled"),
+			"abc-123, why",
+		);
+		// Plain trailing space (no dangling punct) keeps the strip behavior.
+		assert_eq!(
+			derive_title("[[acme]] core claim about widgets", "untitled"),
+			"core claim about widgets",
+		);
+	}
+
+	#[tokio::test]
+	async fn retag_adds_removes_and_moves_purpose() {
+		use tempfile::TempDir;
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+		store::create_purpose(root, "alpha", "Alpha", "alpha purpose").unwrap();
+		store::create_purpose(root, "beta", "Beta", "beta purpose").unwrap();
+
+		let q = store::create_document(
+			root, "questions", "Q?", "qbody",
+			vec!["question".into(), "alpha".into(), "draft".into()],
+			Some("alpha"), None,
+		).unwrap();
+
+		let known: std::collections::HashSet<String> =
+			["alpha".to_string(), "beta".to_string()].into_iter().collect();
+		let svc = WikiService { wiki_path: root.to_path_buf() };
+		let raw = svc.retag_one(
+			RetagItem {
+				id: q.id.clone(),
+				doc_type: Some("questions".into()),
+				add_tags: Some(vec!["reviewed".into()]),
+				remove_tags: Some(vec!["draft".into()]),
+				purpose: Some("beta".into()),
+			},
+			&known,
+		);
+		let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+		let after: Vec<String> = v["tags_after"].as_array().unwrap()
+			.iter().filter_map(|t| t.as_str().map(String::from)).collect();
+		assert!(after.contains(&"beta".to_string()));
+		assert!(!after.contains(&"alpha".to_string()), "old purpose tag must be stripped");
+		assert!(after.contains(&"reviewed".to_string()));
+		assert!(!after.contains(&"draft".to_string()));
+		// Purpose field synced via set_frontmatter_field.
+		let reloaded = store::get_document(root, "questions", &q.id).unwrap();
+		assert_eq!(reloaded.purpose.as_deref(), Some("beta"));
 	}
 
 	#[test]

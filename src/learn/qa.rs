@@ -112,24 +112,18 @@ async fn qa_for_doc(
 		.iter()
 		.map(|r| (r.question_id.clone(), r.title.clone(), r.purpose.clone()))
 		.collect();
-	if let Ok(reasons) = store::search_reasons_for(root, &doc.id, "to") {
-		for r in reasons {
-			let _ = r;
-		}
-	}
-	if let Ok(questions) = store::list_documents(root, "questions") {
-		for q in questions {
+
+	// Walk this doc's outbound edges; pick the open questions it Supports/Answers.
+	// Body-start `[[<qid>]]` wikilinks mint `Supports` edges thought→question;
+	// this discovery is what feeds them into the synthesis loop.
+	if let Ok(out_reasons) = store::search_reasons_for(root, &doc.id, "from") {
+		for r in out_reasons {
+			let Some((_from, to, kind, _p)) = super::infra::read_reason_meta(root, &r.id) else { continue };
+			if kind != "Supports" && kind != "Answers" { continue; }
+			let Ok(q) = store::get_document(root, "questions", &to) else { continue };
 			if q.tags.iter().any(|t| t == "answered" || t == "dropped") { continue; }
 			if q_targets.iter().any(|(id, _, _)| id == &q.id) { continue; }
-			let linked = store::search_reasons_for(root, &q.id, "from")
-				.ok()
-				.map(|rs| rs.iter().any(|r| {
-					r.title.ends_with(&doc.id)
-				}))
-				.unwrap_or(false);
-			if linked {
-				q_targets.push((q.id, q.title, q.purpose));
-			}
+			q_targets.push((q.id, q.title, q.purpose));
 		}
 	}
 
@@ -372,12 +366,18 @@ pub async fn run_pass(
 		merges_total,
 		if dry_run { " (dry_run)" } else { "" },
 	);
-	if invariant_violated {
-		eprintln!(
-			"[learn] invariant violated: 0 links/edges/questions/conclusions added. \
-			 Widen N (limit) or lower thresholds (edge_threshold={}, answer_threshold={}).",
-			cfg.edge_threshold, cfg.answer_threshold,
-		);
+	let invariant_reason = if invariant_violated {
+		Some(format!(
+			"0 links/edges/questions/conclusions added across {} sampled docs (skipped_recent={}). \
+			 Widen `limit`, lower thresholds (edge_threshold={}, answer_threshold={}, support_threshold={}), \
+			 or run with `force:true` to bypass the 24h last_qa_at skip.",
+			targets.len(), skipped_recent, cfg.edge_threshold, cfg.answer_threshold, cfg.support_threshold,
+		))
+	} else {
+		None
+	};
+	if let Some(ref r) = invariant_reason {
+		eprintln!("[learn] invariant violated: {r}");
 	}
 
 	let report = serde_json::json!({
@@ -399,6 +399,7 @@ pub async fn run_pass(
 		"skipped_recent": skipped_recent,
 		"crosstopic_invoked": crosstopic_invoked,
 		"invariant_violated": invariant_violated,
+		"invariant_reason": invariant_reason,
 		"sampling": "weighted_inverse_degree",
 		"cursor": last_processed.as_ref().map(|(dt, id)| format!("{}/{}", dt, id)),
 		"details": details,

@@ -80,14 +80,24 @@ pub async fn raise_questions_for_doc(
 		return Ok(Vec::new());
 	}
 
-	let sys = "You read a wiki doc and produce open questions IT raises (not answers). \
+	let sys = "You read a wiki doc and surface concrete unresolved questions raised by its specific claims. \
 		Return JSON {\"questions\": [{\"title\": string, \"body\": string}]}. \
-		Skip if doc already self-explanatory. Max 3. \
-		Hard rules: \
-		- Reject questions any reasonable reader could answer from the doc body alone. \
-		- No templated phrasing. No 'How does X relate to similar concepts'. \
-		No 'What are the implications of X'. No 'What are the key characteristics of X'. \
-		- Each question must require >=2 sentences of context in the body, not just a title.";
+		Output zero questions if the doc is self-contained or only restates known facts. Max 3. \
+		\
+		HARD REJECTS (return empty if these are all you can produce): \
+		- Generic shape: 'How does X work?', 'What are the implications of X?', \
+		  'What challenges might arise from X?', 'How does X relate to similar concepts?', \
+		  'What are the key characteristics of X?', 'Why is X important?'. \
+		- Questions answerable directly from the doc body. \
+		- Questions that just rename the doc title with a question mark. \
+		\
+		REQUIRED SHAPE: \
+		- Title names a specific mechanism, threshold, decision, or tradeoff present in the doc. \
+		  Example good: 'What happens to the auto-link edge when a doc's purpose changes after ingest?' \
+		  Example bad: 'How does auto-linking work?'. \
+		- Body cites the exact claim from the doc that raises the question, then states what's missing \
+		  to answer it (>=2 sentences, names a measurement, source, or experiment). \
+		- Each question must point at a real gap, not a paraphrase.";
 	let user = format!("Title: {}\n\nBody:\n{}", doc.title, doc.content);
 	let raw = http::chat_json(sys, &user).await?;
 	let parsed: RaisedQResp = serde_json::from_str(&raw)
