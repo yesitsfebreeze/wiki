@@ -247,7 +247,7 @@ struct CodeParams {
 
 #[derive(Deserialize, JsonSchema)]
 struct AdminParams {
-	/// recompute | sanitize | migrate | feedback
+	/// recompute | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops
 	action: String,
 	dry_run: Option<bool>,
 	limit: Option<u64>,
@@ -324,7 +324,7 @@ struct IngestParams {
 #[derive(Deserialize, JsonSchema)]
 struct MarkQuestionItem {
 	question_id: String,
-	/// `answered` | `dropped`.
+	/// `deleted` (hard delete + edge cleanup) | `buried` (move to questions/graveyard/, reversible).
 	status: String,
 }
 

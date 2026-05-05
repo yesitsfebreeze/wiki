@@ -11,7 +11,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Collect embeddings for OPEN (not `answered` or `dropped`) questions in `purpose_tag`.
+/// Collect embeddings for OPEN (not buried in `graveyard`) questions in `purpose_tag`.
 pub async fn gather_open_question_embeddings(
 	root: &Path,
 	purpose_tag: &str,
