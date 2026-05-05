@@ -334,6 +334,7 @@ pub async fn run_pass(
 	}
 
 	let mut crosstopic_invoked = 0u64;
+	let mut support_floor_promoted = 0u64;
 	if qa && !dry_run {
 		let answered: HashSet<String> = cache::tag_index_lookup(root, "answered")
 			.into_iter()
@@ -346,6 +347,52 @@ pub async fn run_pass(
 			.filter(|d| d.doc_type == "questions" && !answered.contains(&d.id))
 			.map(|d| d.id)
 			.collect();
+
+		// Pre-pass: any open question with ≥ support_promote_floor inbound
+		// `Supports` edges gets promoted directly — independent of which docs
+		// fell into the random scan window. Closes the gap where 3 supporting
+		// thoughts existed but the question's question-doc was never visited
+		// during the per-doc qa_for_doc walk.
+		for qid in &candidates {
+			if llm_budget == 0 { break; }
+			let inbound = match store::search_reasons_for(root, qid, "to") {
+				Ok(v) => v,
+				Err(_) => continue,
+			};
+			let mut supports: Vec<super::infra::AnswerCandidate> = Vec::new();
+			for r in inbound {
+				let Some((from_id, _to, kind, _p)) = super::infra::read_reason_meta(root, &r.id) else { continue };
+				if kind != "Supports" { continue; }
+				if from_id == *qid { continue; } // defensive: never self-supports
+				let dt = ["thoughts", "conclusions", "entities"].iter()
+					.find(|d| store::get_document(root, d, &from_id).is_ok())
+					.map(|s| s.to_string())
+					.unwrap_or_else(|| "thoughts".to_string());
+				supports.push(super::infra::AnswerCandidate {
+					doc_id: from_id,
+					doc_type: dt,
+					score: cfg.support_threshold,
+					kind: "Supports".to_string(),
+					body: String::new(),
+				});
+			}
+			if supports.len() < cfg.support_promote_floor { continue; }
+			llm_budget = llm_budget.saturating_sub(1);
+			if let Ok(Some(_)) = super::promote::promote_to_conclusion(root, qid, &supports, cfg).await {
+				support_floor_promoted += 1;
+				questions_answered += 1;
+				conclusions_promoted += 1;
+				if let Ok(mut q) = store::get_document(root, "questions", qid) {
+					if !q.tags.iter().any(|t| t == "answered") {
+						q.tags.push("answered".to_string());
+						q.tags.push("synthesized".to_string());
+						let _ = store::update_document(root, "questions", qid, None, Some(q.tags));
+						let _ = super::links::move_to_answered(root, qid);
+					}
+				}
+			}
+		}
+
 		for qid in candidates {
 			if llm_budget < 2 { break; }
 			if !should_invoke_cross_topic(root, &qid) { continue; }
@@ -416,6 +463,7 @@ pub async fn run_pass(
 		"raise_questions": cfg.raise_questions,
 		"skipped_recent": skipped_recent,
 		"crosstopic_invoked": crosstopic_invoked,
+		"support_floor_promoted": support_floor_promoted,
 		"invariant_violated": invariant_violated,
 		"invariant_reason": invariant_reason,
 		"start": start,

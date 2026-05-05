@@ -1,3 +1,4 @@
 target/
 .wiki/
 *.env
+bin/

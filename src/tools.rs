@@ -1154,11 +1154,12 @@ impl WikiService {
 			qa_max_per_pass, conclusion_merge_threshold, support_promote_floor,
 		} = params.0;
 		let start = start.map(|n| n as usize);
-		// `limit: 0` → unlimited (scan whole vault). `None` → default 25.
+		// `limit: 0` → unlimited. `None` → unlimited (default flipped — 25
+		// was too narrow for real vaults, kept paginating callers blind).
+		// Callers that want a deterministic page must pass both `start` + `limit`.
 		let limit = match limit {
-			Some(0) => usize::MAX,
+			Some(0) | None => usize::MAX,
 			Some(n) => n as usize,
-			None => 25,
 		};
 		let defaults = learn::PassConfig::default();
 		let cfg = learn::PassConfig {
@@ -1179,7 +1180,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Vault maintenance. action: recompute | sanitize | migrate | feedback. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
+	#[tool(description = "Vault maintenance. action: recompute | sanitize | migrate | feedback | retitle_questions | prune_self_loops. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
 	async fn admin(&self, params: Parameters<AdminParams>) -> String {
 		let AdminParams { action, dry_run, limit } = params.0;
 		let dry = dry_run.unwrap_or(false);
@@ -1203,11 +1204,41 @@ impl WikiService {
 					Err(e) => json_err(e),
 				}
 			},
+			"prune_self_loops" => {
+				let reasons = store::list_documents(self.root(), "reasons").unwrap_or_default();
+				let mut scanned = 0u64;
+				let mut deleted = 0u64;
+				let mut examples: Vec<serde_json::Value> = Vec::new();
+				for r in reasons {
+					scanned += 1;
+					let Some((from_id, to_id, kind, _)) = learn::infra_read_reason_meta(self.root(), &r.id) else { continue };
+					if from_id != to_id { continue; }
+					if !dry {
+						if store::delete_document(self.root(), "reasons", &r.id).is_ok() {
+							deleted += 1;
+						}
+					} else {
+						deleted += 1;
+					}
+					if examples.len() < 10 {
+						examples.push(serde_json::json!({
+							"reason_id": r.id, "from_id": from_id, "to_id": to_id, "kind": kind,
+						}));
+					}
+				}
+				serde_json::json!({
+					"action": "prune_self_loops",
+					"scanned": scanned,
+					"deleted": deleted,
+					"dry_run": dry,
+					"examples": examples,
+				}).to_string()
+			},
 			"retitle_questions" => match retitle_generic_questions(self.root(), dry) {
 				Ok(rep) => to_json(&rep),
 				Err(e) => json_err(e),
 			},
-			other => json_err(format!("Unknown action: {} (recompute|sanitize|migrate|feedback|retitle_questions)", other)),
+			other => json_err(format!("Unknown action: {} (recompute|sanitize|migrate|feedback|retitle_questions|prune_self_loops)", other)),
 		}
 	}
 

@@ -61,7 +61,9 @@ learn_pass({force:true, raise_questions:true})
 
 Reports edges added, questions raised, conclusions promoted. The pass samples weighted by inverse edge degree (orphans first), forges typed edges between semantic neighbors, raises questions on linkable docs, runs cross-reference + cross-topic synthesis on open questions with supporting evidence.
 
-`limit` controls how many docs the pass scans (default `25`; pass `limit: 0` to scan the whole vault). The pass is bounded further by `qa_max_per_pass` LLM-call budget.
+`limit` controls how many docs the pass scans. **Default is unlimited** (entire vault). Pass `limit: 25` to cap. The pass is bounded further by `qa_max_per_pass` LLM-call budget.
+
+A second sweep at the end of every pass walks all open questions and counts inbound `Supports` edges. Any question that meets `support_promote_floor` (default `3`) gets promoted directly — no longer dependent on which docs the random sampler happened to visit. The result is reported as `support_floor_promoted` in the JSON.
 
 For deterministic pagination across a large vault, pass `start` (page offset). The universe is sorted by `(doc_type, id)` and the slice `[start, start + limit)` is processed. The response carries `next_start` (`null` once exhausted) and `total_universe`. Loop:
 ```

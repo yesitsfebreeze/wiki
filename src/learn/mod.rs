@@ -13,6 +13,7 @@ pub(crate) mod feedback;
 pub(crate) mod code_links;
 
 pub use infra::{EntityRef, PassConfig};
+pub(crate) use infra::read_reason_meta as infra_read_reason_meta;
 pub use dedup::find_near_duplicate_entity;
 pub use links::link_doc;
 pub use links::move_to_answered;
