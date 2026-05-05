@@ -1,9 +1,80 @@
-//! One-shot template-question cleanup.
+//! One-shot template-question cleanup + question-lifecycle collapse.
 
 use crate::cache;
 use crate::store;
 use anyhow::Result;
 use std::path::Path;
+
+/// Outcome of [`migrate_question_lifecycle`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LifecycleMigrationReport {
+	/// Files removed under `questions/answered/**` — duplicates of conclusions.
+	pub answered_deleted: usize,
+	/// Files removed under `questions/dropped/**` — junk per user policy.
+	pub dropped_deleted: usize,
+	/// Open-tree questions that had stale `"answered"` tags and were deleted.
+	pub stray_answered_tag_deleted: usize,
+	/// Open-tree questions that had stale `"dropped"` tags and were deleted.
+	pub stray_dropped_tag_deleted: usize,
+}
+
+/// Collapse the legacy 4-state question lifecycle (`open` / `answered` /
+/// `dropped` / various tags) into the new 2-state model:
+///
+/// - **open** — `questions/<purpose>/...`, no `graveyard` tag
+/// - **graveyard** — `questions/graveyard/<purpose>/...`, `graveyard` tag
+///
+/// Everything else is hard-deleted:
+/// 1. Files under `questions/answered/**` — the conclusion is the durable
+///    answer record, the answered question is redundant.
+/// 2. Files under `questions/dropped/**` — per user policy, no audit trail
+///    needed; reexplore by deleting `questions/graveyard/`.
+/// 3. Stray `"answered"` / `"dropped"` tags on open-tree questions —
+///    leftovers from a partial pre-migration state.
+///
+/// Idempotent: re-runs find nothing to do.
+pub fn migrate_question_lifecycle(root: &Path, dry_run: bool) -> Result<LifecycleMigrationReport> {
+	let mut rep = LifecycleMigrationReport::default();
+	let questions = store::list_documents(root, "questions").unwrap_or_default();
+
+	for q in questions {
+		// Resolve the file path so we can detect legacy subfolder placement.
+		let dir = root.join("questions");
+		let path = match store::find_document_path_by_id(&dir, &q.id) {
+			Ok(p) => p,
+			Err(_) => continue,
+		};
+		let in_answered = path.components().any(|c| c.as_os_str() == "answered");
+		let in_dropped = path.components().any(|c| c.as_os_str() == "dropped");
+		let has_answered_tag = q.tags.iter().any(|t| t == "answered");
+		let has_dropped_tag = q.tags.iter().any(|t| t == "dropped");
+
+		let kill = in_answered || in_dropped || has_answered_tag || has_dropped_tag;
+		if !kill {
+			continue;
+		}
+		if dry_run {
+			if in_answered { rep.answered_deleted += 1; }
+			else if in_dropped { rep.dropped_deleted += 1; }
+			else if has_answered_tag { rep.stray_answered_tag_deleted += 1; }
+			else if has_dropped_tag { rep.stray_dropped_tag_deleted += 1; }
+			continue;
+		}
+		// Cascade-delete edges touching the question alongside the file so
+		// no dangling reasons survive.
+		let adj = cache::reason_index_lookup(root, &q.id);
+		for rid in adj.to.iter().chain(adj.from.iter()) {
+			let _ = store::delete_document(root, "reasons", rid);
+		}
+		if store::delete_document(root, "questions", &q.id).is_ok() {
+			if in_answered { rep.answered_deleted += 1; }
+			else if in_dropped { rep.dropped_deleted += 1; }
+			else if has_answered_tag { rep.stray_answered_tag_deleted += 1; }
+			else if has_dropped_tag { rep.stray_dropped_tag_deleted += 1; }
+		}
+	}
+	Ok(rep)
+}
 
 /// Outcome of [`migrate_templated_questions`].
 #[derive(Debug, Clone, Default, serde::Serialize)]

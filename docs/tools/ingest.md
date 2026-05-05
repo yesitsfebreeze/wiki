@@ -74,8 +74,8 @@ Batch-only. Single write tool for all five doc types. Wrap every payload in `{it
   1. Embed body.
   2. Nearest-neighbor scan within purpose cluster → top-k similar (cosine ≥ 0.82) become edges.
   3. Parse `[[wikilinks]]` → resolve + edge. Body-start wikilink → `Supports` (question target or same-purpose non-question target). **No auto-mark** — `learn_pass` decides promotion from accumulated `Supports`. Mid-body / cross-purpose → `References`. To force an immediate `Answers` edge + auto-mark, ingest an explicit reason: `{kind:"reason", reason_kind:"Answers", from_id, to_id}`.
-  4. `kind=conclusion`: scan open questions; match → auto `mark_question(answered)` + `Answers` edge.
-  5. `kind=question`: scan existing conclusions; match → auto-answer.
+  4. `kind=conclusion`: scan open questions; match → emit `Answers` edge from new conclusion to the question, repoint inbound wikilinks, then hard-delete the question (lifecycle is open|graveyard|deleted).
+  5. `kind=question`: scan existing conclusions; match → emit `Answers` edge from existing conclusion to the new question, repoint inbound, hard-delete the duplicate question.
 - `auto_linked` returned so caller can audit. To remove a bad auto-edge, call `delete_doc` on the reason node or `update` to replace.
 - Top-5 cap on auto-linked count per item.
 - For huge batches, prefer chunks of ≤100 to keep the response payload manageable.

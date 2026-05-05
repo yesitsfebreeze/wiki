@@ -227,15 +227,10 @@ async fn cross_topic_emit_and_promote(
 		return Ok(0);
 	};
 
-	if let Ok(mut q) = store::get_document(root, "questions", question_id) {
-		if !q.tags.iter().any(|t| t == "answered") {
-			q.tags.push("answered".to_string());
-			if !got_answer && !q.tags.iter().any(|t| t == "synthesized") {
-				q.tags.push("synthesized".to_string());
-			}
-			let _ = store::update_document(root, "questions", question_id, None, Some(q.tags));
-		}
-	}
+	// Question state is encoded by file existence: we mutate nothing here.
+	// The actual delete happens after promote_to_conclusion below, once the
+	// conclusion exists and inbound links have been repointed.
+	let _ = got_answer;
 
 	let mut bridges: HashSet<String> = HashSet::new();
 	for c in promotion_edges {
@@ -303,6 +298,13 @@ pub async fn promote_to_conclusion(
 	let question = store::get_document(root, "questions", question_id)?;
 	let hash = fnv_question_id(&question.title);
 	if let Some(existing) = find_conclusion_by_hash(root, &hash) {
+		// Conclusion already exists for this question hash (likely a re-ingest
+		// of a question that was previously promoted+deleted). Repoint inbound
+		// links to the existing conclusion and hard-delete the duplicate
+		// question to keep the lifecycle invariant: an answered question
+		// never survives as a question doc.
+		let _ = super::links::repoint_inbound_to_conclusion(root, question_id, &existing);
+		let _ = super::links::delete_question_with_edges(root, question_id);
 		return Ok(Some(existing));
 	}
 
@@ -319,10 +321,13 @@ pub async fn promote_to_conclusion(
 	}).collect();
 
 	let sys = "Synthesize a 1-paragraph conclusion answering this question, citing the \
-		supplied edges. Be concise. Return JSON {\"body\": string}.";
+		supplied edges. Preserve any specific terminology or constraints from the \
+		question's body so context isn't lost when the question is deleted. Be \
+		concise. Return JSON {\"body\": string}.";
 	let user = format!(
-		"Question: {}\n\nEdges JSON:\n{}",
+		"Question title: {}\n\nQuestion body:\n{}\n\nEdges JSON:\n{}",
 		question.title,
+		question.content,
 		serde_json::to_string(&edges_json)?,
 	);
 	let raw = http::chat_json(sys, &user).await?;
@@ -333,6 +338,16 @@ pub async fn promote_to_conclusion(
 
 	let purpose = question.purpose.clone();
 	let purpose_tag = purpose.clone().unwrap_or_else(|| "general".to_string());
+
+	// Conclusion body keeps the question text verbatim as a preamble so the
+	// rationale survives the question's deletion. The LLM-synthesized answer
+	// follows underneath.
+	let q_body_trimmed = question.content.trim();
+	let conclusion_body = if q_body_trimmed.is_empty() {
+		parsed.body.clone()
+	} else {
+		format!("> Q: {}\n> {}\n\n{}", question.title, q_body_trimmed.replace('\n', "\n> "), parsed.body)
+	};
 
 	let body_text = format!("{}\n\n{}", question.title, parsed.body);
 	let threshold = cfg.conclusion_merge_threshold;
@@ -349,6 +364,8 @@ pub async fn promote_to_conclusion(
 				None,
 				purpose.as_deref(),
 			);
+			let _ = super::links::repoint_inbound_to_conclusion(root, question_id, &existing_id);
+			let _ = super::links::delete_question_with_edges(root, question_id);
 			eprintln!("merged into existing conclusion {}", existing_id);
 			return Ok(Some(existing_id));
 		}
@@ -356,7 +373,7 @@ pub async fn promote_to_conclusion(
 
 	let tags = vec!["conclusion".to_string(), purpose_tag.clone(), hash];
 	let cdoc = store::create_document(
-		root, "conclusions", &question.title, &parsed.body, tags, Some(&purpose_tag), None,
+		root, "conclusions", &question.title, &conclusion_body, tags, Some(&purpose_tag), None,
 	)?;
 
 	let _ = store::create_reason(root, question_id, &cdoc.id, "Derives", None, purpose.as_deref());
@@ -366,6 +383,14 @@ pub async fn promote_to_conclusion(
 	for e in edges {
 		let _ = store::create_reason(root, &cdoc.id, &e.doc_id, "References", Some(&e.body), purpose.as_deref());
 	}
+
+	// Repoint inbound wikilinks from the question to the new conclusion, then
+	// hard-delete the question. The conclusion is now the durable answer
+	// record; leaving the question around would duplicate state and reopen
+	// the lifecycle drift this collapse was meant to kill.
+	let _ = super::links::repoint_inbound_to_conclusion(root, question_id, &cdoc.id);
+	let _ = super::links::delete_question_with_edges(root, question_id);
+
 	Ok(Some(cdoc.id))
 }
 
@@ -491,9 +516,12 @@ mod tests {
 		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("general"), &cands, &cfg).await.unwrap();
 		assert_eq!(n, 2, "expected promote with 2 support edges");
 
-		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
-		assert!(q.tags.iter().any(|t| t == "answered"));
-		assert!(q.tags.iter().any(|t| t == "synthesized"));
+		// Question is hard-deleted by promote (early-return path repoints
+		// inbound and removes the duplicate question doc).
+		assert!(
+			store::get_document(root, "questions", &qdoc.id).is_err(),
+			"promoted question must be deleted",
+		);
 
 		// Conclusion was reused, not duplicated.
 		let concs = store::list_documents(root, "conclusions").unwrap();
@@ -571,8 +599,10 @@ mod tests {
 		let cfg = PassConfig { support_promote_floor: 3, ..PassConfig::default() };
 		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("general"), &cands, &cfg).await.unwrap();
 		assert_eq!(n, 0, "below floor must not promote");
+		// Below-floor path does not promote, so the question stays open
+		// (file still exists, no graveyard tag).
 		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
-		assert!(!q.tags.iter().any(|t| t == "answered"));
+		assert!(!q.tags.iter().any(|t| t == "graveyard"));
 	}
 
 	#[tokio::test]
@@ -636,13 +666,13 @@ mod tests {
 		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("phyons"), &cands, &PassConfig::default()).await.unwrap();
 		assert_eq!(n, 1, "one strong edge expected");
 
-		let q = store::get_document(root, "questions", &qdoc.id).unwrap();
-		assert!(q.tags.iter().any(|t| t == "answered"));
-
-		let from_q = store::search_reasons_for(root, &qdoc.id, "from").unwrap();
+		// Strong-edge path runs full promote, which on hash-match early-return
+		// hard-deletes the duplicate question (and cascade-deletes every edge
+		// touching it). The pre-existing conclusion stays and gains its
+		// crosstopic + bridges tags from the post-promote tagging step.
 		assert!(
-			from_q.iter().any(|r| r.title.contains("-[Answers]->") && r.title.ends_with(&cand.id)),
-			"expected Answers edge q→cand"
+			store::get_document(root, "questions", &qdoc.id).is_err(),
+			"promoted question must be deleted",
 		);
 
 		let cf = store::get_document(root, "conclusions", &cdoc.id).unwrap();

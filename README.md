@@ -60,9 +60,9 @@ All multi-doc tools are **batch-only** — wrap every payload in `{items: [...]}
 | `delete_doc` | 🗑️ Batch-delete by `id`/`ids`; cascades edge cleanup |
 | `learn_pass` | 🔁 Sensemaker — link/dedupe → connect → raise/answer → promote conclusions. `limit:0` = scan whole vault. Returns `invariant_reason` when no progress |
 | `list_open_questions` | ❓ Paginate unresolved questions, filter by purpose |
-| `mark_question` | ✅ Batch-set question status (answered \| dropped) |
+| `mark_question` | ✅ Batch-resolve questions (deleted \| buried) |
 | `purpose` | 🏷️ Manage purposes — `action`: list \| create \| delete \| reembed |
-| `admin` | 🧹 Vault maintenance — `action`: recompute \| sanitize \| migrate \| feedback \| retitle_questions |
+| `admin` | 🧹 Vault maintenance — `action`: recompute \| sanitize \| migrate \| migrate_lifecycle \| feedback \| retitle_questions |
 | `code` | 💻 Code index ops — `action`: index \| search \| read \| refs \| validate |
 | `docs` | 📚 Fetch tool / concept markdown docs (no arg → list) |
 

@@ -95,10 +95,10 @@ Only create when an entity has linked reasons + ≥2 resolved questions. Use `su
 
 ## Answering open questions
 
-1. `list_open_questions()` — all questions not marked resolved
+1. `list_open_questions()` — all questions not in graveyard
 2. `find_answers({question_id})` — fulltext-search candidates with suggested reason kinds
 3. For each candidate that answers: `ingest_reason({from_id: question_id, to_id: candidate_id, kind: "Answers", body})`
-4. `mark_question({question_id, status: "answered"|"dropped"})`
+4. `learn_pass({force:true})` — promotes conclusion + hard-deletes question. Or `mark_question({question_id, status: "deleted"})` (already-answered junk) / `status: "buried"` (unanswerable, parks in `questions/graveyard/`).
 
 ## Cross-purpose queries
 

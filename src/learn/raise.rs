@@ -17,9 +17,8 @@ pub async fn gather_open_question_embeddings(
 	purpose_tag: &str,
 ) -> Result<Vec<Vec<f32>>> {
 	let by_purpose = cache::tag_index_lookup(root, purpose_tag);
-	let answered: HashSet<String> = cache::tag_index_lookup(root, "answered")
+	let buried: HashSet<String> = cache::tag_index_lookup(root, "graveyard")
 		.into_iter()
-		.chain(cache::tag_index_lookup(root, "dropped"))
 		.filter(|d| d.doc_type == "questions")
 		.map(|d| d.id)
 		.collect();
@@ -27,7 +26,7 @@ pub async fn gather_open_question_embeddings(
 	let mut from_pool: Vec<Vec<f32>> = Vec::new();
 	let mut miss_titles: Vec<String> = Vec::new();
 	for dref in by_purpose {
-		if dref.doc_type != "questions" || answered.contains(&dref.id) {
+		if dref.doc_type != "questions" || buried.contains(&dref.id) {
 			continue;
 		}
 		if let Some(entry) = cache::pool_get(root, &dref.id) {
@@ -182,20 +181,19 @@ pub async fn raise_questions_for_doc(
 	Ok(out)
 }
 
-/// Counts open (not yet `answered` or `dropped`) questions for the given purpose using the
-/// cached tag index. `purpose` of `None` falls back to `"general"`.
+/// Counts open (not buried in graveyard) questions for the given purpose
+/// using the cached tag index. `purpose` of `None` falls back to `"general"`.
 pub fn count_open_questions_in_purpose(root: &Path, purpose: Option<&str>) -> usize {
 	let purpose_tag = purpose.unwrap_or("general");
 	let by_purpose = cache::tag_index_lookup(root, purpose_tag);
-	let answered: HashSet<String> = cache::tag_index_lookup(root, "answered")
+	let buried: HashSet<String> = cache::tag_index_lookup(root, "graveyard")
 		.into_iter()
-		.chain(cache::tag_index_lookup(root, "dropped"))
 		.filter(|d| d.doc_type == "questions")
 		.map(|d| d.id)
 		.collect();
 	by_purpose
 		.into_iter()
-		.filter(|d| d.doc_type == "questions" && !answered.contains(&d.id))
+		.filter(|d| d.doc_type == "questions" && !buried.contains(&d.id))
 		.count()
 }
 
@@ -251,9 +249,9 @@ mod tests {
 			store::create_document(root, "questions", &title, "b", tags, Some("phyons"), None).unwrap();
 		}
 		assert_eq!(count_open_questions_in_purpose(root, Some("phyons")), 3);
-		let title = "Resolved Q?";
+		let title = "Buried Q?";
 		let hash = fnv_question_id(title);
-		let tags = vec!["question".to_string(), "phyons".to_string(), hash, "answered".to_string()];
+		let tags = vec!["question".to_string(), "phyons".to_string(), hash, "graveyard".to_string()];
 		store::create_document(root, "questions", title, "b", tags, Some("phyons"), None).unwrap();
 		assert_eq!(count_open_questions_in_purpose(root, Some("phyons")), 3);
 		std::env::remove_var("WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP");

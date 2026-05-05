@@ -29,5 +29,5 @@ All multi-doc tools (`ingest`, `mark_question`, `search`, `get`, `update`) are *
    ]})
    ```
    Body-start `[[<question_id>]]` mints a `Supports` edge — evidence stacks across thoughts.
-3. `learn_pass({force: true, raise_questions: false})` — promotes a conclusion + marks the question answered once `support_promote_floor` (default 3) Supports edges accumulate or one candidate clears `answer_threshold` (default 0.6).
-4. Still open after the pass? Either lower thresholds (`learn_pass({force:true, support_threshold:0.2, support_promote_floor:1})`) or fall back to `mark_question({items: [{question_id, status: "answered"}]})`.
+3. `learn_pass({force: true, raise_questions: false})` — promotes a conclusion + hard-deletes the question (lifecycle is open|graveyard|deleted) once `support_promote_floor` (default 3) Supports edges accumulate or one candidate clears `answer_threshold` (default 0.6).
+4. Still open after the pass? Either lower thresholds (`learn_pass({force:true, support_threshold:0.2, support_promote_floor:1})`) or fall back to `mark_question({items: [{question_id, status: "deleted"}]})` for already-answered questions, or `status: "buried"` to park unanswerable ones in `questions/graveyard/`.

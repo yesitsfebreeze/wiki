@@ -104,10 +104,7 @@ async fn process_entry(
 			entry.tag_filter.clone().unwrap_or_else(|| "general".to_string())
 		});
 		let body = decision.question_body.clone().unwrap_or_else(|| entry.question.clone());
-		let mut tags = vec!["question".to_string(), purpose.clone(), hash_id.clone()];
-		if decision.answered {
-			tags.push("answered".to_string());
-		}
+		let tags = vec!["question".to_string(), purpose.clone(), hash_id.clone()];
 		if let Ok(qdoc) = store::create_document(
 			root,
 			"questions",
@@ -119,15 +116,6 @@ async fn process_entry(
 		) {
 			question_id = Some(qdoc.id);
 			created_question = true;
-		}
-	} else if decision.answered && !dry_run {
-		if let Some(qid) = &question_id {
-			if let Ok(mut q) = store::get_document(root, "questions", qid) {
-				if !q.tags.iter().any(|t| t == "answered") {
-					q.tags.push("answered".to_string());
-					let _ = store::update_document(root, "questions", qid, None, Some(q.tags.clone()));
-				}
-			}
 		}
 	}
 

@@ -121,7 +121,7 @@ async fn qa_for_doc(
 			let Some((_from, to, kind, _p)) = super::infra::read_reason_meta(root, &r.id) else { continue };
 			if kind != "Supports" && kind != "Answers" { continue; }
 			let Ok(q) = store::get_document(root, "questions", &to) else { continue };
-			if q.tags.iter().any(|t| t == "answered" || t == "dropped") { continue; }
+			if q.tags.iter().any(|t| t == "graveyard") { continue; }
 			if q_targets.iter().any(|(id, _, _)| id == &q.id) { continue; }
 			q_targets.push((q.id, q.title, q.purpose));
 		}
@@ -159,13 +159,9 @@ async fn qa_for_doc(
 		}
 		if got_answer {
 			answered += 1;
-			if let Ok(mut q) = store::get_document(root, "questions", &qid) {
-				if !q.tags.iter().any(|t| t == "answered") {
-					q.tags.push("answered".to_string());
-					let _ = store::update_document(root, "questions", &qid, None, Some(q.tags));
-					let _ = super::links::move_to_answered(root, &qid);
-				}
-			}
+			// promote_to_conclusion materializes the conclusion + deletes the
+			// question. If the LLM budget is exhausted, the question stays
+			// open until a future pass — no half-state tag mutation.
 			if *llm_budget == 0 { continue; }
 			*llm_budget = llm_budget.saturating_sub(1);
 			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &strong_edges, cfg).await {
@@ -179,14 +175,6 @@ async fn qa_for_doc(
 			if let Ok(Some(_)) = promote_to_conclusion(root, &qid, &support_edges, cfg).await {
 				answered += 1;
 				promoted += 1;
-				if let Ok(mut q) = store::get_document(root, "questions", &qid) {
-					if !q.tags.iter().any(|t| t == "answered") {
-						q.tags.push("answered".to_string());
-						q.tags.push("synthesized".to_string());
-						let _ = store::update_document(root, "questions", &qid, None, Some(q.tags));
-						let _ = super::links::move_to_answered(root, &qid);
-					}
-				}
 			}
 		} else if max_score >= cfg.support_threshold && *llm_budget >= 2 {
 			*llm_budget = llm_budget.saturating_sub(2);
@@ -336,15 +324,14 @@ pub async fn run_pass(
 	let mut crosstopic_invoked = 0u64;
 	let mut support_floor_promoted = 0u64;
 	if qa && !dry_run {
-		let answered: HashSet<String> = cache::tag_index_lookup(root, "answered")
+		let buried: HashSet<String> = cache::tag_index_lookup(root, "graveyard")
 			.into_iter()
-			.chain(cache::tag_index_lookup(root, "dropped"))
 			.filter(|d| d.doc_type == "questions")
 			.map(|d| d.id)
 			.collect();
 		let candidates: Vec<String> = cache::tag_index_lookup(root, "question")
 			.into_iter()
-			.filter(|d| d.doc_type == "questions" && !answered.contains(&d.id))
+			.filter(|d| d.doc_type == "questions" && !buried.contains(&d.id))
 			.map(|d| d.id)
 			.collect();
 
@@ -382,14 +369,8 @@ pub async fn run_pass(
 				support_floor_promoted += 1;
 				questions_answered += 1;
 				conclusions_promoted += 1;
-				if let Ok(mut q) = store::get_document(root, "questions", qid) {
-					if !q.tags.iter().any(|t| t == "answered") {
-						q.tags.push("answered".to_string());
-						q.tags.push("synthesized".to_string());
-						let _ = store::update_document(root, "questions", qid, None, Some(q.tags));
-						let _ = super::links::move_to_answered(root, qid);
-					}
-				}
+				// Question file is hard-deleted inside promote_to_conclusion;
+				// no tag mutation needed.
 			}
 		}
 

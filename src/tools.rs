@@ -65,25 +65,11 @@ pub fn retitle_generic_questions(root: &Path, dry_run: bool) -> Result<RetitleRe
 	Ok(rep)
 }
 
-/// If `to_id` resolves to a question doc and the question isn't already
-/// answered/dropped, flip its state to `answered` and move the file. Used
-/// when an `Answers` reason is ingested so callers don't need a separate
-/// `mark_question` round-trip. Returns `true` if a state change happened.
-pub(crate) fn mark_question_answered(root: &Path, to_id: &str) -> Result<bool> {
-	const TERMINAL: &[&str] = &["answered", "dropped"];
-	let mut doc = match store::get_document(root, "questions", to_id) {
-		Ok(d) => d,
-		Err(_) => return Ok(false),
-	};
-	if doc.tags.iter().any(|t| TERMINAL.contains(&t.as_str())) {
-		return Ok(false);
-	}
-	doc.tags.retain(|t| !TERMINAL.contains(&t.as_str()));
-	doc.tags.push("answered".to_string());
-	store::update_document(root, "questions", to_id, None, Some(doc.tags.clone()))?;
-	let _ = learn::move_to_answered(root, to_id);
-	Ok(true)
-}
+// `mark_question_answered` removed: the question lifecycle is now collapsed
+// to open|graveyard|deleted. An `Answers` reason ingested against an open
+// question is recorded as an edge, but the question stays open until
+// `promote_to_conclusion` materializes a real conclusion doc — at which
+// point the question is hard-deleted. See docs/prd/question_lifecycle_collapse.md.
 
 /// Pull a clean ≤60-char title from a doc body. Strips leading markdown
 /// (`#`, `*`, `-`, `>`), wikilinks (`[[...]]`), and bracketed tags
@@ -967,7 +953,7 @@ impl WikiService {
 		match store::list_documents(self.root(), "questions") {
 			Ok(docs) => {
 				let open: Vec<serde_json::Value> = docs.iter()
-					.filter(|d| !d.tags.iter().any(|t| t == "answered" || t == "dropped"))
+					.filter(|d| !d.tags.iter().any(|t| t == "graveyard"))
 					.map(doc_preview)
 					.collect();
 				paginate(open, cursor, limit).to_string()
@@ -976,7 +962,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Set status on many questions in one call (batch-only). Override only — learn_pass auto-marks. Docs: docs(\"mark_question\"). Args: items ([{question_id, status}]). status: answered|dropped.")]
+	#[tool(description = "Resolve open questions in batch (batch-only). Docs: docs(\"mark_question\"). Args: items ([{question_id, status}]). status: deleted (hard delete + edge cleanup; use for already-answered or junk) | buried (move to questions/graveyard/, excluded from raise/qa/list, reversible by manual move).")]
 	fn mark_question(&self, params: Parameters<MarkQuestionParams>) -> String {
 		let MarkQuestionParams { items } = params.0;
 		let mut results = Vec::with_capacity(items.len());
@@ -989,29 +975,26 @@ impl WikiService {
 
 	fn mark_question_one(&self, item: MarkQuestionItem) -> String {
 		let MarkQuestionItem { question_id, status } = item;
-		const VALID: &[&str] = &["answered", "dropped"];
+		const VALID: &[&str] = &["deleted", "buried"];
 		if !VALID.contains(&status.as_str()) {
-			return json_err(format!("Invalid status: {}", status));
+			return json_err(format!("Invalid status: {} (valid: deleted|buried)", status));
 		}
-		match store::get_document(self.root(), "questions", &question_id) {
-			Ok(mut doc) => {
-				doc.tags.retain(|t| !VALID.contains(&t.as_str()));
-				doc.tags.push(status.clone());
-				match store::update_document(self.root(), "questions", &question_id, None, Some(doc.tags.clone())) {
-					Ok(_) => {
-						if status == "answered" {
-							let _ = learn::move_to_answered(self.root(), &question_id);
-						} else if status == "dropped" {
-							let _ = learn::move_to_dropped(self.root(), &question_id);
-						}
-						serde_json::json!({
-							"question_id": question_id,
-							"status": status,
-						}).to_string()
-					}
-					Err(e) => json_err(e),
-				}
-			}
+		// Confirm the doc exists before acting so the response distinguishes
+		// "id not found" from a successful no-op on idempotent re-marks.
+		if store::get_document(self.root(), "questions", &question_id).is_err() {
+			return json_err(format!("question not found: {}", question_id));
+		}
+		let result: anyhow::Result<bool> = match status.as_str() {
+			"deleted" => learn::delete_question_with_edges(self.root(), &question_id),
+			"buried" => learn::bury_question(self.root(), &question_id),
+			_ => unreachable!(),
+		};
+		match result {
+			Ok(applied) => serde_json::json!({
+				"question_id": question_id,
+				"status": status,
+				"applied": applied,
+			}).to_string(),
 			Err(e) => json_err(e),
 		}
 	}
@@ -1146,20 +1129,22 @@ impl WikiService {
 	}
 
 
-	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Returns report JSON with `next_start` for pagination. Args: limit?, start?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?, support_promote_floor?.")]
+	#[tool(description = "Read docs(\"learn\") first. Run wiki sensemaker: link/dedupe → connect → raise/answer questions → promote conclusions. Default paginated: limit=25, start=0 — chain calls via returned `next_start` until null. Pass limit=0 for unlimited (slow on real vaults, risks MCP timeout). Args: limit?, start?, purpose?, dry_run?, qa?, force?, raise_questions?, edge_threshold?, connect_k?, answer_threshold?, support_threshold?, qa_max_per_pass?, conclusion_merge_threshold?, support_promote_floor?.")]
 	async fn learn_pass(&self, params: Parameters<LearnPassParams>) -> String {
 		let LearnPassParams {
 			limit, start, purpose, dry_run, qa, force, raise_questions,
 			answer_threshold, support_threshold, edge_threshold, connect_k,
 			qa_max_per_pass, conclusion_merge_threshold, support_promote_floor,
 		} = params.0;
-		let start = start.map(|n| n as usize);
-		// `limit: 0` → unlimited. `None` → unlimited (default flipped — 25
-		// was too narrow for real vaults, kept paginating callers blind).
-		// Callers that want a deterministic page must pass both `start` + `limit`.
+		// Default to paginated (start=0) so a no-arg call always returns
+		// `next_start` and callers can chain pages without guessing the API.
+		let start = Some(start.map(|n| n as usize).unwrap_or(0));
+		// `Some(0)` → unlimited (explicit opt-in: slow, risks MCP timeout).
+		// `None` → 25 (paginated default; chain via `next_start`).
 		let limit = match limit {
-			Some(0) | None => usize::MAX,
+			Some(0) => usize::MAX,
 			Some(n) => n as usize,
+			None => 25,
 		};
 		let defaults = learn::PassConfig::default();
 		let cfg = learn::PassConfig {
@@ -1180,7 +1165,7 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Vault maintenance. action: recompute | sanitize | migrate | feedback | retitle_questions | prune_self_loops. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
+	#[tool(description = "Vault maintenance. action: recompute | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
 	async fn admin(&self, params: Parameters<AdminParams>) -> String {
 		let AdminParams { action, dry_run, limit } = params.0;
 		let dry = dry_run.unwrap_or(false);
@@ -1194,6 +1179,10 @@ impl WikiService {
 				Err(e) => json_err(e),
 			},
 			"migrate" => match learn::migrate_templated_questions(self.root(), dry) {
+				Ok(rep) => to_json(&rep),
+				Err(e) => json_err(e),
+			},
+			"migrate_lifecycle" => match learn::migrate_question_lifecycle(self.root(), dry) {
 				Ok(rep) => to_json(&rep),
 				Err(e) => json_err(e),
 			},
@@ -1532,18 +1521,7 @@ impl WikiService {
 					Ok(doc) => {
 						self.try_index_doc(&doc);
 						let _ = store::log_ingest(self.root(), "reasons", &doc.id, &doc.title);
-						let auto_marked = if rk == "Answers" {
-							mark_question_answered(self.root(), &to).unwrap_or(false)
-						} else {
-							false
-						};
-						let mut v = serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}));
-						if auto_marked {
-							if let Some(obj) = v.as_object_mut() {
-								obj.insert("auto_marked_answered".into(), serde_json::Value::String(to.clone()));
-							}
-						}
-						v
+						serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}))
 					}
 					Err(e) => return json_err(e),
 				}
@@ -1619,7 +1597,7 @@ impl WikiService {
 		const SIM_THRESHOLD: f32 = 0.85;
 		let questions = store::list_documents(self.root(), "questions").ok()?;
 		let open: Vec<store::Document> = questions.into_iter()
-			.filter(|q| !q.tags.iter().any(|t| t == "answered" || t == "dropped"))
+			.filter(|q| !q.tags.iter().any(|t| t == "graveyard"))
 			.collect();
 		if open.is_empty() { return None; }
 		let body_emb = crate::http::embed_batch(&[body.to_string()]).await.ok()?.into_iter().next()?;
@@ -1633,16 +1611,13 @@ impl WikiService {
 			}
 		}
 		let (qid, score) = best?;
-		// Mark answered
-		let mut tags_opt = None;
-		if let Ok(mut q) = store::get_document(self.root(), "questions", &qid) {
-			q.tags.retain(|t| t != "answered" && t != "dropped");
-			q.tags.push("answered".to_string());
-			tags_opt = Some(q.tags);
-		}
-		let _ = store::update_document(self.root(), "questions", &qid, None, tags_opt);
+		// Conclusion now answers this question. Record the edge, repoint
+		// inbound links from the question to the conclusion, then hard-delete
+		// the question file.
 		let _ = store::create_reason(self.root(), conclusion_id, &qid, "Answers", None, None);
-		Some(serde_json::json!({"question_id": qid, "score": score, "marked": "answered"}))
+		let _ = learn::repoint_inbound_to_conclusion(self.root(), &qid, conclusion_id);
+		let _ = learn::delete_question_with_edges(self.root(), &qid);
+		Some(serde_json::json!({"question_id": qid, "score": score, "resolved": "deleted"}))
 	}
 
 	async fn try_match_existing_conclusions(&self, question_id: &str, body: &str) -> Option<serde_json::Value> {
@@ -1660,15 +1635,12 @@ impl WikiService {
 			}
 		}
 		let (cid, score) = best?;
-		let mut tags_opt = None;
-		if let Ok(mut q) = store::get_document(self.root(), "questions", question_id) {
-			q.tags.retain(|t| t != "answered" && t != "dropped");
-			q.tags.push("answered".to_string());
-			tags_opt = Some(q.tags);
-		}
-		let _ = store::update_document(self.root(), "questions", question_id, None, tags_opt);
+		// Existing conclusion already answers this newly-ingested question.
+		// Record the edge, repoint inbound, hard-delete the question.
 		let _ = store::create_reason(self.root(), &cid, question_id, "Answers", None, None);
-		Some(serde_json::json!({"conclusion_id": cid, "score": score, "marked": "answered"}))
+		let _ = learn::repoint_inbound_to_conclusion(self.root(), question_id, &cid);
+		let _ = learn::delete_question_with_edges(self.root(), question_id);
+		Some(serde_json::json!({"conclusion_id": cid, "score": score, "resolved": "deleted"}))
 	}
 }
 
@@ -1786,26 +1758,47 @@ mod tests {
 	}
 
 	#[test]
-	fn mark_question_answered_flips_state_and_is_idempotent() {
+	fn mark_question_buried_moves_to_graveyard_and_tags() {
 		use tempfile::TempDir;
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
 		store::bootstrap(root).unwrap();
 		let q = store::create_document(
-			root, "questions", "Will it answer?", "body",
+			root, "questions", "Boring question", "body",
 			vec!["question".into(), "general".into()], Some("general"), None,
 		).unwrap();
-		assert!(mark_question_answered(root, &q.id).unwrap());
-		assert!(!mark_question_answered(root, &q.id).unwrap());
+		assert!(learn::bury_question(root, &q.id).unwrap());
+		let after = store::get_document(root, "questions", &q.id).unwrap();
+		assert!(after.tags.iter().any(|t| t == "graveyard"), "buried question must carry graveyard tag");
+		// Idempotent: a second bury is a no-op.
+		assert!(!learn::bury_question(root, &q.id).unwrap());
 	}
 
 	#[test]
-	fn mark_question_answered_noop_for_non_question() {
+	fn delete_question_with_edges_removes_file_and_reasons() {
 		use tempfile::TempDir;
 		let dir = TempDir::new().unwrap();
 		let root = dir.path();
 		store::bootstrap(root).unwrap();
-		assert!(!mark_question_answered(root, "nonexistent-id").unwrap());
+		let q = store::create_document(
+			root, "questions", "Soon to be deleted?", "body",
+			vec!["question".into(), "general".into()], Some("general"), None,
+		).unwrap();
+		let t = store::create_document(
+			root, "thoughts", "supporter", "anchor body",
+			vec!["thought".into(), "general".into()], Some("general"), None,
+		).unwrap();
+		// Edges in both directions touching the question.
+		store::create_reason(root, &t.id, &q.id, "Supports", Some("a"), Some("general")).unwrap();
+		store::create_reason(root, &q.id, &t.id, "References", Some("b"), Some("general")).unwrap();
+
+		assert!(learn::delete_question_with_edges(root, &q.id).unwrap());
+		assert!(store::get_document(root, "questions", &q.id).is_err(), "question file must be gone");
+		// All reasons touching the question are gone too.
+		let remaining = store::list_documents(root, "reasons").unwrap_or_default();
+		for r in remaining {
+			assert!(!r.title.contains(&q.id), "stray edge survived: {}", r.title);
+		}
 	}
 
 	#[test]

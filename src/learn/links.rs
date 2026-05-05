@@ -352,8 +352,11 @@ fn move_question_to(root: &Path, question_id: &str, subfolder: &str) -> Result<b
 	let dir = root.join("questions");
 	let old_path = store::find_document_path_by_id(&dir, question_id)?;
 
-	// Guard: already under a resolved subfolder (answered/ or dropped/)
-	if old_path.components().any(|c| c.as_os_str() == "answered" || c.as_os_str() == "dropped") {
+	// Guard: already under a resolved subfolder (graveyard/, or legacy answered/dropped/)
+	if old_path.components().any(|c| {
+		let s = c.as_os_str();
+		s == "graveyard" || s == "answered" || s == "dropped"
+	}) {
 		return Ok(false);
 	}
 
@@ -393,17 +396,88 @@ fn move_question_to(root: &Path, question_id: &str, subfolder: &str) -> Result<b
 	Ok(true)
 }
 
-/// Move an answered question to `questions/answered/<purpose>/<stem>.md`,
-/// preserving the frontmatter `id` so all doc lookups remain valid.
-/// Rewrites inbound wikilinks. No-op if already under a resolved subfolder.
-pub fn move_to_answered(root: &Path, question_id: &str) -> Result<bool> {
-	move_question_to(root, question_id, "answered")
+/// Move a buried (junk/unanswerable) question to
+/// `questions/graveyard/<purpose>/<stem>.md`, preserving the frontmatter `id`
+/// so all doc lookups remain valid. Tags the doc with `"graveyard"` so the
+/// tag index gives a fast exclusion set. Rewrites inbound wikilinks. No-op
+/// if already under a resolved subfolder.
+pub fn bury_question(root: &Path, question_id: &str) -> Result<bool> {
+	if !move_question_to(root, question_id, "graveyard")? {
+		return Ok(false);
+	}
+	if let Ok(mut doc) = store::get_document(root, "questions", question_id) {
+		if !doc.tags.iter().any(|t| t == "graveyard") {
+			doc.tags.push("graveyard".to_string());
+			let _ = store::update_document(root, "questions", question_id, None, Some(doc.tags));
+		}
+	}
+	Ok(true)
 }
 
-/// Move a dropped question to `questions/dropped/<purpose>/<stem>.md`.
-/// Rewrites inbound wikilinks. No-op if already under a resolved subfolder.
-pub fn move_to_dropped(root: &Path, question_id: &str) -> Result<bool> {
-	move_question_to(root, question_id, "dropped")
+/// Hard-delete a question file and cascade-delete all `reasons` (edges)
+/// that touch it, in either direction. Returns `true` if the question file
+/// was removed. Inbound wikilinks are NOT repointed here — call
+/// [`repoint_inbound_to_conclusion`] before this when promoting.
+pub fn delete_question_with_edges(root: &Path, question_id: &str) -> Result<bool> {
+	let dir = root.join("questions");
+	if store::find_document_path_by_id(&dir, question_id).is_err() {
+		return Ok(false);
+	}
+	let adj = crate::cache::reason_index_lookup(root, question_id);
+	let mut edge_ids: HashSet<String> = HashSet::new();
+	edge_ids.extend(adj.to.iter().cloned());
+	edge_ids.extend(adj.from.iter().cloned());
+	for rid in edge_ids {
+		let _ = store::delete_document(root, "reasons", &rid);
+	}
+	store::delete_document(root, "questions", question_id)?;
+	Ok(true)
+}
+
+/// Rewrite every inbound wikilink that points at `question_id` so it now
+/// points at `conclusion_id`. Used by promote so deleting the question
+/// doesn't leave dangling links — the conclusion is the durable answer
+/// record.
+pub fn repoint_inbound_to_conclusion(
+	root: &Path,
+	question_id: &str,
+	conclusion_id: &str,
+) -> Result<()> {
+	let q_dir = root.join("questions");
+	let q_path = match store::find_document_path_by_id(&q_dir, question_id) {
+		Ok(p) => p,
+		Err(_) => return Ok(()),
+	};
+	let q_purpose = q_path
+		.parent()
+		.and_then(|p| p.file_name())
+		.and_then(|s| s.to_str())
+		.unwrap_or("")
+		.to_string();
+	let q_stem = q_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.unwrap_or("")
+		.to_string();
+
+	let c_dir = root.join("conclusions");
+	let c_path = store::find_document_path_by_id(&c_dir, conclusion_id)?;
+	let c_purpose = c_path
+		.parent()
+		.and_then(|p| p.file_name())
+		.and_then(|s| s.to_str())
+		.unwrap_or("")
+		.to_string();
+	let c_stem = c_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.unwrap_or("")
+		.to_string();
+
+	let old_target = format!("questions/{}/{}", q_purpose, q_stem);
+	let new_target = format!("conclusions/{}/{}", c_purpose, c_stem);
+	let _ = rewrite_inbound_links(root, &old_target, &new_target);
+	Ok(())
 }
 
 pub(crate) async fn link_doc_internal(

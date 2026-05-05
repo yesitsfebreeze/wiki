@@ -29,9 +29,9 @@ raw source
 
 1. **Never** `ingest({items:[{kind:"conclusion", ...}]})` freehand. Conclusions are output of `learn_pass` over supporting thoughts. Direct ingest creates orphan synthesis with no evidence trail.
 2. `refs` parameter creates **`References`** edges, **not `Answers`**. Do not use `refs` to "answer" a question.
-3. To bind a thought to a question, put `[[<question_id>]]` (or the question's title) at the **start** of the thought body. Body-start wikilink to a question → `Supports` edge (evidence; multiple thoughts can stack). Body-start same-purpose non-question → `Supports`. Mid-body or cross-purpose → `References`. **No auto-mark** — `learn_pass` decides when accumulated `Supports` clear the floor and promotes a conclusion + marks the question answered. To force an immediate answer, ingest a reason explicitly: `ingest({items:[{kind:"reason", from_id:<thought>, to_id:<qid>, reason_kind:"Answers", body:"..."}]})`.
+3. To bind a thought to a question, put `[[<question_id>]]` (or the question's title) at the **start** of the thought body. Body-start wikilink to a question → `Supports` edge (evidence; multiple thoughts can stack). Body-start same-purpose non-question → `Supports`. Mid-body or cross-purpose → `References`. **No auto-mark** — `learn_pass` decides when accumulated `Supports` clear the floor and promotes a conclusion (which hard-deletes the question — lifecycle is open|graveyard|deleted). To force an immediate answer, ingest a reason explicitly: `ingest({items:[{kind:"reason", from_id:<thought>, to_id:<qid>, reason_kind:"Answers", body:"..."}]})` and then run `learn_pass`.
 4. Before answering an open question, **always** `search({items:[{query: question_body, mode: "qa", include_bodies:true, include_reasons:true, edges_depth:1}]})` first. Read the `suggested_conclusions` field — if non-empty, use the bound conclusion; skip new ingest.
-5. Answer threshold for auto-mark is cosine ≥ 0.8 between conclusion and question bodies. Below that, the conclusion stays standalone with `References` edges. Manual fallback: `mark_question({items:[{question_id, status:"answered"}]})`.
+5. Answer threshold for auto-promote is cosine ≥ 0.8 between conclusion and question bodies. Below that, the conclusion stays standalone with `References` edges and the question stays open. Manual fallback: `mark_question({items:[{question_id, status:"deleted"}]})` (no conclusion needed) or `status:"buried"` (park in graveyard).
 
 ## Q&A flow (driven by /learn or agent-led research)
 
@@ -48,8 +48,8 @@ For each open question:
    ]})
    ```
    Body-start wikilink to the question → server creates `Supports` edge thought → question. Multiple `Supports` accumulate; `learn_pass` synthesizes once `support_promote_floor` (default 3) is met or one candidate clears `answer_threshold` (default 0.6).
-5. After **all** thoughts ingested: `learn_pass({force:true, raise_questions:false})`. Server scans questions with supporting thoughts, synthesizes a conclusion via LLM over the supporting bodies, creates the conclusion doc, emits `Derives` edge question → conclusion + `Answers` edges, and tags the question `resolved`.
-6. Verify: `get({items:[{id: question_id, depth:1}]})`. If still open after the pass: `mark_question({items:[{question_id, status:"answered"}]})` as final fallback.
+5. After **all** thoughts ingested: `learn_pass({force:true, raise_questions:false})`. Server scans questions with supporting thoughts, synthesizes a conclusion via LLM over the supporting bodies, creates the conclusion doc, emits `Derives` edge question → conclusion + `Answers` edges, repoints inbound wikilinks, and hard-deletes the question. The conclusion body preserves the original question text as a preamble so context isn't lost.
+6. Verify: `get({items:[{id: conclusion_id, depth:1}]})`. The question id is gone — look up the conclusion via the search banner instead. If a question stayed open after the pass: `mark_question({items:[{question_id, status:"deleted"}]})` as final fallback.
 
 ## Densify-only flow
 
