@@ -46,8 +46,6 @@ source doc  →  ingest_thought / ingest_entity
 
 ## 🛠️ Tools
 
-| Tool | What it does |
-|---|---|
 All multi-doc tools are **batch-only** — wrap every payload in `{items: [...]}`, even for one record.
 
 | Tool | What it does |
@@ -65,6 +63,26 @@ All multi-doc tools are **batch-only** — wrap every payload in `{items: [...]}
 | `admin` | 🧹 Vault maintenance — `action`: recompute \| sanitize \| migrate \| migrate_lifecycle \| feedback \| retitle_questions |
 | `code` | 💻 Code index ops — `action`: index \| search \| read \| refs \| validate |
 | `docs` | 📚 Fetch tool / concept markdown docs (no arg → list) |
+
+## ❓ Question lifecycle
+
+Two states only:
+
+- **open** — `questions/<purpose>/...`. Default for any new question.
+- **graveyard** — `questions/graveyard/<purpose>/...`. Junk or unanswerable. Excluded from `list_open_questions`, `learn_pass`, and conclusions-first search.
+
+Anything else is hard-deleted. An *answered* question is one that was promoted: a conclusion doc now exists with an `Answers` edge to the (former) question, and the question file itself is gone. The conclusion body preserves the original question text as a preamble so context survives the delete.
+
+Resolve open questions via `mark_question`:
+
+| Status | Effect |
+|---|---|
+| `deleted` | Hard delete + cascade-delete every reason touching it. Use for already-answered or junk questions. |
+| `buried` | Move to `questions/graveyard/`, tag `graveyard`, rewrite inbound wikilinks. Reversible — move the file back into the open tree to resurrect. |
+
+To re-explore everything in the graveyard: delete `questions/graveyard/`.
+
+`learn_pass` auto-promotes when `support_promote_floor` (default 3) supporting thoughts accumulate or one candidate clears `answer_threshold` (default 0.6). Manual fallback only if the pass can't find enough evidence.
 
 ## 💿 Install
 
