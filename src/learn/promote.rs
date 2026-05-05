@@ -176,7 +176,11 @@ async fn cross_topic_emit_and_promote(
 	let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
 	let mut support_edges: Vec<AnswerCandidate> = Vec::new();
 	let mut got_answer = false;
-	for c in candidates {
+	// Drop any candidate that *is* the question — defensive guard against
+	// smart-search returning the question doc among its own neighbors,
+	// which would mint a question→question Answers self-loop.
+	let candidates: Vec<&AnswerCandidate> = candidates.iter().filter(|c| c.doc_id != question_id).collect();
+	for c in candidates.iter().copied() {
 		let kind = if c.score >= strong { "Answers" } else { "Supports" };
 		if c.score >= strong { got_answer = true; }
 		let _ = store::create_reason(
@@ -469,6 +473,42 @@ mod tests {
 		let concs = store::list_documents(root, "conclusions").unwrap();
 		assert_eq!(concs.len(), 1);
 		assert_eq!(concs[0].id, cdoc.id);
+	}
+
+	#[tokio::test]
+	async fn cross_topic_skips_self_match_no_self_loop() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let qtitle = "Self-loop guard test?";
+		let qhash = fnv_question_id(qtitle);
+		let qdoc = store::create_document(
+			root, "questions", qtitle, "qbody",
+			vec!["question".to_string(), "general".to_string(), qhash],
+			Some("general"), None,
+		).unwrap();
+
+		// Candidate set deliberately includes the question itself — simulates
+		// smart-search returning the question doc among its own neighbors.
+		let cands = vec![
+			AnswerCandidate {
+				doc_id: qdoc.id.clone(),
+				doc_type: "questions".into(),
+				score: 0.95,
+				kind: "Answers".into(),
+				body: "self".into(),
+			},
+		];
+
+		let n = cross_topic_emit_and_promote(root, &qdoc.id, Some("general"), &cands, &PassConfig::default()).await.unwrap();
+		assert_eq!(n, 0, "self-match must produce zero edges");
+
+		let from_q = store::search_reasons_for(root, &qdoc.id, "from").unwrap();
+		assert!(
+			!from_q.iter().any(|r| r.title.contains(&qdoc.id) && r.title.matches(&qdoc.id).count() >= 2),
+			"no edge should have qid as both from and to"
+		);
 	}
 
 	#[tokio::test]

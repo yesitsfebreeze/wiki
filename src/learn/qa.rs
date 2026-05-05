@@ -134,10 +134,14 @@ async fn qa_for_doc(
 	for (qid, qtitle, qpurpose) in q_targets {
 		if *llm_budget == 0 { break; }
 		*llm_budget = llm_budget.saturating_sub(1);
-		let cands = match cross_reference_question(root, &qtitle, qpurpose.as_deref(), cfg.support_threshold).await {
+		let cands_raw = match cross_reference_question(root, &qtitle, qpurpose.as_deref(), cfg.support_threshold).await {
 			Ok(v) => v,
 			Err(_) => continue,
 		};
+		// Smart-search can return the question itself among the candidates.
+		// Filter the self-match before scoring so we never mint a question→
+		// question Answers self-loop.
+		let cands: Vec<_> = cands_raw.into_iter().filter(|c| c.doc_id != qid).collect();
 		let mut strong_edges: Vec<AnswerCandidate> = Vec::new();
 		let mut support_edges: Vec<AnswerCandidate> = Vec::new();
 		let mut got_answer = false;
