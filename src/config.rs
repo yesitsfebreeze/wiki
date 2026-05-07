@@ -44,38 +44,96 @@ pub fn open_questions_per_purpose_cap() -> usize {
         .unwrap_or(DEFAULT_OPEN_QUESTIONS_PER_PURPOSE_CAP)
 }
 
-pub fn load() {
-    let Some(home) = dirs::home_dir() else { return };
-    let path = home.join(".config/wiki/config.toml");
-    let Ok(content) = std::fs::read_to_string(&path) else { return };
-    let Ok(table) = content.parse::<toml::Table>() else { return };
+const MAPPINGS: &[(&str, &str)] = &[
+    ("openai_api_key", "OPENAI_API_KEY"),
+    ("wiki_rerank_model", "WIKI_RERANK_MODEL"),
+    ("wiki_similarity_threshold", "WIKI_SIMILARITY_THRESHOLD"),
+    ("wiki_dedupe_threshold", "WIKI_DEDUPE_THRESHOLD"),
+    ("wiki_template_question_regexes", "WIKI_TEMPLATE_QUESTION_REGEXES"),
+    ("wiki_open_questions_per_purpose_cap", "WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP"),
+    ("code_dirs", "WIKI_CODE_DIRS"),
+    ("split_ext", "SPLIT_EXT"),
+    ("split_exts", "SPLIT_EXTS"),
+    ("split_index_dir", "SPLIT_INDEX_DIR"),
+    ("split_max_loc", "SPLIT_MAX_LOC"),
+];
 
-    // env var takes precedence over config.toml
-    let mappings = [
-        ("openai_api_key", "OPENAI_API_KEY"),
-        ("wiki_rerank_model", "WIKI_RERANK_MODEL"),
-        ("wiki_similarity_threshold", "WIKI_SIMILARITY_THRESHOLD"),
-        ("wiki_dedupe_threshold", "WIKI_DEDUPE_THRESHOLD"),
-        ("wiki_template_question_regexes", "WIKI_TEMPLATE_QUESTION_REGEXES"),
-        ("wiki_open_questions_per_purpose_cap", "WIKI_OPEN_QUESTIONS_PER_PURPOSE_CAP"),
-        ("split_src_dir", "SPLIT_SRC_DIR"),
-        ("split_src_dirs", "SPLIT_SRC_DIRS"),
-        ("split_ext", "SPLIT_EXT"),
-        ("split_exts", "SPLIT_EXTS"),
-        ("split_index_dir", "SPLIT_INDEX_DIR"),
-        ("split_max_loc", "SPLIT_MAX_LOC"),
-    ];
-
-    for (toml_key, env_key) in &mappings {
-        if std::env::var(env_key).is_ok() {
-            continue;
-        }
+fn table_to_map(table: &toml::Table) -> std::collections::HashMap<&'static str, String> {
+    let mut map = std::collections::HashMap::new();
+    for (toml_key, env_key) in MAPPINGS {
         if let Some(val) = table.get(*toml_key) {
             let s = match val {
                 toml::Value::String(s) => s.clone(),
+                toml::Value::Array(arr) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 other => other.to_string(),
             };
-            unsafe { std::env::set_var(env_key, s) };
+            map.insert(*env_key, s);
+        }
+    }
+    map
+}
+
+fn find_local_config() -> Option<std::path::PathBuf> {
+    // prefer WIKI_PATH env var (set by MCP server config)
+    if let Ok(wiki_path) = std::env::var("WIKI_PATH") {
+        let p = std::path::PathBuf::from(&wiki_path).join("config.toml");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // walk up from cwd looking for .wiki/config.toml
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let p = dir.join(".wiki").join("config.toml");
+        if p.exists() {
+            return Some(p);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+pub fn load() {
+    use std::collections::HashMap;
+
+    // snapshot which env vars were already set before we touch anything
+    let pre_set: std::collections::HashSet<String> = MAPPINGS
+        .iter()
+        .filter(|(_, env_key)| std::env::var(env_key).is_ok())
+        .map(|(_, env_key)| env_key.to_string())
+        .collect();
+
+    let mut merged: HashMap<&'static str, String> = HashMap::new();
+
+    // global config — lowest priority
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".config/wiki/config.toml");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(table) = content.parse::<toml::Table>() {
+                merged.extend(table_to_map(&table));
+            }
+        }
+    }
+
+    // local .wiki/config.toml — overrides global
+    if let Some(local_path) = find_local_config() {
+        if let Ok(content) = std::fs::read_to_string(&local_path) {
+            if let Ok(table) = content.parse::<toml::Table>() {
+                merged.extend(table_to_map(&table));
+            }
+        }
+    }
+
+    // apply merged values — env vars set before load() always win
+    for (env_key, val) in merged {
+        if !pre_set.contains(env_key) {
+            unsafe { std::env::set_var(env_key, val) };
         }
     }
 }

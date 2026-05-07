@@ -107,7 +107,7 @@ openai_api_key = "sk-..."
 # wiki_dedupe_threshold = 0.85
 
 # Code indexing (optional)
-# split_src_dir = "src"
+# code_dirs = ["src", "lib"]   # or code_dirs = "src"
 # split_ext = "rs"
 # split_index_dir = ".wiki/code"
 # split_max_loc = "256"

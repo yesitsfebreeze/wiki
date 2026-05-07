@@ -384,13 +384,27 @@ async fn dispatch_cli(cmd: CliCmd) -> anyhow::Result<()> {
 }
 
 fn spawn_code_watcher() {
-    let mut src_dirs: Vec<PathBuf> = std::env::var("SPLIT_SRC_DIRS")
-        .into_iter()
-        .flat_map(|s| s.split(';').map(|p| PathBuf::from(p.trim())).collect::<Vec<_>>())
+    let raw_dirs = std::env::var("WIKI_CODE_DIRS")
+        .or_else(|_| std::env::var("SPLIT_SRC_DIRS"))
+        .unwrap_or_default();
+    let mut src_dirs: Vec<PathBuf> = raw_dirs
+        .split([',', ';'])
+        .map(|p| PathBuf::from(p.trim()))
         .chain(std::env::var("SPLIT_SRC_DIR").ok().map(PathBuf::from))
-        .filter(|p| p.exists())
+        .filter(|p| !p.as_os_str().is_empty() && p.exists())
         .collect();
     src_dirs.dedup();
+
+    // fallback: derive project root from WIKI_PATH (.wiki/../) or cwd
+    if src_dirs.is_empty() {
+        let root = std::env::var("WIKI_PATH")
+            .ok()
+            .and_then(|p| PathBuf::from(p).parent().map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(r) = root.filter(|p| p.exists()) {
+            src_dirs.push(r);
+        }
+    }
 
     let exts: Vec<String> = std::env::var("SPLIT_EXTS")
         .ok()
