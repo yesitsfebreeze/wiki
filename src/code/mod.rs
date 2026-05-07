@@ -34,11 +34,12 @@ pub fn index_dir(src_dir: &Path, ext: &str) -> Result<String> {
 	let mut files_indexed = 0u32;
 	let mut files_skipped = 0u32;
 	let mut bodies_total = 0u32;
-	let mut newly_indexed: Vec<PathBuf> = Vec::new();
+	let mut all_sources: Vec<PathBuf> = Vec::new();
 	for src in walk_files(src_dir, ext) {
 		let struct_path = splitter::structure_path(&src, &index);
 		if struct_path.exists() {
 			files_skipped += 1;
+			all_sources.push(src);
 			continue;
 		}
 		match splitter::split_for_ext(&src, &index, ext) {
@@ -55,13 +56,13 @@ pub fn index_dir(src_dir: &Path, ext: &str) -> Result<String> {
 				}
 				bodies_total += bodies.len() as u32;
 				files_indexed += 1;
-				newly_indexed.push(src);
+				all_sources.push(src);
 			}
 			Err(e) => eprintln!("skip {}: {e}", src.display()),
 		}
 	}
 	let mut links_added = 0u32;
-	for src in &newly_indexed {
+	for src in &all_sources {
 		if let Ok(msg) = relink_structure_mentions(src, &index) {
 			links_added += parse_relink_count(&msg);
 		}
@@ -128,6 +129,7 @@ pub fn relink_structure_mentions(src_path: &Path, index_dir: &Path) -> Result<St
 fn inject_first_wikilink(content: &str, terms: &[String], link_target: &str) -> Option<String> {
 	let fm_end = frontmatter_end_offset(content);
 	let wl_re = regex::Regex::new(r"\[\[[^\]]*\]\]").ok()?;
+	let fences = code_fence_ranges(content);
 
 	for term in terms {
 		if content.contains(&format!("[[{}", term)) {
@@ -148,11 +150,39 @@ fn inject_first_wikilink(content: &str, terms: &[String], link_target: &str) -> 
 			if prot.iter().any(|(s, e)| m.start() >= *s && m.start() < *e) {
 				continue;
 			}
+			if fences.iter().any(|(s, e)| m.start() >= *s && m.start() < *e) {
+				// Match is inside a code fence — append link at end of file instead.
+				return Some(format!("{}\n\n[[{}]]\n", content.trim_end(), link_target));
+			}
 			let replacement = format!("[[{}]]", link_target);
 			return Some(format!("{}{}{}", &content[..m.start()], replacement, &content[m.end()..]));
 		}
 	}
 	None
+}
+
+fn code_fence_ranges(content: &str) -> Vec<(usize, usize)> {
+	let mut ranges = Vec::new();
+	let mut in_fence = false;
+	let mut fence_start = 0usize;
+	let mut byte_offset = 0usize;
+	for line in content.lines() {
+		let line_bytes = line.len() + 1;
+		if line.starts_with("```") {
+			if in_fence {
+				ranges.push((fence_start, byte_offset + line_bytes));
+				in_fence = false;
+			} else {
+				fence_start = byte_offset;
+				in_fence = true;
+			}
+		}
+		byte_offset += line_bytes;
+	}
+	if in_fence {
+		ranges.push((fence_start, content.len()));
+	}
+	ranges
 }
 
 fn frontmatter_end_offset(content: &str) -> Option<usize> {
