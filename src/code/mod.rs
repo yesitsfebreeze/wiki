@@ -67,6 +67,9 @@ pub fn index_dir(src_dir: &Path, ext: &str) -> Result<String> {
 			links_added += parse_relink_count(&msg);
 		}
 	}
+	for src in &all_sources {
+		let _ = relink_all_into(src, &index);
+	}
 	Ok(format!(
 		"indexed {files_indexed} files ({bodies_total} functions); {files_skipped} skipped; {links_added} structure links added"
 	))
@@ -124,6 +127,50 @@ pub fn relink_structure_mentions(src_path: &Path, index_dir: &Path) -> Result<St
 		}
 	}
 	Ok(format!("relinked {patched} structure files → [[{stem}]]"))
+}
+
+/// Reverse of `relink_structure_mentions`: inject links from all known modules
+/// INTO `src_path`'s own structure file. Called after a file is (re-)split so
+/// its fresh structure file gets inbound links from whatever it references.
+pub fn relink_all_into(src_path: &Path, index_dir: &Path) -> Result<String> {
+	let struct_path = splitter::structure_path(src_path, index_dir);
+	if !struct_path.exists() {
+		return Ok("no structure file".to_string());
+	}
+	let all_structs = walk_structure_files(index_dir);
+	let mut patched = 0u32;
+	for sf in &all_structs {
+		if sf == &struct_path {
+			continue;
+		}
+		let Ok(sf_content) = std::fs::read_to_string(sf) else { continue };
+		let Some(fm) = splitter::parse_frontmatter(&sf_content) else { continue };
+		let src_str = fm.get("source").cloned().unwrap_or_default();
+		let stem = std::path::Path::new(&src_str)
+			.file_stem()
+			.and_then(|s| s.to_str())
+			.map(|s| s.to_string())
+			.unwrap_or_default();
+		if stem.len() < 3 {
+			continue;
+		}
+		let mut terms = vec![stem.clone()];
+		if let Some(fns_str) = fm.get("fns") {
+			for f in fns_str.split(',').map(|f| f.trim().to_string()).filter(|f| f.len() >= 4) {
+				if !terms.contains(&f) {
+					terms.push(f);
+				}
+			}
+		}
+		terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
+		let Ok(a_content) = std::fs::read_to_string(&struct_path) else { continue };
+		if let Some(new_content) = inject_first_wikilink(&a_content, &terms, &stem) {
+			if crate::io::write_atomic_str(&struct_path, &new_content).is_ok() {
+				patched += 1;
+			}
+		}
+	}
+	Ok(format!("pulled {patched} inbound links into {}", splitter::to_slash(&struct_path)))
 }
 
 fn inject_first_wikilink(content: &str, terms: &[String], link_target: &str) -> Option<String> {

@@ -63,6 +63,11 @@ fn on_source_change(src_path: &Path, index_dir: &Path, ext: &str) -> Result<()> 
             eprintln!("relink: {msg}");
         }
     }
+    if let Ok(msg) = crate::code::relink_all_into(src_path, index_dir) {
+        if !msg.starts_with("no") {
+            eprintln!("relink-in: {msg}");
+        }
+    }
     Ok(())
 }
 
