@@ -247,7 +247,7 @@ struct CodeParams {
 
 #[derive(Deserialize, JsonSchema)]
 struct AdminParams {
-	/// recompute | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops
+	/// reindex | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops
 	action: String,
 	dry_run: Option<bool>,
 	limit: Option<u64>,
@@ -1179,14 +1179,25 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Vault maintenance. action: recompute | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
+	#[tool(description = "Vault maintenance. action: reindex | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
 	async fn admin(&self, params: Parameters<AdminParams>) -> String {
 		let AdminParams { action, dry_run, limit } = params.0;
 		let dry = dry_run.unwrap_or(false);
 		match action.as_str() {
-			"recompute" => match crate::weight::run_cli(self.root(), dry) {
-				Ok(n) => serde_json::json!({ "recomputed": n, "dry_run": dry }).to_string(),
-				Err(e) => json_err(e),
+			"reindex" => {
+				// 1. Sync Relations wikilinks from existing edges (must run before weights)
+				let relations = if !dry {
+					learn::reindex_all_relations(self.root()).unwrap_or(0)
+				} else { 0 };
+				// 2. Recompute node weights (edge counts now reflect fresh links)
+				match crate::weight::run_cli(self.root(), dry) {
+					Ok(weights) => serde_json::json!({
+						"relations_synced": relations,
+						"weights_recomputed": weights,
+						"dry_run": dry,
+					}).to_string(),
+					Err(e) => json_err(e),
+				}
 			},
 			"sanitize" => match sanitize::sanitize_vault(self.root(), false) {
 				Ok(report) => to_json(&report),
@@ -1241,7 +1252,7 @@ impl WikiService {
 				Ok(rep) => to_json(&rep),
 				Err(e) => json_err(e),
 			},
-			other => json_err(format!("Unknown action: {} (recompute|sanitize|migrate|feedback|retitle_questions|prune_self_loops)", other)),
+			other => json_err(format!("Unknown action: {} (reindex|sanitize|migrate|feedback|retitle_questions|prune_self_loops)", other)),
 		}
 	}
 

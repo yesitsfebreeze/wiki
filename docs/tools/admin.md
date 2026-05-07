@@ -1,19 +1,19 @@
 # admin
 
-Vault maintenance. Single tool for recompute, sanitize, migrate, feedback.
+Vault maintenance. Single tool for reindex, sanitize, migrate, feedback.
 
 ## Params
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `action` | enum | (required) | `recompute` \| `sanitize` \| `migrate` \| `feedback` |
-| `dry_run` | bool | `false` | `recompute` / `migrate` / `feedback`: count without writing. |
+| `action` | enum | (required) | `reindex` \| `sanitize` \| `migrate` \| `feedback` |
+| `dry_run` | bool | `false` | `reindex` / `migrate` / `feedback`: count without writing. |
 | `limit` | int | `25` | `feedback`: max entries to replay. |
 
 ## Actions
 
-### recompute
-Recompute pagerank-style node weights across the vault. Writes `node_size` to each doc's frontmatter. Run after large ingest batches when importance scores feel stale.
+### reindex
+Sync `## Relations` wikilinks into all doc bodies from existing reason edges (thoughts, questions, conclusions, entities), then recompute pagerank-style node weights. Run after large ingest or learn batches. Order is intentional: links first, weights after (weights depend on edge counts).
 
 ### sanitize
 Rename vault docs whose stems contain characters Obsidian cannot wikilink (spaces, parens, slashes, etc.), then rewrite all `[[wikilinks]]` and relative `.md` links vault-wide. Idempotent.

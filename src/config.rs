@@ -44,6 +44,20 @@ pub fn open_questions_per_purpose_cap() -> usize {
         .unwrap_or(DEFAULT_OPEN_QUESTIONS_PER_PURPOSE_CAP)
 }
 
+pub fn relations_limit(doc_type: &str) -> usize {
+    let (env_key, default) = match doc_type {
+        "thoughts"    => ("WIKI_RELATIONS_LIMIT_THOUGHTS",    5usize),
+        "questions"   => ("WIKI_RELATIONS_LIMIT_QUESTIONS",   3usize),
+        "conclusions" => ("WIKI_RELATIONS_LIMIT_CONCLUSIONS", 5usize),
+        "entities"    => ("WIKI_RELATIONS_LIMIT_ENTITIES",   10usize),
+        _             => ("WIKI_RELATIONS_LIMIT_CODE",        5usize),
+    };
+    std::env::var(env_key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 const MAPPINGS: &[(&str, &str)] = &[
     ("openai_api_key", "OPENAI_API_KEY"),
     ("wiki_rerank_model", "WIKI_RERANK_MODEL"),
@@ -56,6 +70,11 @@ const MAPPINGS: &[(&str, &str)] = &[
     ("split_exts", "SPLIT_EXTS"),
     ("split_index_dir", "SPLIT_INDEX_DIR"),
     ("split_max_loc", "SPLIT_MAX_LOC"),
+    ("relations_limit_thoughts", "WIKI_RELATIONS_LIMIT_THOUGHTS"),
+    ("relations_limit_questions", "WIKI_RELATIONS_LIMIT_QUESTIONS"),
+    ("relations_limit_conclusions", "WIKI_RELATIONS_LIMIT_CONCLUSIONS"),
+    ("relations_limit_entities", "WIKI_RELATIONS_LIMIT_ENTITIES"),
+    ("relations_limit_code", "WIKI_RELATIONS_LIMIT_CODE"),
 ];
 
 fn table_to_map(table: &toml::Table) -> std::collections::HashMap<&'static str, String> {

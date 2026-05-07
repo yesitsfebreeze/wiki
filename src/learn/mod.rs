@@ -16,6 +16,7 @@ pub use infra::{EntityRef, PassConfig};
 pub(crate) use infra::read_reason_meta as infra_read_reason_meta;
 pub use dedup::find_near_duplicate_entity;
 pub use links::link_doc;
+pub use links::reindex_all_relations;
 pub use links::bury_question;
 pub use links::delete_question_with_edges;
 pub use links::repoint_inbound_to_conclusion;

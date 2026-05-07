@@ -480,6 +480,158 @@ pub fn repoint_inbound_to_conclusion(
 	Ok(())
 }
 
+const RELATIONS_START: &str = "<!-- wiki-relations-start -->";
+const RELATIONS_END: &str = "<!-- wiki-relations-end -->";
+
+fn edge_kind_weight(kind: &str) -> f32 {
+	match kind {
+		"Answers" => 2.0,
+		"Supports" | "Derives" | "Consolidates" => 1.5,
+		"Extends" => 0.7,
+		"References" | "Instances" | "Requires" => 0.3,
+		"Contradicts" => -0.5,
+		_ => 0.0,
+	}
+}
+
+/// Resolve any doc id to its vault-relative wikilink path and title.
+/// E.g. thoughts/general/my-slug + "My Thought"
+fn resolve_id_to_wiki_path(root: &Path, id: &str) -> Option<(String, String)> {
+	for dt in DOC_TYPES {
+		let dir = root.join(dt);
+		if let Ok(path) = store::find_document_path_by_id(&dir, id) {
+			let rel = path.strip_prefix(root).ok()?;
+			let wiki_path = rel.to_string_lossy()
+				.replace('\\', "/")
+				.trim_end_matches(".md")
+				.to_string();
+			let title = store::get_document(root, dt, id).ok()?.title;
+			return Some((wiki_path, title));
+		}
+	}
+	None
+}
+
+/// Convert a `code_refs` entry like `src/classifier.rs::classify`
+/// to its vault-relative path `code/rs/functions/src/classifier/classify`.
+fn code_ref_to_wiki_path(code_ref: &str) -> Option<String> {
+	let (file_part, fn_name) = code_ref.split_once("::")?;
+	let p = std::path::Path::new(file_part);
+	let ext = p.extension()?.to_str()?;
+	let dir = p.with_extension("").to_string_lossy().replace('\\', "/");
+	Some(format!("code/{}/functions/{}/{}", ext, dir, fn_name))
+}
+
+/// Replace the sentinel block in `body`, or append it if absent.
+fn replace_relations_block(body: &str, block: &str) -> String {
+	if let (Some(s), Some(e)) = (body.find(RELATIONS_START), body.find(RELATIONS_END)) {
+		let end_pos = e + RELATIONS_END.len();
+		format!("{}{}{}", &body[..s], block, &body[end_pos..])
+	} else {
+		let trimmed = body.trim_end();
+		if trimmed.is_empty() {
+			block.to_string()
+		} else {
+			format!("{}\n\n{}", trimmed, block)
+		}
+	}
+}
+
+/// Write (or refresh) a `<!-- wiki-relations-start/end -->` block in the doc body.
+/// Collects reason edges (both directions), ranks by kind weight, fills remaining
+/// slots with `code_refs` frontmatter. Respects `config::relations_limit(doc_type)`.
+/// Returns number of links written (0 = no edges found, block removed if present).
+fn sync_relations_section(root: &Path, doc_type: &str, id: &str) -> Result<usize> {
+	let limit = crate::config::relations_limit(doc_type);
+
+	struct EdgeEntry {
+		wiki_path: String,
+		title: String,
+		kind: String,
+		weight: f32,
+	}
+
+	let mut entries: Vec<EdgeEntry> = Vec::new();
+	let mut seen_ids: HashSet<String> = HashSet::new();
+
+	for direction in &["from", "to"] {
+		let Ok(reasons) = store::search_reasons_for(root, id, direction) else { continue };
+		for r in reasons {
+			let Some((from_id, to_id, kind, _)) = super::infra::read_reason_meta(root, &r.id) else { continue };
+			let other_id = if *direction == "from" { to_id } else { from_id };
+			if other_id == id || seen_ids.contains(&other_id) { continue; }
+			let Some((wiki_path, title)) = resolve_id_to_wiki_path(root, &other_id) else { continue };
+			let weight = edge_kind_weight(&kind);
+			seen_ids.insert(other_id);
+			entries.push(EdgeEntry { wiki_path, title, kind, weight });
+		}
+	}
+
+	entries.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+	entries.truncate(limit);
+
+	// Fill remaining slots with code_refs (lowest-priority References)
+	let remaining = limit.saturating_sub(entries.len());
+	if remaining > 0 {
+		let dir = root.join(doc_type);
+		if let Ok(path) = store::find_document_path_by_id(&dir, id) {
+			if let Ok(raw) = std::fs::read_to_string(&path) {
+				if let Ok((fm, _)) = store::parse_frontmatter(&raw) {
+					if let Some(refs) = fm.get("code_refs").and_then(|v| v.as_array()) {
+						for r in refs.iter().take(remaining) {
+							if let Some(s) = r.as_str() {
+								if let Some(wp) = code_ref_to_wiki_path(s) {
+									let fn_name = s.split("::").nth(1).unwrap_or(s).to_string();
+									entries.push(EdgeEntry {
+										wiki_path: wp,
+										title: fn_name,
+										kind: "References".to_string(),
+										weight: 0.3,
+									});
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	let doc = store::get_document(root, doc_type, id)?;
+
+	if entries.is_empty() {
+		// Remove stale block if present
+		if doc.content.contains(RELATIONS_START) {
+			let cleaned = if let (Some(s), Some(e)) = (
+				doc.content.find(RELATIONS_START),
+				doc.content.find(RELATIONS_END),
+			) {
+				let end_pos = e + RELATIONS_END.len();
+				format!("{}{}", doc.content[..s].trim_end(), &doc.content[end_pos..])
+			} else {
+				doc.content.clone()
+			};
+			if cleaned != doc.content {
+				store::update_document(root, doc_type, id, Some(&cleaned), None)?;
+			}
+		}
+		return Ok(0);
+	}
+
+	let mut block = format!("{}\n", RELATIONS_START);
+	for e in &entries {
+		block.push_str(&format!("- [[{}|{}]] — {}\n", e.wiki_path, e.title, e.kind));
+	}
+	block.push_str(RELATIONS_END);
+
+	let new_body = replace_relations_block(&doc.content, &block);
+	if new_body != doc.content {
+		store::update_document(root, doc_type, id, Some(&new_body), None)?;
+	}
+
+	Ok(entries.len())
+}
+
 pub(crate) async fn link_doc_internal(
 	root: &Path,
 	doc_type: &str,
@@ -541,6 +693,11 @@ pub(crate) async fn link_doc_internal(
 		}
 	}
 
+	let mut relations_synced = 0usize;
+	if !dry_run {
+		relations_synced = sync_relations_section(root, doc_type, id).unwrap_or(0);
+	}
+
 	Ok(serde_json::json!({
 		"doc_id": id,
 		"doc_type": doc_type,
@@ -548,6 +705,7 @@ pub(crate) async fn link_doc_internal(
 		"aliases_added": aliases_added,
 		"paragraphs_merged": merges.len(),
 		"references_added": references_added,
+		"relations_synced": relations_synced,
 		"modified": !dry_run && modified,
 		"moved_to_crosstopic": moved_to_crosstopic,
 		"dry_run": dry_run,
@@ -557,6 +715,21 @@ pub(crate) async fn link_doc_internal(
 pub async fn link_doc(root: &Path, doc_type: &str, id: &str, dry_run: bool) -> Result<serde_json::Value> {
 	let entities = build_entity_index(root).await?;
 	link_doc_internal(root, doc_type, id, entities.as_slice(), dry_run).await
+}
+
+/// Bulk-sync `## Relations` wikilinks across all knowledge docs.
+/// Pure mechanical pass — reads existing reason edges, writes sentinel blocks.
+/// No AI calls, no learning. Run before weight recomputation.
+pub fn reindex_all_relations(root: &Path) -> Result<usize> {
+	const TYPES: &[&str] = &["thoughts", "questions", "conclusions", "entities"];
+	let mut total = 0usize;
+	for dt in TYPES {
+		let docs = store::list_documents(root, dt).unwrap_or_default();
+		for doc in docs {
+			total += sync_relations_section(root, dt, &doc.id).unwrap_or(0);
+		}
+	}
+	Ok(total)
 }
 
 #[cfg(test)]
@@ -793,6 +966,105 @@ mod tests {
 
 		let res = link_doc_internal(root, "thoughts", &src.id, &[], false).await.unwrap();
 		assert_eq!(res["references_added"].as_u64(), Some(0));
+	}
+
+	#[test]
+	fn replace_relations_block_appends_when_missing() {
+		let body = "some content here";
+		let block = "<!-- wiki-relations-start -->\n- [[x]]\n<!-- wiki-relations-end -->";
+		let result = replace_relations_block(body, block);
+		assert!(result.starts_with("some content here"));
+		assert!(result.contains(RELATIONS_START));
+		assert!(result.contains("[[x]]"));
+	}
+
+	#[test]
+	fn replace_relations_block_replaces_existing() {
+		let body = "before\n<!-- wiki-relations-start -->\n- [[old]]\n<!-- wiki-relations-end -->\nafter";
+		let block = "<!-- wiki-relations-start -->\n- [[new]]\n<!-- wiki-relations-end -->";
+		let result = replace_relations_block(body, block);
+		assert!(result.contains("[[new]]"));
+		assert!(!result.contains("[[old]]"));
+		assert!(result.contains("before"));
+		assert!(result.contains("after"));
+	}
+
+	#[test]
+	fn code_ref_to_wiki_path_converts() {
+		let r = code_ref_to_wiki_path("src/classifier.rs::classify");
+		assert_eq!(r, Some("code/rs/functions/src/classifier/classify".to_string()));
+		let r2 = code_ref_to_wiki_path("src/learn/links.rs::link_doc");
+		assert_eq!(r2, Some("code/rs/functions/src/learn/links/link_doc".to_string()));
+	}
+
+	#[test]
+	fn edge_kind_weight_order() {
+		assert!(edge_kind_weight("Answers") > edge_kind_weight("Supports"));
+		assert!(edge_kind_weight("Supports") > edge_kind_weight("Extends"));
+		assert!(edge_kind_weight("Extends") > edge_kind_weight("References"));
+		assert!(edge_kind_weight("Contradicts") < 0.0);
+	}
+
+	#[tokio::test]
+	async fn sync_relations_writes_block_from_reason_edge() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let a = store::create_document(root, "thoughts", "Alpha", "alpha body",
+			vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
+		let b = store::create_document(root, "thoughts", "Beta", "beta body",
+			vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
+		store::create_reason(root, &a.id, &b.id, "Supports", None, Some("general")).unwrap();
+		crate::cache::invalidate_indexes(root);
+
+		let n = sync_relations_section(root, "thoughts", &a.id).unwrap();
+		assert_eq!(n, 1);
+
+		let doc = store::get_document(root, "thoughts", &a.id).unwrap();
+		assert!(doc.content.contains(RELATIONS_START));
+		assert!(doc.content.contains("Beta"));
+		assert!(doc.content.contains("Supports"));
+	}
+
+	#[tokio::test]
+	async fn sync_relations_idempotent() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let a = store::create_document(root, "thoughts", "A", "body",
+			vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
+		let b = store::create_document(root, "thoughts", "B", "body",
+			vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
+		store::create_reason(root, &a.id, &b.id, "Supports", None, Some("general")).unwrap();
+		crate::cache::invalidate_indexes(root);
+
+		sync_relations_section(root, "thoughts", &a.id).unwrap();
+		let after_first = store::get_document(root, "thoughts", &a.id).unwrap().content;
+		sync_relations_section(root, "thoughts", &a.id).unwrap();
+		let after_second = store::get_document(root, "thoughts", &a.id).unwrap().content;
+		assert_eq!(after_first, after_second, "second sync must not change content");
+	}
+
+	#[tokio::test]
+	async fn sync_relations_respects_limit() {
+		// questions limit = 3 by default
+		let dir = TempDir::new().unwrap();
+		let root = dir.path();
+		store::bootstrap(root).unwrap();
+
+		let src = store::create_document(root, "questions", "Q?", "q body",
+			vec!["question".into(), "general".into()], Some("general"), None).unwrap();
+		for i in 0..6 {
+			let t = store::create_document(root, "thoughts", &format!("T{}", i), "t body",
+				vec!["thought".into(), "general".into()], Some("general"), None).unwrap();
+			store::create_reason(root, &t.id, &src.id, "Supports", None, Some("general")).unwrap();
+		}
+		crate::cache::invalidate_indexes(root);
+
+		let n = sync_relations_section(root, "questions", &src.id).unwrap();
+		assert!(n <= 3, "questions limit is 3, got {}", n);
 	}
 
 	#[tokio::test]
