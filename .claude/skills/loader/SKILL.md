@@ -1,29 +1,42 @@
 ---
 name: loader
-description: loads all necessary skills at the start of a session.
+description: Index of available skills — file locations, purpose, when/how to use.
 tags:
   - skill
-  - streaming
-  - code
-  - truth
-  - ui
-  - agent
+  - index
+  - reference
 ---
 
-**Invoke `/coder` immediately** at the start of the session via the Skill tool (`Skill(skill="coder")`).
-   - File path: `.claude/skills/coder/SKILL.md`.
-   - Single architect mode. Bundles KISS/DRY/YAGNI, phased planning (orient → align → glossary → PRD → TDD → design+delegate), adversarial self-review, bounded-commit discipline.
-   - Prefix the first response with `## [CODER MODE]` per the coder skill's contract.
+# Loader
 
-**Invoke `/rust-best-practices` immediately** at the start of the session via the Skill tool (`Skill(skill="rust-best-practices")`).
-   - File path: `.claude/skills/rust-best-practices/SKILL.md`.
-   - All Rust code must follow these idioms — borrowing, error handling, ownership.
+Skill index. Lists each skill: path, purpose, trigger.
 
-**Invoke `/caveman` immediately** at the start of the session via the Skill tool (`Skill(skill="caveman")`).
-   - File path: `.claude/skills/caveman/SKILL.md`.
-   - Terse mode for all narrative output. Code/commits/security messages stay normal.
+## Skills
 
-**Invoke `/learn` immediately** when task involves persistent wiki built from raw sources. `/learn` is sole entry: ingest, link, dedupe, Q&A, conclusions, query.
-   - File path: `skills/learn/SKILL.md`.
+### coder
+- **Path:** `.claude/skills/coder/SKILL.md`
+- **Purpose:** Architect mode. Bundles KISS/DRY/YAGNI, phased planning (orient → align → glossary → PRD → TDD → design+delegate), adversarial self-review, bounded-commit discipline.
+- **When:** Non-trivial feature, refactor, multi-file change, bug fix touching >1 module, new architectural component. Skip for one-line fixes, throwaway spikes, exploratory reads.
+- **How:** `Skill(skill="coder")`. Prefix first response with `## [CODER MODE]`.
 
-**READ docs/*.md** for the big picture before starting.
+### rust-best-practices
+- **Path:** `.claude/skills/rust-best-practices/SKILL.md`
+- **Purpose:** Apollo GraphQL Rust idioms — borrowing vs cloning, error handling (`thiserror`/`anyhow`), ownership, clippy lints, type-state pattern.
+- **When:** Writing, reviewing, or refactoring Rust code.
+- **How:** `Skill(skill="rust-best-practices")`. Read referenced chapters on demand.
+
+### caveman
+- **Path:** `.claude/skills/caveman/SKILL.md`
+- **Purpose:** Terse output mode. ~75% token cut. Drops articles, filler, hedging. Code/commits/security stay normal.
+- **When:** User says "caveman", "be brief", "less tokens", or `/caveman lite|full|ultra`. Auto-active per session hook.
+- **How:** `Skill(skill="caveman")`. Default level: `full`.
+
+### learn (wiki plugin)
+- **Path:** `.claude/plugins/cache/yesitsfebreeze/wiki/<version>/skills/learn/SKILL.md`
+- **Purpose:** Sole entry to wiki MCP — ingest, link, dedupe, Q&A, conclusions, query. Densify pass + research-to-thoughts flow.
+- **When:** Task involves persistent wiki built from raw sources. Replaces deprecated `/wiki`.
+- **How:** `Skill(skill="wiki:learn")`. First action inside skill: `docs({name: "learn"})`.
+
+## Big-picture docs
+
+Read `docs/*.md` for project overview before non-trivial work.

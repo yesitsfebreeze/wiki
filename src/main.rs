@@ -401,6 +401,14 @@ fn spawn_code_watcher() {
     let index = code::default_index_dir();
     if src_dirs.is_empty() || exts.is_empty() { return; }
     std::thread::spawn(move || {
+        for src_dir in &src_dirs {
+            for ext in &exts {
+                match code::index_dir(src_dir, ext) {
+                    Ok(msg) => eprintln!("startup scan: {msg}"),
+                    Err(e) => eprintln!("startup scan error {}: {e}", src_dir.display()),
+                }
+            }
+        }
         if let Err(e) = code::watcher::watch(&src_dirs, &index, &exts) {
             eprintln!("watcher: {e}");
         }
