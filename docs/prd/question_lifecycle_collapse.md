@@ -81,7 +81,7 @@ Keep: filter for `graveyard/` path prefix in raise + qa + list + search.
 
 Drop `tag_index_lookup(root, "answered")` + `"dropped"` callsites.
 
-## Migration (one-shot, on next ingest or via `admin` tool)
+## Migration (one-shot, on next ingest or via `author` tool)
 
 1. For every question file under `questions/answered/**` → **hard delete**. (Conclusion already exists with edge; question is redundant.)
 2. For every question file under `questions/dropped/**` → **hard delete**. (Per user: existing dropped not worth preserving.)

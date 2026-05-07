@@ -246,7 +246,7 @@ struct CodeParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-struct AdminParams {
+struct AuthorParams {
 	/// reindex | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops
 	action: String,
 	dry_run: Option<bool>,
@@ -1179,9 +1179,9 @@ impl WikiService {
 		}
 	}
 
-	#[tool(description = "Vault maintenance. action: reindex | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops. Docs: docs(\"admin\"). Args: action, dry_run?, limit?.")]
-	async fn admin(&self, params: Parameters<AdminParams>) -> String {
-		let AdminParams { action, dry_run, limit } = params.0;
+	#[tool(description = "Vault maintenance. action: reindex | sanitize | migrate | migrate_lifecycle | feedback | retitle_questions | prune_self_loops. Docs: docs(\"author\"). Args: action, dry_run?, limit?.")]
+	async fn author(&self, params: Parameters<AuthorParams>) -> String {
+		let AuthorParams { action, dry_run, limit } = params.0;
 		let dry = dry_run.unwrap_or(false);
 		match action.as_str() {
 			"reindex" => {

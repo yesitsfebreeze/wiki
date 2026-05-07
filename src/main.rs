@@ -365,8 +365,8 @@ fn parse_cli() -> Option<CliCmd> {
             eprintln!(
                 "wiki: unknown subcommand `{}`. The wiki binary exposes only \
                  Claude Code hook subprocesses on the CLI; everything else \
-                 (search, ingest, learn, purpose, code, sanitize, migrate, \
-                 recompute-weights) lives on the MCP surface. Run `wiki` with \
+                 (search, ingest, learn, purpose, code, author) lives on the \
+                 MCP surface. Run `wiki` with \
                  no args to start the MCP server.",
                 other,
             );

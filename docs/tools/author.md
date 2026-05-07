@@ -1,4 +1,4 @@
-# admin
+# author
 
 Vault maintenance. Single tool for reindex, sanitize, migrate, feedback.
 
