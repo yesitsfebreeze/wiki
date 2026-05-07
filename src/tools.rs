@@ -1669,7 +1669,7 @@ impl WikiService {
 	}
 }
 
-#[tool_handler(instructions = "WIKI - Single-store Obsidian Knowledge Base. Each doc tagged with 1 type tag + 1 purpose tag. Ingest auto-classifies content into purpose chunks via OpenAI embeddings.")]
+#[tool_handler(instructions = "WIKI - Single-store Obsidian Knowledge Base. File watcher auto-ingests code changes live — wiki stays current with codebase, no manual sync needed. Each doc tagged with 1 type tag + 1 purpose tag. Ingest auto-classifies content into purpose chunks via OpenAI embeddings.")]
 impl ServerHandler for WikiService {}
 
 impl WikiService {
