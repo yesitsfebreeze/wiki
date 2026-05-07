@@ -34,6 +34,7 @@ pub fn index_dir(src_dir: &Path, ext: &str) -> Result<String> {
 	let mut files_indexed = 0u32;
 	let mut files_skipped = 0u32;
 	let mut bodies_total = 0u32;
+	let mut newly_indexed: Vec<PathBuf> = Vec::new();
 	for src in walk_files(src_dir, ext) {
 		let struct_path = splitter::structure_path(&src, &index);
 		if struct_path.exists() {
@@ -54,13 +55,115 @@ pub fn index_dir(src_dir: &Path, ext: &str) -> Result<String> {
 				}
 				bodies_total += bodies.len() as u32;
 				files_indexed += 1;
+				newly_indexed.push(src);
 			}
 			Err(e) => eprintln!("skip {}: {e}", src.display()),
 		}
 	}
+	let mut links_added = 0u32;
+	for src in &newly_indexed {
+		if let Ok(msg) = relink_structure_mentions(src, &index) {
+			links_added += parse_relink_count(&msg);
+		}
+	}
 	Ok(format!(
-		"indexed {files_indexed} files ({bodies_total} functions); {files_skipped} skipped"
+		"indexed {files_indexed} files ({bodies_total} functions); {files_skipped} skipped; {links_added} structure links added"
 	))
+}
+
+fn parse_relink_count(msg: &str) -> u32 {
+	msg.split_whitespace()
+		.nth(1)
+		.and_then(|n| n.parse().ok())
+		.unwrap_or(0)
+}
+
+/// Grep all structure files in `index_dir` for plain-text mentions of
+/// `src_path`'s stem and exported function names. Injects `[[stem]]` on the
+/// first unprotected word-boundary hit in each matching file.
+pub fn relink_structure_mentions(src_path: &Path, index_dir: &Path) -> Result<String> {
+	let struct_path = splitter::structure_path(src_path, index_dir);
+	if !struct_path.exists() {
+		return Ok("no structure file".to_string());
+	}
+
+	let stem = src_path
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.unwrap_or("")
+		.to_string();
+	if stem.len() < 3 {
+		return Ok("stem too short".to_string());
+	}
+
+	let struct_content = std::fs::read_to_string(&struct_path).unwrap_or_default();
+	let mut terms: Vec<String> = vec![stem.clone()];
+	if let Some(fm) = splitter::parse_frontmatter(&struct_content) {
+		if let Some(fns_str) = fm.get("fns") {
+			for f in fns_str.split(',').map(|f| f.trim().to_string()).filter(|f| f.len() >= 4) {
+				if !terms.contains(&f) {
+					terms.push(f);
+				}
+			}
+		}
+	}
+	terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
+
+	let all_structs = walk_structure_files(index_dir);
+	let mut patched = 0u32;
+	for sf in &all_structs {
+		if sf == &struct_path {
+			continue;
+		}
+		let Ok(content) = std::fs::read_to_string(sf) else { continue };
+		if let Some(new_content) = inject_first_wikilink(&content, &terms, &stem) {
+			if crate::io::write_atomic_str(sf, &new_content).is_ok() {
+				patched += 1;
+			}
+		}
+	}
+	Ok(format!("relinked {patched} structure files → [[{stem}]]"))
+}
+
+fn inject_first_wikilink(content: &str, terms: &[String], link_target: &str) -> Option<String> {
+	let fm_end = frontmatter_end_offset(content);
+	let wl_re = regex::Regex::new(r"\[\[[^\]]*\]\]").ok()?;
+
+	for term in terms {
+		if content.contains(&format!("[[{}", term)) {
+			continue;
+		}
+		let escaped = regex::escape(term);
+		let re = regex::Regex::new(&format!(r"\b{}\b", escaped)).ok()?;
+
+		let mut prot: Vec<(usize, usize)> = Vec::new();
+		if let Some(end) = fm_end {
+			prot.push((0, end));
+		}
+		for m in wl_re.find_iter(content) {
+			prot.push((m.start(), m.end()));
+		}
+
+		if let Some(m) = re.find(content) {
+			if prot.iter().any(|(s, e)| m.start() >= *s && m.start() < *e) {
+				continue;
+			}
+			let replacement = format!("[[{}]]", link_target);
+			return Some(format!("{}{}{}", &content[..m.start()], replacement, &content[m.end()..]));
+		}
+	}
+	None
+}
+
+fn frontmatter_end_offset(content: &str) -> Option<usize> {
+	if !content.starts_with("---") {
+		return None;
+	}
+	let after_first = content.find('\n')? + 1;
+	let rest = &content[after_first..];
+	let re = regex::Regex::new(r"(?m)^---\s*$").ok()?;
+	let m = re.find(rest)?;
+	Some(after_first + m.end())
 }
 
 pub fn open_source(src: &Path, ext: &str) -> Result<String> {

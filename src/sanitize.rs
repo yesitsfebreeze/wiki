@@ -10,7 +10,7 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 
 /// Doc-type subdirs that hold user-edited Obsidian files. Other dirs
-/// (`.obsidian`, `.search`, `code`, `assets`, `ingest_log`) are internal.
+/// (`.obsidian`, `.search`, `code`, `assets`) are internal.
 const DOC_DIRS: &[&str] = &[
 	"thoughts", "entities", "reasons", "questions", "conclusions", "purposes",
 ];

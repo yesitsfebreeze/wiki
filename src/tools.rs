@@ -932,16 +932,19 @@ impl WikiService {
 
 	fn list_ingest_log(&self, params: Parameters<ListLogParams>) -> String {
 		let ListLogParams { limit, cursor } = params.0;
-		let log_dir = self.root().join("ingest_log");
-		if !log_dir.exists() {
-			return paginate::<serde_json::Value>(vec![], cursor, limit).to_string();
-		}
-		let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
+		let log_root = self.root();
+		let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(log_root)
 			.into_iter()
 			.flatten()
 			.filter_map(|e| e.ok())
 			.map(|e| e.path())
-			.filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+			.filter(|p| {
+				p.extension().and_then(|s| s.to_str()) == Some("jsonl")
+					&& p.file_stem()
+						.and_then(|s| s.to_str())
+						.map(|s| s.starts_with("ingest"))
+						.unwrap_or(false)
+			})
 			.collect();
 		files.sort();
 		let mut entries: Vec<serde_json::Value> = Vec::new();

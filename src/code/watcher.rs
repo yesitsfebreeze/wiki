@@ -58,6 +58,11 @@ fn on_source_change(src_path: &Path, index_dir: &Path, ext: &str) -> Result<()> 
         std::fs::write(&b.path, &b.content)?;
     }
     eprintln!("re-split <- {}", src_path.display());
+    if let Ok(msg) = crate::code::relink_structure_mentions(src_path, index_dir) {
+        if !msg.starts_with("no") && !msg.starts_with("stem") {
+            eprintln!("relink: {msg}");
+        }
+    }
     Ok(())
 }
 

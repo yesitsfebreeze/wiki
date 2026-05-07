@@ -61,7 +61,7 @@ pub fn wiki_root() -> PathBuf {
 pub fn bootstrap(root: &Path) -> anyhow::Result<()> {
 	for dir in &[
 		"purposes", "thoughts", "entities", "reasons", "questions",
-		"conclusions", "ingest_log", "assets", ".search",
+		"conclusions", "assets", ".search",
 	] {
 		std::fs::create_dir_all(root.join(dir))?;
 	}
@@ -542,7 +542,7 @@ pub fn log_ingest(root: &Path, doc_type: &str, doc_id: &str, title: &str) -> any
 		"doc_id": doc_id,
 		"title": title,
 	});
-	let path = root.join("ingest_log").join("ingest.jsonl");
+	let path = root.join("ingest.jsonl");
 	crate::io::append_jsonl_rotating(&path, &serde_json::to_string(&entry)?, INGEST_LOG_ROTATE_AT)
 }
 

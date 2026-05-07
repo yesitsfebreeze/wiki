@@ -350,7 +350,7 @@ pub(crate) fn write_pass_log(root: &Path, kind: &str, report: &serde_json::Value
 		entry.insert("report".to_string(), report.clone());
 	}
 	let line = serde_json::to_string(&serde_json::Value::Object(entry))?;
-	let path = root.join("ingest_log").join("ingest.jsonl");
+	let path = root.join("ingest.jsonl");
 	crate::io::append_jsonl_rotating(&path, &line, crate::store::INGEST_LOG_ROTATE_AT)
 }
 
