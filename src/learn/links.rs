@@ -729,6 +729,26 @@ pub fn reindex_all_relations(root: &Path) -> Result<usize> {
 			total += sync_relations_section(root, dt, &doc.id).unwrap_or(0);
 		}
 	}
+	// Backfill [[from_id]] [[to_id]] wikilinks into reason files that predate the fix.
+	let reasons_dir = root.join("reasons");
+	for path in store::walk_md_paths(&reasons_dir) {
+		let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+		let Ok((fm, body)) = store::parse_frontmatter(&raw) else { continue };
+		let from = fm.get("from_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+		let to   = fm.get("to_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+		if from.is_empty() || to.is_empty() { continue }
+		let wl_from = format!("[[{}]]", from);
+		let wl_to   = format!("[[{}]]", to);
+		if body.contains(&wl_from) && body.contains(&wl_to) { continue }
+		let new_body = if body.is_empty() {
+			format!("{} {}", wl_from, wl_to)
+		} else {
+			format!("{}\n\n{} {}", body, wl_from, wl_to)
+		};
+		let Ok(fm_str) = serde_yaml::to_string(&fm) else { continue };
+		let _ = std::fs::write(&path, format!("---\n{}---\n\n{}", fm_str, new_body));
+		total += 1;
+	}
 	Ok(total)
 }
 

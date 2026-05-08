@@ -501,7 +501,13 @@ pub fn create_reason(
 	std::fs::create_dir_all(&dir)?;
 	let file_path = unique_path(&dir, &slug);
 	let body_str = body.as_deref().unwrap_or("");
-	write_atomic_str(&file_path, &format!("---\n{}---\n\n{}", fm, body_str))?;
+	let wikilinks = format!("[[{}]] [[{}]]", from_id, to_id);
+	let file_content = if body_str.is_empty() {
+		format!("---\n{}---\n\n{}", fm, wikilinks)
+	} else {
+		format!("---\n{}---\n\n{}\n\n{}", fm, body_str, wikilinks)
+	};
+	write_atomic_str(&file_path, &file_content)?;
 	let _ = update_link_index(root);
 	cache::on_doc_changed(root, &id, "reasons");
 
@@ -518,7 +524,11 @@ pub fn create_reason(
 		source_doc_id: None,
 		created_at: now.clone(),
 		updated_at: now,
-		content: body.unwrap_or_default(),
+		content: if body_str.is_empty() {
+			wikilinks.clone()
+		} else {
+			format!("{}\n\n{}", body_str, wikilinks)
+		},
 	})
 }
 
